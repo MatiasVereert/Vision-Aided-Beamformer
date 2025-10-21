@@ -1,0 +1,14 @@
+#  Python
+__pycache__/
+*.pyc
+*.log
+
+#  NumPy y Matplotlib
+*.npy
+*.npz
+*.pdf
+*.png
+*.jpeg
+
+# VS Code
+.vscode/
