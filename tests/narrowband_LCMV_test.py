@@ -1,8 +1,9 @@
 import numpy as np
 from matplotlib import pyplot as plt 
-import functions 
-from functions import near_field_steering_vector, simular_propagacion_arreglo, beamforming
-import sys
+import sys 
+import os 
+from propagation.free_field import simular_propagacion_arreglo
+from beamforming.beamformer_core import near_field_steering_vector, point_constraint, compute_fixed_weights_optimized, beamforming
 
 # --- 1. PARÁMETROS DEL SISTEMA Y ESCENARIO ---
 
@@ -35,12 +36,12 @@ target_point = np.array([x_focal, y_focal, z_focal])
 
 # 2.1. Diseñar restricciones para el punto/frecuencia de prueba
 # C tiene forma (N x 2), h tiene forma (2 x 1)
-C, h = functions.point_constraint(target_point, K_taps, mic_array_positions, f_test, fs)
+C, h = point_constraint(target_point, K_taps, mic_array_positions, f_test, fs)
 L_constraints = C.shape[1] # Debe ser 2
 
 # 2.2. Calcular los pesos fijos w_q
 # w_q tiene forma (N x 1)
-w_fixed = functions.compute_fixed_weights_optimized(C, h)
+w_fixed = compute_fixed_weights_optimized(C, h)
 
 print("--- Evaluación del Beamformer Fijo (Single Frequency) ---")
 print(f"Dimensiones del vector de pesos N: {N_total}")
@@ -51,7 +52,7 @@ print(f"Número de restricciones L: {L_constraints}")
 # La ganancia debe ser 1 (0 dB) en el punto focal para la frecuencia de prueba f_test.
 
 # 3.1. Obtener el vector de dirección real a(x_F, f_test) para la verificación
-a_test = functions.near_field_steering_vector(f_test, target_point, fs, mic_array_positions, K=K_taps, c=c)
+a_test = near_field_steering_vector(f_test, target_point, fs, mic_array_positions, K=K_taps, c=c)
 
 # 3.2. Calcular la respuesta del beamformer: b(x_F, f) = w_q^H * a(x_F, f)
 # La operación es una multiplicación matricial: (1 x N) * (N x 1)
@@ -131,22 +132,20 @@ for angle_deg in angles_deg:
     Z, _, _ = simular_propagacion_arreglo(signal_source, fs, test_point, mic_array_positions)
     N_fft = Z.shape[1] # Longitud total con padding
 
-    # 3.3. Formatear la entrada U(t) para el beamformer con TAPS
-    # La entrada U debe ser (M*K, T), donde T es el número de snapshots.
-    # Esto es una implementación de filtro FIR multicanal
-    
-    T_snapshots = N_fft - K_taps + 1
-    U_snapshots = np.zeros((M_mic * K_taps, T_snapshots))
-    
-    for t_idx in range(T_snapshots):
-        u_k = np.zeros(M_mic * K_taps)
-        for m in range(M_mic):
-            # Obtener las K muestras temporales (taps) para el mic m
-            taps_samples = Z[m, t_idx : t_idx + K_taps] 
-            # Concatenar en el vector N x 1 (u_k)
-            u_k[m*K_taps : (m+1)*K_taps] = taps_samples
-        
-        U_snapshots[:, t_idx] = u_k.T # Vector u(k) de dimensión (N)
+    # 3.3. Formatear la entrada U(t) para el beamformer con TAPS (Versión Optimizada)
+    # Se crea una "vista" de ventanas deslizantes para cada micrófono sin copiar datos.
+    # Esto es significativamente más rápido que un bucle en Python.
+    T_snapshots = N_fft - K_taps + 1 # Número de snapshots de tiempo
+    shape = (M_mic, T_snapshots, K_taps)
+    strides = (Z.strides[0], Z.strides[1], Z.strides[1])
+    U_tapped = np.lib.stride_tricks.as_strided(Z, shape=shape, strides=strides)
+
+    # Ahora U_tapped tiene forma (M, T_snapshots, K_taps).
+    # Necesitamos reordenarlo a (M*K, T_snapshots) para el beamformer.
+    # 1. Mover el eje de los taps al medio: (M, K, T)
+    U_permuted = np.transpose(U_tapped, (0, 2, 1))
+    # 2. Reestructurar a la forma final (M*K, T)
+    U_snapshots = U_permuted.reshape((M_mic * K_taps, T_snapshots))
 
     # 3.4. Aplicar el beamformer (w_q^H * U)
     # La salida y_snapshots tiene forma (1 x T_snapshots)

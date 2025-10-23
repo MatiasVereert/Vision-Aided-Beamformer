@@ -1,0 +1,26 @@
+[build-system]
+# Indica a Python cómo construir el paquete.
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beamfomig-python" # El nombre que tendrá tu paquete.
+version = "0.1.0" # La versión inicial.
+description = "Proyecto de Beamforming en Python"
+readme = "README.md"
+authors = [{name = "Tu Nombre", email = "tu.email@ejemplo.com"}]
+license = {file = "LICENSE"} # Si tienes un archivo de licencia.
+keywords = ["beamforming", "mems", "array", "audio"]
+
+# Las dependencias de tu proyecto. Asegúrate de incluir las librerías que usas.
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib", # Si usas plot_utils
+]
+
+[tool.setuptools.packages]
+# Esta sección es CRUCIAL. Indica dónde están los módulos.
+# En tu caso, 'src' contiene los paquetes 'beamforming' y 'propagation'.
+# La siguiente línea le dice a setuptools que busque los paquetes dentro de la carpeta 'src'.
+find = {where = ["src"]}
