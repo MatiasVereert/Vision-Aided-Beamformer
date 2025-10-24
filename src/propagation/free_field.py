@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import math
-from scipy.constants import speed_of_sound as c # Velocidad del sonido (m/s)
+from scipy.constants import speed_of_sound # Usamos el nombre completo para claridad
 
 
 def simular_propagacion_arreglo(signal, fs, source_pos, mic_positions_matrix):
@@ -14,22 +14,29 @@ def simular_propagacion_arreglo(signal, fs, source_pos, mic_positions_matrix):
     Args:
         signal (np.ndarray): Señal discreta de entrada (vector 1D).
         fs (float): Frecuencia de muestreo (Hz).
-        source_pos (np.ndarray): Coordenadas (x, y, z) de la fuente (vector 1D).
+        source_pos (np.ndarray): Coordenadas (x, y, z) de la(s) fuente(s).
+                                 Puede ser un vector 1D (3,) para una fuente,
+                                 o una matriz (P, 3) para P fuentes.
         mic_positions_matrix (np.ndarray): Matriz de coordenadas de micrófonos (Mics x 3).
 
     Returns:
         tuple: 
-            - array_retardado (np.ndarray): Matriz (Mics x N_fft) con las señales retardadas.
+            - array_retardado (np.ndarray): Matriz con las señales retardadas.
+                                            Si hay 1 fuente: (Mics, N_fft).
+                                            Si hay P fuentes: (P, Mics, N_fft).
             - signal_referencia_padded (np.ndarray): Señal original rellenada con ceros a longitud N_fft.
             - tau_array (np.ndarray): Array con los retardos absolutos (en segundos).
     """
     
     N_original = len(signal)
-    c =343
+    source_pos = np.atleast_2d(source_pos) # Asegura que source_pos sea al menos 2D (P, 3)
+    num_sources = source_pos.shape[0]
+
     # 1. CÁLCULO VECTORIAL DE DISTANCIAS Y RETARDOS
-    # Calcula la distancia euclidiana de la fuente a cada micrófono
-    distancias = np.linalg.norm(mic_positions_matrix - source_pos, axis=1)
-    tau_array = distancias / c  # Array de retardos temporales (tau_m)
+    # Broadcasting: (P, 1, 3) - (M, 3) -> (P, M, 3)
+    diff_vectors = source_pos[:, np.newaxis, :] - mic_positions_matrix
+    distancias = np.linalg.norm(diff_vectors, axis=2) # Resultado: (P, M)
+    tau_array = distancias / speed_of_sound  # Array de retardos temporales (tau_m)
     
     # 2. DETERMINAR LA LONGITUD GLOBAL (N_fft)
     # Basado en el máximo retardo para el zero-padding (evitar aliasing)
@@ -48,17 +55,22 @@ def simular_propagacion_arreglo(signal, fs, source_pos, mic_positions_matrix):
     k = np.fft.fftfreq(N_fft, d=1/fs)
     
     # 4. CÁLCULO VECTORIAL DEL CAMBIO DE FASE
-    # Multiplicar el vector de frecuencias k por cada tau en tau_array (Broadcasting)
-    tau_matrix = tau_array[:, np.newaxis] # Forma (num_mics, 1)
-    phase_shift_matrix = np.exp(-1j * 2 * np.pi * k * tau_matrix) # Forma (num_mics, N_fft)
+    # Broadcasting: k(N_fft) * tau_array(P, M) -> phase_shift_matrix(P, M, N_fft)
+    # tau_array tiene forma (P, M), k tiene forma (N_fft)
+    # Añadimos ejes para que las formas sean compatibles: (P, M, 1) y (N_fft)
+    phase_shift_matrix = np.exp(-1j * 2 * np.pi * k * tau_array[..., np.newaxis])
     
     # 5. APLICAR FASE Y TRANSFORMAR (Vectorización)
-    # Multiplicar la FFT de la señal X por la matriz de fases
-    Y_matrix = X * phase_shift_matrix # Resultado: (num_mics, N_fft)
+    # Broadcasting: X(N_fft) * phase_shift_matrix(P, M, N_fft) -> Y_matrix(P, M, N_fft)
+    Y_matrix = X * phase_shift_matrix
     
     # IFFT en el eje de las muestras (axis=1)
     array_retardado = np.fft.ifft(Y_matrix, axis=1).real
     
+    # Si solo había una fuente, devolvemos el resultado con la forma original (M, N_fft)
+    if num_sources == 1:
+        array_retardado = array_retardado.squeeze(axis=0)
+
     # 6. SEÑAL DE REFERENCIA (Padded a la misma longitud N_fft)
     signal_referencia_padded = signal_padded 
     

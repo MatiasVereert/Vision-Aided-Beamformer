@@ -4,12 +4,12 @@ import sys
 import os 
 from propagation.free_field import simular_propagacion_arreglo
 from beamforming.beamformer_core import near_field_steering_vector, point_constraint, compute_fixed_weights_optimized, beamforming
+from scipy.constants import speed_of_sound
 
 # --- 1. PARÁMETROS DEL SISTEMA Y ESCENARIO ---
 
 # Constantes físicas y de muestreo
 fs = 16000     # Frecuencia de muestreo (Hz)
-c = 343.0      # Velocidad del sonido (m/s)
 
 # Parámetros del Array
 M_mic = 9      # Número de micrófonos
@@ -52,7 +52,7 @@ print(f"Número de restricciones L: {L_constraints}")
 # La ganancia debe ser 1 (0 dB) en el punto focal para la frecuencia de prueba f_test.
 
 # 3.1. Obtener el vector de dirección real a(x_F, f_test) para la verificación
-a_test = near_field_steering_vector(f_test, target_point, fs, mic_array_positions, K=K_taps, c=c)
+a_test = near_field_steering_vector(f_test, target_point, fs, mic_array_positions, K=K_taps)
 
 # 3.2. Calcular la respuesta del beamformer: b(x_F, f) = w_q^H * a(x_F, f)
 # La operación es una multiplicación matricial: (1 x N) * (N x 1)
