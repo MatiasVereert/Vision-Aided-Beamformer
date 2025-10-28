@@ -3,8 +3,7 @@ import matplotlib.pyplot as plt
 import math
 from scipy.constants import speed_of_sound # Usamos el nombre completo para claridad
 
-
-def simular_propagacion_arreglo(signal, fs, source_pos, mic_positions_matrix):
+def space_delay(signal, fs, source_pos, mic_array):
     """
     Simula la propagación de una señal a un arreglo de micrófonos de forma optimizada.
     
@@ -17,7 +16,7 @@ def simular_propagacion_arreglo(signal, fs, source_pos, mic_positions_matrix):
         source_pos (np.ndarray): Coordenadas (x, y, z) de la(s) fuente(s).
                                  Puede ser un vector 1D (3,) para una fuente,
                                  o una matriz (P, 3) para P fuentes.
-        mic_positions_matrix (np.ndarray): Matriz de coordenadas de micrófonos (Mics x 3).
+        mic_array (np.ndarray): Matriz de coordenadas de micrófonos (Mics x 3).
 
     Returns:
         tuple: 
@@ -34,7 +33,7 @@ def simular_propagacion_arreglo(signal, fs, source_pos, mic_positions_matrix):
 
     # 1. CÁLCULO VECTORIAL DE DISTANCIAS Y RETARDOS
     # Broadcasting: (P, 1, 3) - (M, 3) -> (P, M, 3)
-    diff_vectors = source_pos[:, np.newaxis, :] - mic_positions_matrix
+    diff_vectors = source_pos[:, np.newaxis, :] - mic_array
     distancias = np.linalg.norm(diff_vectors, axis=2) # Resultado: (P, M)
     tau_array = distancias / speed_of_sound  # Array de retardos temporales (tau_m)
     

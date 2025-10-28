@@ -1,7 +1,8 @@
 import numpy as np
 from matplotlib import pyplot as plt 
-import sys 
-import os 
+# No es necesario manipular sys.path si el proyecto está instalado
+# (ej. con `pip install -e .` desde la raíz) o si se usa pytest desde la raíz.
+# Las importaciones deberían funcionar directamente si el entorno está configurado correctamente.
 from propagation.free_field import simular_propagacion_arreglo
 from beamforming.beamformer_core import near_field_steering_vector, point_constraint, compute_fixed_weights_optimized, beamforming
 from scipy.constants import speed_of_sound
