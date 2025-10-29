@@ -1,6 +1,6 @@
 # --- 1. IMPORTACIONES ---
-from beamforming.beamformer_core import beamforming, snapshots, point_constraint, compute_fixed_weights_optimized
-from propagation.free_field import space_delay
+from beamforming.beamformer_core import beamforming, snapshots, near_field_steering_vector
+from propagation.free_field import space_delay 
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -16,7 +16,6 @@ d = 0.04
 mic_x = np.linspace(0, (M - 1) * d, M) - (M - 1) * d / 2
 mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
 
-mic_areray_debug = -mic_array
 # Dirección de enfoque (p. ej., 45 grados) y distancia.
 # NOTA: La distancia debe ser lo suficientemente corta para que los retardos
 # sean mayores que el período de muestreo y se puedan distinguir entre taps.
@@ -28,9 +27,13 @@ print("--- Ejecutando Test de Beamformer LCMV (Tiempo) ---")
 print(f"Objetivo: Verificar ganancia unitaria para un tono de {f_test} Hz desde {np.rad2deg(look_direction_rad):.0f} grados.")
 
 # --- 3. CÁLCULO DE PESOS LCMV ---
-# Se calculan los pesos para tener ganancia unitaria en la dirección y frecuencia de la fuente.
-C, h = point_constraint(source_pos, K, mic_array, f_test, fs)
-w_lcmv = compute_fixed_weights_optimized(C, h)
+# Para un caso sin ruido (matriz de covarianza = Identidad), el peso LCMV con una
+# restricción de ganancia unitaria se simplifica a: w = a / (a^H * a)
+# donde 'a' es el vector de dirección. Esto asegura que w^H * a = 1.
+
+a = near_field_steering_vector(f_test, source_pos, fs, mic_array, K=K)
+a_H_a = a.conj().T @ a
+w_lcmv = a / a_H_a
 
 # --- 4. SIMULACIÓN DE LA SEÑAL RECIBIDA ---
 # Usamos un tono puro a f_test como señal de prueba.
