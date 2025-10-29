@@ -115,12 +115,14 @@ def snapshots(array_signals, K):
     # This results in a 3D tensor of shape (M, N_snapshots, K).
     signals_window = sliding_window_view(array_signals, window_shape=K, axis=1)
 
-    # Reverse the tap axis to ensure a causal FIR filter structure [x(k), x(k-1), ...].
-    reversed_taps = signals_window[:, :, ::-1]
+    # The sliding_window_view already produces windows like [x(n), x(n+1), ...].
+    # For a standard FIR filter [x(n), x(n-1), ...], we need to reverse the tap axis.
+    # However, our steering vector is defined for [x(n), x(n-1), ...], so we should NOT reverse here if the steering vector expects a non-reversed order.
+    # Let's align with the steering vector definition which does not imply reversal.
 
     # Reorder axes to group taps by microphone, then reshape to the final
     # (M*K, N_snapshots) matrix by concatenating all tap blocks.
-    snapshot_matrix = reversed_taps.transpose(0, 2, 1).reshape(M * K, -1)
+    snapshot_matrix = signals_window.transpose(0, 2, 1).reshape(M * K, -1)
 
     return snapshot_matrix
 

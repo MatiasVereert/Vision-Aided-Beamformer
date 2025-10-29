@@ -1,14 +1,16 @@
 # --- 1. IMPORTACIONES ---
-from beamforming.beamformer_core import beamforming, snapshots
+from beamforming.beamformer_core import beamforming, snapshots, point_constraint, compute_fixed_weights_optimized
 from propagation.free_field import space_delay
 import numpy as np
+from utils.geometry import source_rotation
 import matplotlib.pyplot as plt
 
 # --- 2. PARÁMETROS DEL ESCENARIO ---
-fs = 16000
+fs = 48000
 c = 343.0
 M = 9       # Número de micrófonos
 K = 50      # Número de taps
+f_test = 1000.0 # Frecuencia de prueba para LCMV
 
 # Geometría del Array (ULA en el eje X, centrado)
 d = 0.04
@@ -18,61 +20,49 @@ mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
 # Dirección de enfoque (p. ej., 45 grados) y distancia.
 # NOTA: La distancia debe ser lo suficientemente corta para que los retardos
 # sean mayores que el período de muestreo y se puedan distinguir entre taps.
-look_direction_rad = np.deg2rad(45)
+look_direction_rad = np.deg2rad(90)
 source_distance = 2.0 # Metros
 source_pos = source_distance * np.array([np.cos(look_direction_rad), np.sin(look_direction_rad), 0])
 
-print("--- Ejecutando Test de Delay-and-Sum ---")
-print("Objetivo: Verificar que `snapshots` y `beamforming` suman coherentemente una señal.")
+print("--- Ejecutando Test de Beamformer LCMV (Tiempo) ---")
+print(f"Objetivo: Verificar ganancia unitaria para un tono de {f_test} Hz desde {np.rad2deg(look_direction_rad):.0f} grados.")
 
-# --- 3. CREACIÓN DE PESOS "DELAY-AND-SUM" (w_ds) ---
-# Estos pesos invierten el retardo de propagación para alinear las señales.
-w_ds = np.zeros((M * K, 1))
-
-# Calcular retardos de tiempo relativos al centro del array
-center_pos = np.mean(mic_array, axis=0)
-ref_dist = np.linalg.norm(source_pos - center_pos)
-time_delays = (np.linalg.norm(source_pos - mic_array, axis=1) - ref_dist) / c
-
-# Convertir retardos de tiempo a un índice de tap. Se usa un offset para centrar.
-tap_offset = K // 2
-delay_indices = np.round(time_delays * fs).astype(int) + tap_offset
-
-# Asignar un '1' en el tap correcto para cada micrófono
-for m in range(M):
-    tap_index = delay_indices[m]
-    if 0 <= tap_index < K:
-        w_ds[m * K + tap_index] = 1.0
-    else:
-        print(f"ADVERTENCIA: Retardo para mic {m} (índice {tap_index}) fuera de rango [0, {K-1}]")
-
-# Verificación de los pesos
-non_zero_weights = np.count_nonzero(w_ds)
-print(f"\nNúmero de pesos no nulos en w_ds: {non_zero_weights} (Esperado: {M})")
-if non_zero_weights != M:
-    print(">>> ❌ ALERTA: El vector de pesos w_ds no se está creando correctamente. Revise la geometría o el número de taps K.")
+# --- 3. CÁLCULO DE PESOS LCMV ---
+# Se calculan los pesos para tener ganancia unitaria en la dirección y frecuencia de la fuente.
+C, h = point_constraint(source_pos, K, mic_array, f_test, fs)
+w_lcmv = compute_fixed_weights_optimized(C, h)
 
 # --- 4. SIMULACIÓN DE LA SEÑAL RECIBIDA ---
-# Usamos un impulso (delta de Kronecker) como señal de prueba.
-source_signal = np.zeros(200)
-source_signal[50] = 1.0 # Impulso en la muestra 50
-Z_signals, _, _ = space_delay(source_signal, fs, source_pos, mic_array)
+# Usamos un tono puro a f_test como señal de prueba.
+duration_s = 0.1
+N_samples = int(duration_s * fs)
+t = np.arange(N_samples) / fs
+source_signal = np.sin(2 * np.pi * f_test * t)
+
+# Propagar la señal al array. Z_signals tendrá padding añadido por space_delay.
+Z_signals, signal_padded_ref, _ = space_delay(source_signal, fs, source_pos, mic_array)
+
+# Potencia de la señal de referencia para calcular la ganancia
+# Se debe calcular sobre la señal con padding para que la duración coincida con la de la salida.
+source_power = np.mean(signal_padded_ref**2)
 
 # --- 5. APLICACIÓN DEL BEAMFORMER ---
 U_snapshots = snapshots(Z_signals, K)
-y_output = beamforming(U_snapshots, w_ds)
+y_output = beamforming(U_snapshots, w_lcmv)
 y_output_flat = y_output.flatten()
 
 # --- 6. VERIFICACIÓN DEL RESULTADO ---
-peak_amplitude = np.max(y_output_flat)
+# La ganancia debe ser 1 (0 dB) para la señal objetivo.
+output_power = np.mean(y_output_flat**2)
+gain_dB = 10 * np.log10(output_power / source_power)
 
-print(f"\nAmplitud del pico de salida: {peak_amplitude:.4f}")
-print(f"Amplitud esperada: {float(M)}")
+print(f"\nGanancia de potencia en el foco: {gain_dB:.4f} dB")
+print(f"Ganancia esperada: 0.0 dB")
 
-if np.isclose(peak_amplitude, M, atol=1e-1):
-    print("✅ TEST PASADO: La suma constructiva es correcta.")
+if np.isclose(gain_dB, 0, atol=0.5): # Tolerancia de 0.5 dB
+    print("✅ TEST PASADO: La ganancia en el foco es correcta.")
 else:
-    print("❌ TEST FALLIDO: La amplitud de salida no coincide.")
+    print("❌ TEST FALLIDO: La ganancia en el foco no es unitaria.")
 
 # --- 7. VISUALIZACIÓN ---
 plt.figure(figsize=(10, 7))
@@ -84,9 +74,49 @@ ax1.set_xlabel('Tiempo (ms)')
 plt.colorbar(im, ax=ax1, label='Amplitud')
 ax2 = plt.subplot(2, 1, 2)
 ax2.plot(np.arange(len(y_output_flat))/fs*1000, y_output_flat)
-ax2.set_title(f'Salida del Beamformer Delay-and-Sum (Pico medido = {peak_amplitude:.2f})')
+ax2.set_title(f'Salida del Beamformer LCMV (Ganancia medida = {gain_dB:.2f} dB)')
 ax2.set_xlabel('Tiempo (ms)')
 ax2.set_ylabel('Amplitud')
 ax2.grid(True, linestyle=':')
 plt.tight_layout()
+plt.show()
+
+# --- 8. CÁLCULO Y GRÁFICO DEL PATRÓN POLAR ---
+print("\n--- Calculando Patrón Polar ---")
+
+# 1. Generar los puntos de prueba alrededor del array usando source_rotation
+num_points = 360
+test_points, angles_deg = source_rotation(source_distance, num_points, axis='h')
+angles_rad = np.deg2rad(angles_deg)
+
+# 2. Simular la propagación desde TODAS las direcciones a la vez.
+# `space_delay` puede manejar un array de posiciones (P, 3).
+# Z_test_all tendrá forma (P, M, N_samples_fft)
+Z_test_all, _, _ = space_delay(source_signal, fs, test_points.T, mic_array)
+
+# 3. Calcular la ganancia para cada dirección
+beampattern_dB = []
+source_power_ref = np.mean(source_signal**2)
+
+for i in range(num_points):
+    # Extraer las señales para la dirección i-ésima
+    Z_test = Z_test_all[i, :, :]
+
+    # Aplicar el beamformer con los mismos pesos w_lcmv
+    U_test = snapshots(Z_test, K)
+    y_test = beamforming(U_test, w_lcmv)
+
+    output_power = np.mean(y_test**2)
+    gain = 10 * np.log10(output_power / source_power_ref + 1e-9)
+    beampattern_dB.append(gain)
+
+print("Cálculo finalizado.")
+
+# 4. Visualización en un gráfico polar
+fig, ax = plt.subplots(subplot_kw={'projection': 'polar'})
+ax.plot(angles_rad, beampattern_dB)
+ax.set_title(f'Patrón de Directividad del Beamformer LCMV (Foco a 45°)', va='bottom')
+ax.set_xlabel('Ganancia (dB)')
+ax.set_theta_zero_location("N") # 0 grados arriba
+ax.grid(True)
 plt.show()

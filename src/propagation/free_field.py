@@ -39,15 +39,16 @@ def space_delay(signal, fs, source_pos, mic_array):
     
     # 2. DETERMINAR LA LONGITUD GLOBAL (N_fft)
     # Basado en el máximo retardo para el zero-padding (evitar aliasing)
-    retardo_muestras_max = np.max(tau_array) * fs
-    N_minimo = N_original + int(np.ceil(retardo_muestras_max))
-    N_fft = 2**(int(np.ceil(np.log2(N_minimo)))) # Potencia de 2 para FFT eficiente
+    max_delay_samples = int(np.ceil(np.max(tau_array) * fs))
+    # La longitud de la FFT debe ser suficiente para contener la señal original
+    # más el máximo retardo para evitar el aliasing circular.
+    N_fft = 2**(int(np.ceil(np.log2(N_original + max_delay_samples))))
     
     # 3. PRE-PROCESAMIENTO GLOBAL (Hecho solo una vez)
-    padding_length = N_fft - N_original
-    signal_padded = np.pad(signal, (0, padding_length), 'constant')
+    # Se añade padding al final para acomodar la longitud de la FFT.
+    signal_padded = np.pad(signal, (0, N_fft - N_original), 'constant')
     
-    # 3b. Calcular la FFT global de la señal una sola vez
+    # Calcular la FFT global de la señal una sola vez
     X = np.fft.fft(signal_padded)
     
     # 3c. Vector de frecuencias k
@@ -64,7 +65,10 @@ def space_delay(signal, fs, source_pos, mic_array):
     Y_matrix = X * phase_shift_matrix
     
     # IFFT en el eje de las muestras (axis=1)
-    array_retardado = np.fft.ifft(Y_matrix, axis=1).real
+    # Usamos ifft en el eje correcto (el último)
+    array_retardado_complex = np.fft.ifft(Y_matrix, axis=-1)
+    # El resultado debe ser real, el componente imaginario es ruido numérico.
+    array_retardado = array_retardado_complex.real
     
     # Si solo había una fuente, devolvemos el resultado con la forma original (M, N_fft)
     if num_sources == 1:
