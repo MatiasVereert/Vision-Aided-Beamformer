@@ -2,7 +2,8 @@
 import numpy as np
 from beamforming.processors import point_constraint, compute_fixed_weights_optimized 
 from beamforming.models import near_field_steering_vector
-from beamforming.gain import calculate_gain_at_points, polar_gain
+from beamforming.evaluation.gain import synthetic_gain, polar_gain, analitical_gain
+import beamforming.evaluation.gain as gain 
 from utils.geometry import source_rotation
 from utils.polar_plot import plot_polar_pattern
 
@@ -41,7 +42,7 @@ null_point = source_distance * np.array([np.cos(null_direction_rad), np.sin(null
 points_to_test = np.array([focal_point, null_point])
 
 # 4.3. Calcular la ganancia física en AMBOS puntos
-gains_db = calculate_gain_at_points(
+gains_db = synthetic_gain(
     f=f_test,
     fs=fs,
     mic_array=mic_array,
@@ -76,7 +77,7 @@ source_points_3d, angles_deg = source_rotation(radius=source_distance, samples=p
 source_points_transposed = source_points_3d.T # Convertir de (3, P) a (P, 3)
 
 # 5.2. Calcular la ganancia para todos los puntos con UNA SOLA LLAMADA
-gains_absolute_db = calculate_gain_at_points(
+gains_absolute_db = synthetic_gain(
     f=f_test,
     fs=fs,
     mic_array=mic_array,

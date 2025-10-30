@@ -3,7 +3,7 @@ from scipy.constants import speed_of_sound
 
 from utils.geometry import source_rotation
 from beamforming.processors import beamforming, snapshots
-from beamforming.models import near_field_steering_vector
+from beamforming.models import near_field_steering_vector, near_field_steering_vector_multi
 from propagation.free_field import space_delay
 
 
@@ -96,7 +96,7 @@ def polar_gain(f, fs, mic_array, weights, focal_point, points=360):
 
     return gain_db, angles_deg
 
-def simulate_gain(f, fs, mic_array, weights, source_points):
+def synthetic_gain(f, fs, mic_array, weights, source_points):
     """
     Calculates the beamformer's time-domain gain at a set of specified spatial points.
 
@@ -150,7 +150,7 @@ def simulate_gain(f, fs, mic_array, weights, source_points):
     return gain_db
 
 
-def analitical(frecs, fs, mic_array, weights, source_points):
+def analytical_gain(frecs, fs, mic_array, weights, source_points):
     # 1. Derivar M y K a partir de las formas de los arrays (como hiciste antes)
     M = mic_array.shape[0]
     M_K = weights.shape[0]
@@ -159,7 +159,7 @@ def analitical(frecs, fs, mic_array, weights, source_points):
     K = int(M_K / M)
 
     #Caclulate the steering vector for each pointa and frecuency (F, P, KxM)
-    steering_vectors = near_field_steering_vector(frecs, source_points, fs, mic_array, K )
+    steering_vectors = near_field_steering_vector_multi(frecs, source_points, fs, mic_array, K )
 
     #hermitian traspoese fo the weights (as dim: 1D no need to transpose)
     w_H = np.conj(weights).flatten()

@@ -1,73 +1,59 @@
 import numpy as np
 from scipy.constants import speed_of_sound
 
-def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
+def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
     """
-    Calculates the near-field steering vector for an array of frequencies.
-
-    This function is vectorized to efficiently compute steering vectors for multiple
-    frequencies at once using NumPy broadcasting.
-
-    Args:
-        f (np.ndarray or float): Array of frequencies (shape F,) or a single frequency in Hz.
-        fs (int): Sampling frequency of the signal (to determine tap length).
-        Rs (np.ndarray): Source location (x, y, z), the focal point.
-        K (int): Number of taps.
-        mic_array (np.ndarray): Array of M microphones with 3D coordinates (x, y, z).
-        c (float): Speed of sound in m/s.
-
-    Returns:
-        np.ndarray: Steering vectors array of shape (M*K, F). If f is a scalar,
-                    the shape is (M*K, 1).
+    Calcula los steering vectors de campo cercano para múltiples frecuencias y puntos de la fuente.
+    Esta versión está corregida para manejar el broadcasting de dimensiones correctamente.
     """
-    # 1. Asegurar que 'f' sea al menos un array 1D para consistencia
     f = np.atleast_1d(f)
+    Rs = np.atleast_2d(Rs)
+    
     F = f.shape[0]
-
-    # 2. Calcular factor de normalización (será un vector de forma (F,))
-    source_distance = np.linalg.norm(Rs)
-    phase_reference = np.exp(1j * 2 * np.pi * f * source_distance / c)
-    normalization_factor = source_distance / phase_reference
+    P = Rs.shape[0]
+    M = mic_array.shape[0]
     
-    # Remodelar para broadcasting: (F, 1, 1)
-    normalization_factor = normalization_factor.reshape(F, 1, 1)
+    # --- Cálculos dependientes de Rs (dimensión de Puntos, P) ---
+    source_distances = np.linalg.norm(Rs, axis=1) # Shape: (P,)
+    mic_distances = np.linalg.norm(Rs[:, np.newaxis, :] - mic_array[np.newaxis, :, :], axis=2) # Shape: (P, M)
     
-    # 3. Calcular delays (esto no cambia, no dependen de la frecuencia)
-    # Distances of each element respect to the source (shape M, 1)
-    distances = np.linalg.norm(Rs - mic_array, axis=1).reshape(-1, 1)
-    mic_delay = distances / c  # Shape (M, 1)
+    # --- CORRECCIÓN: Construir el factor de normalización con la forma correcta ---
+    
+    # 1. Combinar frecuencias y distancias para obtener una matriz (F, P)
+    #    f[:, np.newaxis] -> (F, 1)
+    #    source_distances[np.newaxis, :] -> (1, P)
+    #    El broadcasting resulta en (F, P)
+    phase_ref_2d = np.exp(1j * 2 * np.pi * f[:, np.newaxis] * source_distances[np.newaxis, :] / c)
+    
+    # 2. Calcular el factor de normalización, que también será (F, P)
+    norm_factor_2d = source_distances[np.newaxis, :] / phase_ref_2d
+    
+    # 3. ### LA CLAVE DE LA SOLUCIÓN ###
+    #    Añadir dos dimensiones "dummy" al final para que tenga la forma (F, P, 1, 1)
+    #    Esta forma SÍ es compatible para el broadcasting con (F, P, M, K)
+    norm_factor = norm_factor_2d[:, :, np.newaxis, np.newaxis]
 
-    # Tap delays (shape 1, K)
+    # --- Delays (sin cambios) ---
+    mic_delay = mic_distances / c # Shape: (P, M)
     T = 1 / fs
-    tabs = np.arange(K)
-    tab_delay = tabs * T # Shape (K,)
+    tab_delay = np.arange(K) * T # Shape: (K,)
+    total_delay = mic_delay[:, :, np.newaxis] + tab_delay[np.newaxis, np.newaxis, :] # Shape: (P, M, K)
     
-    # 4. Construir el steering vector usando broadcasting
-    # Remodelar f para que tenga la forma (F, 1, 1)
-    f_col = f.reshape(F, 1, 1)
+    # --- Cálculo del Steering Vector (sin cambios) ---
+    # Broadcasting de f (F,1,1,1) con total_delay (1,P,M,K) -> (F, P, M, K)
+    f_bcast = f.reshape(F, 1, 1, 1)
+    phase_term = np.exp(-1j * 2 * np.pi * f_bcast * total_delay[np.newaxis, ...])
+    steering_vector = phase_term / mic_distances[np.newaxis, :, :, np.newaxis]
     
-    # El delay total tiene forma (M, K)
-    total_delay = mic_delay + tab_delay.reshape(1, K)
+    # --- Aplicar la normalización (esta línea ahora funciona) ---
+    # Broadcasting: (F, P, 1, 1) * (F, P, M, K) -> (F, P, M, K)
+    normalized_sv = norm_factor * steering_vector
+    
+    # --- Reshape Final (sin cambios) ---
+    final_sv = normalized_sv.reshape(F, P, M * K)
+    
+    return final_sv
 
-    # Broadcasting: (F, 1, 1) * (M, K) -> (F, M, K)
-    phase_term = np.exp(-1j * 2 * np.pi * f_col * total_delay)
-    
-    # Broadcasting: (F, M, K) / (M, 1) -> (F, M, K)
-    steering_vector = phase_term / distances
-
-    # 5. Aplicar la normalización
-    # Broadcasting: (F, 1, 1) * (F, M, K) -> (F, M, K)
-    normalized_sv = normalization_factor * steering_vector
-
-    # 6. Colapsar las dimensiones M y K y transponer para la forma final (M*K, F)
-    # Primero, se aplana la dimensión de M y K para cada frecuencia: (F, M*K)
-    reshaped_sv = normalized_sv.reshape(F, -1)
-    
-    # Luego, se transpone para obtener la forma deseada: (M*K, F)
-    final_steering_vector = reshaped_sv.T
-    
-    return final_steering_vector
-'''
 def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
     """
     Calculathes the steering vector for a specific frecuency
@@ -110,4 +96,3 @@ def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
 
     return normalized_steering_vector
 
-'''
