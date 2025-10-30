@@ -1,35 +1,62 @@
 from matplotlib import pyplot as plt 
 import numpy as np
 from scipy.constants import speed_of_sound
-from .utils.geo
 
+from utils.geometry import source_rotation
+from beamforming.processors import beamforming
+from propagation.free_field import space_delay
+from beamforming.processors import snapshots
 
-
-def calculate_polar(f, mic_array, K_taps, fs, c= speed_of_sound, beamformer = 'narrowband_LCMV', propagation = "free_field"  ):
+def plot_polar_pattern(gain_db, angles_deg, title="Patrón de Directividad del Beamformer"):
     """
-    
+    Generates a 2D polar plot of a beamformer's directivity pattern.
+
+    This function takes gain data in decibels and corresponding angles in
+    degrees and creates a standard polar plot. It is designed to visualize
+    the output of functions like `calculate_gain_at_points` after normalization.
+
+    Args:
+        gain_db (np.ndarray): 
+            A 1D array containing the beampattern gain in decibels (dB).
+            It is assumed that this data is already normalized, so the peak is at 0 dB.
+        angles_deg (np.ndarray): 
+            A 1D array of the corresponding angles in degrees. Must have the
+            same length as `gain_db`.
+        title (str, optional): 
+            The title for the polar plot. Defaults to 
+            "Patrón de Directividad del Beamformer".
     """
-    #Define the test signal
-    duration_s = 1  # 1 s of duration
-    t = np.arange(0, duration_s, 1/fs)
-    signal_source = np.sin(2 * np.pi * f * t)
+    # 1. Convert angles from degrees to radians, as required by Matplotlib's polar plot.
+    angles_rad = np.deg2rad(angles_deg)
 
-    #Calculate signal arribal from diferent angles 
-    source_points = 
+    # 2. Create a figure and a subplot with a polar projection.
+    fig, ax = plt.subplots(subplot_kw={'projection': 'polar'})
 
+    # 3. Plot the gain data against the angles.
+    ax.plot(angles_rad, gain_db)
 
-
+    # 4. Configure the plot for better readability.
+    # Set the radial limits (r-axis) to show the dynamic range clearly.
+    # For example, from -40 dB up to a little above 0 dB.
+    ax.set_rmin(np.min(gain_db) - 5 if np.min(gain_db) > -100 else -40)
+    ax.set_rmax(np.max(gain_db) + 5 if np.max(gain_db) < 5 else 5)
     
+    # Set the title for the plot. 'va' positions it nicely.
+    ax.set_title(title, va='bottom', fontsize=14)
 
-
+    # Set the label for the radial axis (the gain).
+    ax.set_ylabel("Ganancia (dB)", labelpad=-40)
     
-    return 
-
-
-def simple_plot( gain, angle ):
-    """ 
+    # Set the 0-degree angle to be at the top ("North").
+    ax.set_theta_zero_location("N")
     
+    # Set the angular direction to be clockwise.
+    ax.set_theta_direction(-1)
 
+    # Enable the grid for easier reading.
+    ax.grid(True)
 
-    """
-    return 
+    # 5. Display the plot.
+    plt.show()
+
+    return

@@ -33,7 +33,7 @@ def space_delay(signal, fs, source_pos, mic_array):
 
     # 1. CÁLCULO VECTORIAL DE DISTANCIAS Y RETARDOS
     # Broadcasting: (P, 1, 3) - (M, 3) -> (P, M, 3)
-    diff_vectors = source_pos[:, np.newaxis, :] - mic_array
+    diff_vectors = source_pos[:, np.newaxis, :] - mic_array[np.newaxis, :, :]
     distancias = np.linalg.norm(diff_vectors, axis=2) # Resultado: (P, M)
     tau_array = distancias / speed_of_sound  # Array de retardos temporales (tau_m)
     
@@ -71,8 +71,8 @@ def space_delay(signal, fs, source_pos, mic_array):
     array_retardado = array_retardado_complex.real
     
     # Si solo había una fuente, devolvemos el resultado con la forma original (M, N_fft)
-    if num_sources == 1:
-        array_retardado = array_retardado.squeeze(axis=0)
+    #if num_sources == 1:
+    #    array_retardado = array_retardado.squeeze(axis=0)
 
     # 6. SEÑAL DE REFERENCIA (Padded a la misma longitud N_fft)
     signal_referencia_padded = signal_padded 
