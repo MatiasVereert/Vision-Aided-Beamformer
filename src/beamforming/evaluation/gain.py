@@ -149,7 +149,6 @@ def synthetic_gain(f, fs, mic_array, weights, source_points):
 
     return gain_db
 
-
 def analytical_gain(frecs, fs, mic_array, weights, source_points):
     # 1. Derivar M y K a partir de las formas de los arrays (como hiciste antes)
     M = mic_array.shape[0]

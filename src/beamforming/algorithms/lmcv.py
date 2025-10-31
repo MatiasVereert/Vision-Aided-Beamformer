@@ -19,7 +19,8 @@ def point_constraint( target_point , K_taps, mic_array , f, fs ):
 
 def compute_fixed_weights_optimized(Constrains, Target_gain):
     '''
-    Fixed weights computation given by the equation w_q = C(C^[H]C)^-1 h.
+    Fixed weights computation given by the equation
+             w_q = C(C^[H]C)^-1 h.
     Uses np.linalg.solve for improved numerical stability and efficiency 
     compared to explicit matrix inversion.
     '''
