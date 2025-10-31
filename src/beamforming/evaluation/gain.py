@@ -3,7 +3,7 @@ from scipy.constants import speed_of_sound
 
 from utils.geometry import source_rotation
 from beamforming.processors import beamforming, snapshots
-from beamforming.models import near_field_steering_vector, near_field_steering_vector_multi
+from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
 from propagation.free_field import space_delay
 
 

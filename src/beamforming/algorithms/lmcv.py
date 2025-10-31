@@ -1,20 +1,8 @@
-from beamforming.models import near_field_steering_vector
+from beamforming.signal_model import near_field_steering_vector
 import numpy as np 
-
-
-def point_constraint( target_point , K_taps, mic_array , f, fs ):
-    #steering vector of the specific point (shape (M.K , 1))
-    steering_vector = near_field_steering_vector(f, target_point, fs, mic_array, K=K_taps)
-    
-    constrains_C = np.hstack([np.real(steering_vector), np.imag(steering_vector)]) 
-
-    # 3. Definir el vector de respuesta deseada h. (Forma: 2 x 1)
-    # [Ganancia Real Deseada (1)]
-    # [Ganancia Imaginaria Deseada (0)]
-    target_gain_h = np.vstack([1.0, 0.0]) # [1, 0]^T
-
-
-    return constrains_C, target_gain_h
+from .optimizer import WeightOptimizer
+from .constrains import ConstrainGenerator
+from ..array.mic_array import MicArray
 
 
 def compute_fixed_weights_optimized(Constrains, Target_gain):
@@ -41,3 +29,26 @@ def compute_fixed_weights_optimized(Constrains, Target_gain):
     return fixed_weights
 
 import numpy as np
+
+class LmcvOptimizer(WeightOptimizer):
+    def __init__(self, constrains_generator : ConstrainGenerator):
+        '''
+        Indicates constrain strategy.
+        '''
+        self.constrains_generator = constrains_generator
+    
+    def calculate(self, array_obj: MicArray, K: int, fs: float, **kwargs):
+        """
+        Calcula los pesos del beamformer.
+        
+        Args:
+            array_obj (MicrophoneArray): El objeto de la geometría del arreglo.
+            K (int): Número de taps.
+            fs (float): Frecuencia de muestreo.
+            **kwargs: Este optimizador no los usa directamente, pero los pasa
+                      al generador de restricciones si este los necesita.
+        """
+        C, H = self.constrains_generator.generate(array_obj, K, fs, **kwargs)
+
+        weights = compute_fixed_weights_optimized(C, H)
+        return weights

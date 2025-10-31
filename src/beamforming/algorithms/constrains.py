@@ -1,9 +1,7 @@
 from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
-
-from abc import ABC, abstractmethod
 import numpy as np
+from abc import ABC, abstractmethod
 from typing import Tuple
-
 from ..array.mic_array import MicArray
 
 
@@ -19,37 +17,42 @@ def point_constraint( target_point , K_taps, mic_array , f, fs ):
     # [Ganancia Imaginaria Deseada (0)]
     target_gain_h = np.vstack([1.0, 0.0]) # [1, 0]^T
 
-
     return constrains_C, target_gain_h
 
 class ConstrainGenerator(ABC):
     '''
-    Abstract Class to generate diferent constraints
+    Abstract Class to generate to generate constrains
     '''
     @abstractmethod
-    def generate(self, array_obj: MicArray, K: int, fs: float) -> Tuple[np.ndarray, np.ndarray]:
+    def generate(self, array_obj: MicArray, K: int, fs: float, **kwargs) -> Tuple[np.ndarray, np.ndarray]:
         pass
-
 
 class NarrowbandPointConstrain(ConstrainGenerator):
     '''
+    Defines constrainst structure for unitary gain at focal focal point with f_target. 
     '''
-    def __init__(self, focal_point : np.ndarray, f_target : int ):
-        self.focal_point = focal_point
+    def __init__(self,  f_target : int, **kwargs):
+
         self.f_target = f_target
 
-    def generate(self, array_obj: MicArray, K: int, fs: float):
+    def generate(self, array_obj: MicArray, K: int, fs: float, **kwargs):
+
+        #search the kwargs 
+        if 'focal_point' not in kwargs:
+            raise ValueError("NarrowbandPointConstrain requires 'focal_point' in kwargs")
+        
+        focal_point = kwargs['focal_point']
+
         mic_array = array_obj.coordinates
 
-        C, H = point_constraint(self.focal_point, K, mic_array, self.f_target, fs  )
+        C, H = point_constraint( target_point = focal_point,
+                                 K_taps= K,
+                                 mic_array = mic_array,
+                                 f = self.f_target,
+                                 fs = fs  )
         return C, H
     
-    
 
-#class BroadbandPointConstrain(ConstrainGenerator):
-    '''
-    Work in progress
-    '''
     
 
 

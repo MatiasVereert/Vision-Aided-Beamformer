@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.constants import speed_of_sound
-from beamforming.models import near_field_steering_vector
+from beamforming.signal_model import near_field_steering_vector
 from numpy.lib.stride_tricks import sliding_window_view
 
 
