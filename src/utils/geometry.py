@@ -55,13 +55,75 @@ def source_rotation(radius, samples, axis = 'h'):
 
     return points, degrees 
     
-def sferical_to_coord(radius, azimut, elevation):
-    # Función de conversión (usamos la que ya definiste)
-    coords = np.array([ np.cos(azimut) * np.sin(elevation),
-                        np.sin(elevation) * np.sin(azimut),
-                        np.cos(elevation) ])
+import numpy as np
 
-    return radius * coords
+def spherical_to_cartesian(
+    radius: np.ndarray, 
+    azimuth: np.ndarray, 
+    elevation: np.ndarray
+) -> np.ndarray:
+    """
+    Converts arrays of Spherical coordinates to Cartesian (x, y, z).
+
+    This function assumes the ISO 80000-2 standard (physics convention):
+    - radius (r): Distance from the origin.
+    - azimuth (θ): Angle in the XY-plane from the X-axis (in radians).
+    - elevation (φ): Angle from the positive Z-axis (in radians).
+
+    Args:
+        radius (np.ndarray): Array of radial distances. Shape (N,).
+        azimuth (np.ndarray): Array of azimuth angles (theta) in radians. Shape (N,).
+        elevation (np.ndarray): Array of elevation angles (phi) in radians. Shape (N,).
+
+    Returns:
+        np.ndarray: Array of (x, y, z) Cartesian coordinates. Shape (N, 3).
+    """
+    
+    # Calculate Cartesian coordinates using element-wise operations
+    x = radius * np.sin(elevation) * np.cos(azimuth)
+    y = radius * np.sin(elevation) * np.sin(azimuth)
+    z = radius * np.cos(elevation)
+    
+    # Stack the (N,) coordinate arrays as columns to create an (N, 3) matrix
+    cartesian_coords = np.stack([x, y, z], axis=1)
+    
+    return cartesian_coords
+
+
+
+def cartesian_to_spherical(cartesian_coords: np.ndarray) -> np.ndarray:
+    """
+    Converts an array of Cartesian coordinates (x, y, z) to Spherical.
+
+    Args:
+        cartesian_coords (np.ndarray): Array of (x, y, z) points. Shape: (N, 3).
+
+    Returns:
+        np.ndarray: Array of (radius, azimuth, elevation) points. Shape: (N, 3).
+                    Azimuth and elevation are in radians.
+    """
+    x = cartesian_coords[:, 0]
+    y = cartesian_coords[:, 1]
+    z = cartesian_coords[:, 2]
+
+    radius = np.linalg.norm(cartesian_coords, axis=1)
+
+    # Avoid division by zero at the origin (r=0)
+    radius_safe = np.where(radius == 0, 1e-12, radius)
+    
+    # Calculate elevation (polar angle, φ, from the Z-axis) [0, pi]
+    elevation = np.arccos(np.clip(z / radius_safe, -1.0, 1.0))
+    
+    # Calculate azimuth (angle, θ, in the XY-plane from the X-axis) [-pi, pi]
+    azimuth = np.arctan2(y, x)
+
+    # Handle the origin case (0, 0, 0)
+    elevation[radius == 0] = 0.0
+    azimuth[radius == 0] = 0.0
+    
+    spherical_coords = np.stack([radius, azimuth, elevation], axis=1)
+    
+    return spherical_coords
 
 def source_sphere_grid(radius, samples_azimut, samples_elevation):
     """
