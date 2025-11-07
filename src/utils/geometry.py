@@ -90,40 +90,67 @@ def spherical_to_cartesian(
     return cartesian_coords
 
 
+import numpy as np
 
 def cartesian_to_spherical(cartesian_coords: np.ndarray) -> np.ndarray:
     """
-    Converts an array of Cartesian coordinates (x, y, z) to Spherical.
+    Converts Cartesian coordinates (x, y, z) to Spherical (radius, azimuth, elevation).
+
+    This function robustly handles both a single point (1D array of shape (3,))
+    and a batch of points (2D array of shape (N, 3)).
 
     Args:
-        cartesian_coords (np.ndarray): Array of (x, y, z) points. Shape: (N, 3).
+        cartesian_coords (np.ndarray): Array of (x, y, z) points.
+                                     Shape can be (3,) or (N, 3).
 
     Returns:
-        np.ndarray: Array of (radius, azimuth, elevation) points. Shape: (N, 3).
+        np.ndarray: Array of (radius, azimuth, elevation) points.
+                    Shape will be (3,) or (N, 3), matching the input shape.
                     Azimuth and elevation are in radians.
     """
-    x = cartesian_coords[:, 0]
-    y = cartesian_coords[:, 1]
-    z = cartesian_coords[:, 2]
+    # 1. Convertir a un array de NumPy (por si el usuario pasó una lista)
+    coords = np.asarray(cartesian_coords)
+    
+    # 2. Detectar si la entrada es 1D (un solo punto)
+    if coords.ndim == 1:
+        if coords.shape[0] != 3:
+            raise ValueError(f"Single point must have shape (3,), but got {coords.shape}")
+        # Es 1D. Guardamos este hecho y la promovemos a 2D para el cálculo.
+        was_1d = True
+        coords_2d = coords.reshape(1, 3)
+    elif coords.ndim == 2:
+        if coords.shape[1] != 3:
+            raise ValueError(f"Array of points must have shape (N, 3), but got {coords.shape}")
+        # Es 2D, la usamos tal cual.
+        was_1d = False
+        coords_2d = coords
+    else:
+        raise ValueError(f"Input must be a 1D or 2D array, but got {coords.ndim} dimensions.")
 
-    radius = np.linalg.norm(cartesian_coords, axis=1)
+    # --- 3. Cálculos (Este bloque es idéntico al anterior) ---
+    # (Ahora 'coords_2d' está garantizado que es 2D)
+    x = coords_2d[:, 0]
+    y = coords_2d[:, 1]
+    z = coords_2d[:, 2]
 
-    # Avoid division by zero at the origin (r=0)
+    radius = np.linalg.norm(coords_2d, axis=1)
     radius_safe = np.where(radius == 0, 1e-12, radius)
     
-    # Calculate elevation (polar angle, φ, from the Z-axis) [0, pi]
     elevation = np.arccos(np.clip(z / radius_safe, -1.0, 1.0))
-    
-    # Calculate azimuth (angle, θ, in the XY-plane from the X-axis) [-pi, pi]
     azimuth = np.arctan2(y, x)
 
-    # Handle the origin case (0, 0, 0)
     elevation[radius == 0] = 0.0
     azimuth[radius == 0] = 0.0
     
     spherical_coords = np.stack([radius, azimuth, elevation], axis=1)
     
-    return spherical_coords
+    # --- 4. Devolver el formato original ---
+    if was_1d:
+        # Si la entrada era 1D, devolvemos un array 1D (shape (3,))
+        return spherical_coords.squeeze()
+    else:
+        # Si la entrada era 2D, devolvemos el array 2D (shape (N, 3))
+        return spherical_coords
 
 def source_sphere_grid(radius, samples_azimut, samples_elevation):
     """
@@ -163,7 +190,7 @@ def source_sphere_grid(radius, samples_azimut, samples_elevation):
 
     # 4. Uso de Broadcasting
     # La función vectorizada (sferical_to_coord) usa estos vectores N*M para generar la cuadrícula.
-    coords_grid = sferical_to_coord(radius, azimut_flat, elevation_flat)
+    coords_grid = spherical_to_cartesian(radius, azimut_flat, elevation_flat)
     
     # coords_grid tendrá forma (3, N*M)
     return coords_grid, azimut_flat, elevation_flat
