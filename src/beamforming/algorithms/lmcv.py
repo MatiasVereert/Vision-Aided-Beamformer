@@ -28,7 +28,6 @@ def compute_fixed_weights_optimized(Constrains, Target_gain):
 
     return fixed_weights
 
-import numpy as np
 
 class LmcvOptimizer(WeightOptimizer):
     def __init__(self, constrains_generator : ConstrainGenerator):
@@ -49,6 +48,6 @@ class LmcvOptimizer(WeightOptimizer):
                       al generador de restricciones si este los necesita.
         """
         C, H = self.constrains_generator.generate(array_obj, K, fs, **kwargs)
-
+        
         weights = compute_fixed_weights_optimized(C, H)
         return weights
