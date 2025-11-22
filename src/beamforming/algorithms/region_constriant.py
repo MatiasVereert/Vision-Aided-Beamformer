@@ -193,10 +193,9 @@ def build_region_constraints(
     num_points: int = 100, # I
     num_freqs: int = 100,  # J
     c: float = speed_of_sound
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]: # Actualizado type hint
     """
-    Orchestrates the calculation of the robust constraints C (Eq. 18)
-    and h (Eq. 18) based on the SVD method.
+    Orchestrates the calculation of the robust constraints C, h, and blocking matrix Ca.
     """
     
     # 1. Define sample points for the integration
@@ -206,28 +205,25 @@ def build_region_constraints(
     A, g = build_A_and_g(freqs, points, fs, mic_array, K, c)
 
     # 3. Perform SVD and find the rank L
-    # CORREGIDO: La llamada a la función no necesita P_total
+    # U tiene forma (N, N) si N < 2P (que es lo usual)
     L, U, s, Vh, epsilon = compute_svd_and_rank(A, energy_threshold=0.999)
 
-    # --- 4. Build C and h (Equation 18) ---
+    # --- 4. Build C, h, and Ca ---
     
-    # a. Build C = V_L
-    # V_L (paper) = U (numpy) truncated to L columns [cite: 233]
+    # a. Build C = V_L (Primeras L columnas de U)
     C = U[:, :L] # Shape (N, L)
 
-    # b. Build h = (Sigma_L)^-1 * (U_L)^T * g [cite: 234]
-    
-    # (Sigma_L)^-1
-    # CORREGIDO: Se usa la variable 's' (minúscula) y se trunca a 'L'
+    # b. Build Ca (Blocking Matrix) = Resto de columnas de U
+    # Esto es el complemento ortogonal de C.
+    Ca = U[:, L:] # Shape (N, N-L)
+
+    # c. Build h = (Sigma_L)^-1 * (U_L)^T * g
     s_L_inv = 1.0 / (s[:L] + 1e-12)
     Sigma_L_inv = np.diag(s_L_inv) # Shape (L, L)
     
-    # (U_L)^T
-    # CORREGIDO: U^T (paper) = Vh (numpy). U_L^T is the first L rows of Vh. [cite: 230]
     U_L_T = Vh[:L, :] # Shape (L, 2P)
 
     # Calculate h
-    # (L, L) @ (L, 2P) @ (2P, 1) -> (L, 1)
     h = Sigma_L_inv @ U_L_T @ g
 
-    return C, h   
+    return C, h, Ca

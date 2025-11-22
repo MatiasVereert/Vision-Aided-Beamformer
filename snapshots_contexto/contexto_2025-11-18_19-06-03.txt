@@ -1,0 +1,2840 @@
+SNAPSHOT DEL PROYECTO - FECHA: 2025-11-18_19-06-03
+===========================================
+
+
+============================================================
+ARCHIVO: README.md
+============================================================
+# Vision-Aided-Beamformer
+
+============================================================
+ARCHIVO: pyproject.toml
+============================================================
+[build-system]
+# Indica a Python cómo construir el paquete.
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beamfomig-python" # El nombre que tendrá tu paquete.
+version = "0.1.0" # La versión inicial.
+description = "Proyecto de Beamforming en Python"
+readme = "README.md"
+authors = [{name = "Tu Nombre", email = "tu.email@ejemplo.com"}]
+license = {file = "LICENSE"} # Si tienes un archivo de licencia.
+keywords = ["beamforming", "mems", "array", "audio"]
+
+# Las dependencias de tu proyecto. Asegúrate de incluir las librerías que usas.
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib", # Si usas plot_utils
+]
+
+[tool.setuptools.packages]
+# Esta sección es CRUCIAL. Indica dónde están los módulos.
+# En tu caso, 'src' contiene los paquetes 'beamforming' y 'propagation'.
+# La siguiente línea le dice a setuptools que busque los paquetes dentro de la carpeta 'src'.
+find = {where = ["src"]}
+
+
+============================================================
+ARCHIVO: exportar_contexto.py
+============================================================
+import os
+from datetime import datetime
+
+# --- CONFIGURACIÓN ---
+# Carpeta donde se guardarán los historiales
+OUTPUT_DIR = 'snapshots_contexto'
+
+# Extensiones permitidas
+ALLOWED_EXTENSIONS = {'.py', '.toml', '.md', '.json'}
+
+# Carpetas a ignorar
+IGNORE_DIRS = {
+    '.git', 
+    '__pycache__', 
+    'venv', 
+    'env', 
+    '.idea', 
+    '.vscode',
+    'build',
+    'dist',
+    'beamfomig_python.egg-info'
+}
+
+def is_ignored(path_part):
+    """Verifica si una carpeta debe ser ignorada."""
+    return path_part in IGNORE_DIRS or path_part.endswith('.egg-info')
+
+def main():
+    # 1. Crear directorio de snapshots si no existe
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+        print(f"Carpeta '{OUTPUT_DIR}' creada.")
+
+    # 2. Generar nombre de archivo con fecha y hora
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"contexto_{timestamp}.txt"
+    full_path = os.path.join(OUTPUT_DIR, filename)
+
+    print(f"Iniciando exportación a: {full_path}...")
+    
+    try:
+        with open(full_path, 'w', encoding='utf-8') as out_f:
+            out_f.write(f"SNAPSHOT DEL PROYECTO - FECHA: {timestamp}\n")
+            out_f.write("===========================================\n\n")
+
+            for root, dirs, files in os.walk("."):
+                # Evitar entrar en la propia carpeta de backups para no leer los txt viejos
+                if OUTPUT_DIR in root:
+                    continue
+
+                # Filtrar directorios in-place
+                dirs[:] = [d for d in dirs if not d.startswith('.') and not is_ignored(d)]
+                
+                for file in files:
+                    ext = os.path.splitext(file)[1]
+                    if ext in ALLOWED_EXTENSIONS:
+                        file_path = os.path.join(root, file)
+                        
+                        # Encabezado de archivo
+                        out_f.write(f"\n{'='*60}\n")
+                        out_f.write(f"ARCHIVO: {os.path.relpath(file_path, '.')}\n")
+                        out_f.write(f"{'='*60}\n")
+                        
+                        # Contenido
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as in_f:
+                                out_f.write(in_f.read())
+                                out_f.write("\n") 
+                            print(f"--> Agregado: {os.path.relpath(file_path, '.')}")
+                        except Exception as e:
+                            print(f"[!] Error leyendo {file_path}: {e}")
+                            out_f.write(f"[ERROR LEYENDO ARCHIVO: {e}]\n")
+
+        print(f"\n[OK] Snapshot guardado exitosamente en: {full_path}")
+
+    except Exception as e:
+        print(f"\n[ERROR CRÍTICO] No se pudo escribir el archivo: {e}")
+
+if __name__ == "__main__":
+    main()
+
+============================================================
+ARCHIVO: tests/2_das_vs_lcmv_point.py
+============================================================
+import numpy as np
+from scipy.constants import speed_of_sound
+from matplotlib import pyplot as plt 
+
+# --- Importaciones de tus módulos ---
+from beamforming.signal_model import near_field_steering_vector_multi
+# ESTA ES TU FUNCIÓN ORIGINAL (BEAMPATTERN)
+from beamforming.evaluation.gain import analytical_gain 
+from beamforming.algorithms.lmcv import compute_fixed_weights_optimized
+from utils.geometry import source_rotation, cartesian_to_spherical, spherical_to_cartesian
+from typing import Tuple
+
+# --------------------------------------------------------------------------
+# --- TUS FUNCIONES SVD (Sin cambios) ---
+# --------------------------------------------------------------------------
+def set_domains(Rs, delta_r, delta_azimut, delta_elevation, fmin, fmax, P, J):
+    f_array = np.linspace(fmin, fmax, J)
+    Rs_sferical = cartesian_to_spherical(Rs)
+    radius = np.random.uniform(Rs_sferical[0] - delta_r/2,  Rs_sferical[0] + delta_r/2, P )
+    azimut = np.random.uniform(Rs_sferical[1] - delta_azimut/2, Rs_sferical[1]+ delta_azimut/2, P)
+    elevation = np.random.uniform( Rs_sferical[2] - delta_elevation/2, Rs_sferical[2]+ delta_elevation/2, P)
+    points = spherical_to_cartesian(radius, azimut, elevation)
+    return f_array, points
+
+def build_A_and_g(
+    freqs: np.ndarray, 
+    source_points: np.ndarray, 
+    fs: int, 
+    mic_array: np.ndarray, 
+    K: int, 
+    c: float = speed_of_sound
+) -> Tuple[np.ndarray, np.ndarray]: 
+    num_freqs = len(freqs)
+    num_points = len(source_points)
+    P_total = num_freqs * num_points
+    a_tensor_complex = near_field_steering_vector_multi(
+        f=freqs, Rs=source_points, fs=fs, mic_array=mic_array, K=K, c=c
+    )
+    N = a_tensor_complex.shape[2] 
+    a_transpose_complex = np.transpose(a_tensor_complex, axes=(2, 0, 1))
+    a_complex_flat = a_transpose_complex.reshape(N, -1)
+    A = np.hstack([np.real(a_complex_flat), np.imag(a_complex_flat)])
+    tau_center = ((K - 1) / 2) / fs
+    gain_amplitude = 1.0
+    freqs_P = np.repeat(freqs, num_points)
+    phi = 2 * np.pi * freqs_P * tau_center
+    g_real = gain_amplitude * np.cos(phi)
+    g_imag = gain_amplitude * np.sin(phi)
+    g = np.hstack([g_real, g_imag]).reshape(-1, 1)
+    return A, g
+
+def compute_svd_and_rank(
+    A: np.ndarray, 
+    energy_threshold: float = 0.9999
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, float]:
+    N, two_P = A.shape
+    P = two_P // 2
+    U, s, Vh = np.linalg.svd(A, full_matrices=False)
+    lambdas = (s**2) / P
+    total_energy = np.sum(lambdas)
+    if total_energy < 1e-12:
+        return 0, U, s, Vh, 0.0
+    cumulative_energy = np.cumsum(lambdas)
+    L = np.searchsorted(cumulative_energy / total_energy, energy_threshold) + 1
+    L = min(L, N)
+    epsilon_L = np.sum(lambdas[L:])
+    return L, U, s, Vh, epsilon_L
+
+def build_region_constraints(
+    Rs, delta_r, delta_azimut, delta_elevation, mic_array, fs, K,
+    f_min, f_max, num_points, num_freqs, c=speed_of_sound
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    freqs, points = set_domains(Rs, delta_r, delta_azimut, delta_elevation, f_min, f_max, num_points, num_freqs)
+    A, g = build_A_and_g(freqs, points, fs, mic_array, K, c)
+    L, U, s, Vh, epsilon = compute_svd_and_rank(A)
+    C = U[:, :L]
+    s_L_inv = 1.0 / (s[:L] + 1e-12)
+    Sigma_L_inv = np.diag(s_L_inv)
+    U_L_T = Vh[:L, :]
+    h = Sigma_L_inv @ U_L_T @ g 
+    return C, h, L
+
+# --------------------------------------------------------------------------
+# --- NUEVA FUNCIÓN PARA CALCULAR ARRAY GAIN SENSITIVITY (AGS) ---
+# --------------------------------------------------------------------------
+def calculate_array_gain(
+    w_q: np.ndarray, 
+    f_test: float, 
+    fs: int, 
+    mic_array: np.ndarray, 
+    K: int, 
+    scan_points: np.ndarray
+) -> np.ndarray:
+    """
+    Calcula el Array Gain (AG) para un filtro fijo w_q.
+    Asume Ruido Blanco (Rn = I).
+    AG(x) = |w_q^H a(x)|^2 / (w_q^H w_q)
+    """
+    a_scan_complex = near_field_steering_vector_multi(
+        f=f_test, Rs=scan_points, fs=fs, mic_array=mic_array, K=K
+    )
+    if a_scan_complex.shape[0] == 1:
+        a_scan_complex = a_scan_complex.squeeze(0) 
+
+    w_q_H = np.conj(w_q).T
+    response_power = np.abs(a_scan_complex @ w_q_H)**2
+    
+    # Denominador: White Noise Gain (WNG)
+    noise_power_out = np.dot(np.conj(w_q), w_q).real 
+    
+    if noise_power_out < 1e-12: noise_power_out = 1e-12
+        
+    array_gain = response_power / noise_power_out
+    array_gain_db = 10 * np.log10(array_gain + 1e-12)
+    
+    return array_gain_db
+
+#-------------------------- Define test setup -----------------------------------
+print("Configurando parámetros (MODIFICADOS PARA COINCIDIR CON FIG. 3)...")
+fs = 48000
+K = 25
+C_SOUND = speed_of_sound
+f_test = 3000.0
+f_min_band = 1000.0
+f_max_band = 4000.0
+num_freqs_band = 50 
+
+LAMBDA_REF = C_SOUND / f_test
+M = 9
+D = LAMBDA_REF / 2
+mic_x = np.linspace(0, (M - 1) * D, M) - (M - 1) * D / 2
+mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
+
+radius = 5 * LAMBDA_REF
+focal_angle_rad = np.deg2rad(90.0)
+focal_point_cartesian = np.array([
+    radius * np.cos(focal_angle_rad), 
+    radius * np.sin(focal_angle_rad), 
+    0.0
+])
+N_total = M * K
+print(f"N total (M*K) = {N_total}")
+
+# ------------------------- 1. Define Point-Narrowband Constraint (LCMV-PN) -----------------------
+print("\n--- Calculando 1/4: LCMV-PN (Puntual, Narrowband) ---")
+sv_focal_complex = near_field_steering_vector_multi(f_test, focal_point_cartesian, fs, mic_array, K, C_SOUND).squeeze()
+C_pn = np.stack([np.real(sv_focal_complex), np.imag(sv_focal_complex)], axis = 1)
+tau_center = ((K - 1) / 2) / fs
+phase = 2 * np.pi * f_test * tau_center
+g_pn = np.hstack([np.cos(phase), np.sin(phase)])
+w_lcmv_pn = compute_fixed_weights_optimized(C_pn, g_pn) # w_q
+print(f"Pesos LCMV-PN (L=2) optimizados.")
+
+# -------------------------- 2. Compute DAS Weights -----------------------------------
+print("\n--- Calculando 2/4: DAS (Delay-and-Sum) ---")
+w_das = np.zeros(M * K)
+mic_distances = np.linalg.norm(focal_point_cartesian[np.newaxis, :] - mic_array, axis=1)
+delays_sec = mic_distances / C_SOUND
+ref_delay_sec = radius / C_SOUND
+relative_delays_sec = ref_delay_sec - delays_sec
+relative_delays_taps = np.round(relative_delays_sec * fs).astype(int)
+k_center_tap = (K - 1) // 2
+for m in range(M):
+    k = k_center_tap + relative_delays_taps[m]
+    if 0 <= k < K: w_das[m * K + k] = 1.0 / M
+print("Pesos DAS calculados.")
+
+# -------------------------- 3. Define Point-Broadband Constraint (LCMV-PB) -------------------------
+print("\n--- Calculando 3/4: LCMV-PB (Puntual, Broadband) ---")
+freq_array_band = np.linspace(f_min_band, f_max_band, num_freqs_band)
+point_array = focal_point_cartesian.reshape(1, 3) 
+A_pb, g_pb = build_A_and_g(freq_array_band, point_array, fs, mic_array, K, C_SOUND)
+L_pb, U_pb, s_pb, Vh_pb, epsilon_pb = compute_svd_and_rank(A_pb)
+print(f"Rango L (Puntual, Broadband) calculado: {L_pb}")
+C_pb = U_pb[:, :L_pb]
+h_pb = (np.diag(1.0 / (s_pb[:L_pb] + 1e-12)) @ Vh_pb[:L_pb, :] @ g_pb).flatten()
+w_lcmv_pb = (C_pb @ h_pb) # w_q
+print(f"Pesos LCMV-PB (L={L_pb}) optimizados.")
+
+# -------------------------- 4. Compute SVD-LCMV (Regional, Broadband) (LCMV-RB) -------------------------
+print("\n--- Calculando 4/4: LCMV-RB (Regional, Broadband) ---")
+delta_r_val = radius * 0.2
+delta_azimut_val = np.deg2rad(8.0)
+delta_elev_val = np.deg2rad(2.0) 
+C_rb, h_rb, L_rb = build_region_constraints(
+    Rs=focal_point_cartesian, delta_r=delta_r_val, delta_azimut=delta_azimut_val,
+    delta_elevation=delta_elev_val, mic_array=mic_array, fs=fs, K=K,
+    f_min=f_min_band, f_max=f_max_band, num_points=50, num_freqs=num_freqs_band
+)
+w_lcmv_rb = (C_rb @ h_rb).flatten() # w_q
+print(f"Pesos LCMV-RB (L={L_rb}) optimizados.")
+
+
+# -------------------------- Calculate Gains (Angular Scan) --------------------------
+print("\nCalculando ganancia (Escaneo Angular)...")
+angular_scan_points, deg = source_rotation(radius, 360, axis='h')
+angular_scan_points = angular_scan_points.T
+# Beampatterns (Usando tu función original)
+bp_pn_ang = analytical_gain(f_test, fs, mic_array, w_lcmv_pn, angular_scan_points).squeeze()
+bp_das_ang = analytical_gain(f_test, fs, mic_array, w_das, angular_scan_points).squeeze()
+bp_pb_ang = analytical_gain(f_test, fs, mic_array, w_lcmv_pb, angular_scan_points).squeeze()
+bp_rb_ang = analytical_gain(f_test, fs, mic_array, w_lcmv_rb, angular_scan_points).squeeze()
+# Array Gain Sensitivity (Usando la nueva función)
+ags_pn_ang = calculate_array_gain(w_lcmv_pn, f_test, fs, mic_array, K, angular_scan_points)
+ags_das_ang = calculate_array_gain(w_das, f_test, fs, mic_array, K, angular_scan_points)
+ags_pb_ang = calculate_array_gain(w_lcmv_pb, f_test, fs, mic_array, K, angular_scan_points)
+ags_rb_ang = calculate_array_gain(w_lcmv_rb, f_test, fs, mic_array, K, angular_scan_points)
+
+# -------------------------- Calculate Gains (Distance Scan) -------------------------
+print("Calculando ganancia (Escaneo de Distancia)...")
+scan_distances = np.linspace(radius * 0.1, radius * 3, 200) 
+dist_x = scan_distances * np.cos(focal_angle_rad)
+dist_y = scan_distances * np.sin(focal_angle_rad)
+dist_z = np.zeros_like(scan_distances)
+distance_scan_points = np.stack([dist_x, dist_y, dist_z], axis=1)
+# Beampatterns
+bp_pn_dist = analytical_gain(f_test, fs, mic_array, w_lcmv_pn, distance_scan_points).squeeze()
+bp_das_dist = analytical_gain(f_test, fs, mic_array, w_das, distance_scan_points).squeeze()
+bp_pb_dist = analytical_gain(f_test, fs, mic_array, w_lcmv_pb, distance_scan_points).squeeze()
+bp_rb_dist = analytical_gain(f_test, fs, mic_array, w_lcmv_rb, distance_scan_points).squeeze()
+# Array Gain Sensitivity
+ags_pn_dist = calculate_array_gain(w_lcmv_pn, f_test, fs, mic_array, K, distance_scan_points)
+ags_das_dist = calculate_array_gain(w_das, f_test, fs, mic_array, K, distance_scan_points)
+ags_pb_dist = calculate_array_gain(w_lcmv_pb, f_test, fs, mic_array, K, distance_scan_points)
+ags_rb_dist = calculate_array_gain(w_lcmv_rb, f_test, fs, mic_array, K, distance_scan_points)
+
+# -------------------------- Plot (Comparativo) -----------------------------------
+print("Graficando beampatterns...")
+filter_mask = (deg >= 0) & (deg <= 180) 
+deg_filtered = deg[filter_mask]
+focal_angle_deg = np.degrees(focal_angle_rad)
+
+# --- Crear 2 Figuras con 2 subplots cada una ---
+fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 14))
+fig2, (ax3, ax4) = plt.subplots(2, 1, figsize=(12, 14))
+
+# --- FIGURA 1: BEAMPATTERN (Lo que estuvimos viendo) ---
+fig1.suptitle("Métrica 1: Beampattern Response (Diseño de w_q)", fontsize=16)
+# Normalización (cada uno a su pico)
+bp_pn_norm_ang = bp_pn_ang - np.max(bp_pn_ang)
+bp_das_norm_ang = bp_das_ang - np.max(bp_das_ang)
+bp_pb_norm_ang = bp_pb_ang - np.max(bp_pb_ang)
+bp_rb_norm_ang = bp_rb_ang - np.max(bp_rb_ang)
+bp_pn_norm_dist = bp_pn_dist - np.max(bp_pn_dist)
+bp_das_norm_dist = bp_das_dist - np.max(bp_das_dist)
+bp_pb_norm_dist = bp_pb_dist - np.max(bp_pb_dist)
+bp_rb_norm_dist = bp_rb_dist - np.max(bp_rb_dist)
+
+# Plot 1: Angular Beampattern
+ax1.plot(deg_filtered, bp_pn_norm_ang[filter_mask], label="1. LCMV-PN", linestyle=':', alpha=0.7)
+ax1.plot(deg_filtered, bp_das_norm_ang[filter_mask], label="2. DAS", linestyle='--', alpha=0.7)
+ax1.plot(deg_filtered, bp_pb_norm_ang[filter_mask], label="3. LCMV-PB", linewidth=2.5, color='red')
+ax1.plot(deg_filtered, bp_rb_norm_ang[filter_mask], label="4. LCMV-RB", linewidth=2.5, color='blue')
+ax1.set_title(f"Respuesta Angular (Diseño del Haz) @ {f_test} Hz")
+ax1.set_ylim(-60, 5); ax1.set_xlim(0, 180); ax1.grid(True)
+ax1.set_xlabel("Ángulo (grados)"); ax1.set_ylabel("Ganancia Normalizada (dB)")
+ax1.axvline(x=focal_angle_deg, color='k', linestyle=':')
+ax1.legend()
+
+# Plot 2: Distance Beampattern
+ax2.plot(scan_distances, bp_pn_norm_dist, label="1. LCMV-PN", linestyle=':', alpha=0.7)
+ax2.plot(scan_distances, bp_das_norm_dist, label="2. DAS", linestyle='--', alpha=0.7)
+ax2.plot(scan_distances, bp_pb_norm_dist, label="3. LCMV-PB", linewidth=2.5, color='red')
+ax2.plot(scan_distances, bp_rb_norm_dist, label="4. LCMV-RB", linewidth=2.5, color='blue')
+ax2.set_title(f"Respuesta a Distancia (Diseño del Haz) en {focal_angle_deg:.1f}°")
+ax2.set_ylim(-60, 5); ax2.grid(True)
+ax2.set_xlabel("Distancia (metros)"); ax2.set_ylabel("Ganancia Normalizada (dB)")
+ax2.axvline(x=radius, color='k', linestyle=':')
+ax2.legend()
+
+# --- FIGURA 2: ARRAY GAIN SENSITIVITY (Lo que el paper ploteó) ---
+fig2.suptitle("Métrica 2: Array Gain Sensitivity (Falla vs Ruido Blanco)", fontsize=16)
+# Normalización (cada uno a su pico)
+ags_pn_norm_ang = ags_pn_ang - np.max(ags_pn_ang)
+ags_das_norm_ang = ags_das_ang - np.max(ags_das_ang)
+ags_pb_norm_ang = ags_pb_ang - np.max(ags_pb_ang)
+ags_rb_norm_ang = ags_rb_ang - np.max(ags_rb_ang)
+ags_pn_norm_dist = ags_pn_dist - np.max(ags_pn_dist)
+ags_das_norm_dist = ags_das_dist - np.max(ags_das_dist)
+ags_pb_norm_dist = ags_pb_dist - np.max(ags_pb_dist)
+ags_rb_norm_dist = ags_rb_dist - np.max(ags_rb_dist)
+
+# Plot 3: Angular AGS
+ax3.plot(deg_filtered, ags_pn_norm_ang[filter_mask], label="1. LCMV-PN (Puntual, Narrowband)", linestyle=':', alpha=0.7)
+ax3.plot(deg_filtered, ags_das_norm_ang[filter_mask], label="2. DAS (Simple)", linestyle='--', alpha=0.7)
+ax3.plot(deg_filtered, ags_pb_norm_ang[filter_mask], label="3. LCMV-PB (Puntual, Broadband)", linewidth=2.5, color='red')
+ax3.plot(deg_filtered, ags_rb_norm_ang[filter_mask], label="4. LCMV-RB (Regional, Broadband)", linewidth=2.5, color='blue')
+ax3.set_title(f"Sensibilidad Angular (Falla) @ {f_test} Hz")
+ax3.set_ylim(-60, 5); ax3.set_xlim(0, 180); ax3.grid(True)
+ax3.set_xlabel("Ángulo (grados)"); ax3.set_ylabel("Ganancia Normalizada (dB)")
+ax3.axvline(x=focal_angle_deg, color='k', linestyle=':')
+ax3.legend()
+
+# Plot 4: Distance AGS
+ax4.plot(scan_distances, ags_pn_norm_dist, label="1. LCMV-PN (Puntual, Narrowband)", linestyle=':', alpha=0.7)
+ax4.plot(scan_distances, ags_das_norm_dist, label="2. DAS (Simple)", linestyle='--', alpha=0.7)
+ax4.plot(scan_distances, ags_pb_norm_dist, label="3. LCMV-PB (Puntual, Broadband)", linewidth=2.5, color='red')
+ax4.plot(scan_distances, ags_rb_norm_dist, label="4. LCMV-RB (Regional, Broadband)", linewidth=2.5, color='blue')
+ax4.set_title(f"Sensibilidad a Distancia (Falla) en {focal_angle_deg:.1f}°")
+ax4.set_ylim(-60, 5); ax4.grid(True)
+ax4.set_xlabel("Distancia (metros)"); ax4.set_ylabel("Ganancia Normalizada (dB)")
+ax4.axvline(x=radius, color='k', linestyle=':')
+ax4.legend()
+
+# --- 6. Mostrar el gráfico ---
+fig1.tight_layout(rect=[0, 0.03, 1, 0.95])
+fig2.tight_layout(rect=[0, 0.03, 1, 0.95])
+print("Mostrando gráficos (Figura 1 = Beampattern, Figura 2 = Array Gain Sensitivity)...")
+plt.show()
+
+============================================================
+ARCHIVO: tests/lmcv_point_narrow.py
+============================================================
+
+import numpy as np
+from beamforming.processors import point_constraint, compute_fixed_weights_optimized 
+from beamforming.models import near_field_steering_vector
+from beamforming.evaluation.gain import synthetic_gain, polar_gain, analitical_gain
+import beamforming.evaluation.gain as gain 
+from utils.geometry import source_rotation
+from utils.polar_plot import plot_polar_pattern
+
+# --- 2. PARÁMETROS DEL ESCENARIO ---
+fs = 48000
+c = 343.0
+M = 7      # Número de micrófonos
+K = 50      # Número de taps
+f_test = 3000.0 # Frecuencia de prueba para LCMV
+
+# Geometría del Array (ULA en el eje X, centrado)
+d = 0.04
+mic_x = np.linspace(0, (M - 1) * d, M) - (M - 1) * d / 2
+mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
+
+# Dirección y distancia de enfoque
+look_direction_rad = np.deg2rad(70)
+source_distance = 2.0
+focal_point = source_distance * np.array([np.cos(look_direction_rad), np.sin(look_direction_rad), 0])
+
+# --- 3. CÁLCULO DE PESOS LCMV ---
+# Este paso no cambia: se calculan los pesos una sola vez.
+print("--- Calculando pesos del beamformer LCMV ---")
+C, h = point_constraint(focal_point, K, mic_array, f_test, fs)
+w_lcmv = compute_fixed_weights_optimized(C, h)
+print("Pesos calculados.")
+
+# --- 4. VERIFICACIÓN DE LA DIRECTIVIDAD DEL BEAMFORMER (LÓGICA CORREGIDA) ---
+print("\n--- Verificando la directividad del beamformer ---")
+
+# 4.1. Definir una segunda dirección de prueba (un "nulo" a 90 grados del foco)
+null_direction_rad = look_direction_rad + np.pi / 2 
+null_point = source_distance * np.array([np.cos(null_direction_rad), np.sin(null_direction_rad), 0])
+
+# 4.2. Puntos a probar: el foco y el punto nulo
+points_to_test = np.array([focal_point, null_point])
+
+# 4.3. Calcular la ganancia física en AMBOS puntos
+gains_db = synthetic_gain(
+    f=f_test,
+    fs=fs,
+    mic_array=mic_array,
+    weights=w_lcmv,
+    source_points=points_to_test
+)
+
+gain_at_focal_db = gains_db[0]
+gain_at_null_db = gains_db[1]
+
+print(f"Ganancia de Arreglo en el foco ({np.rad2deg(look_direction_rad):.0f}°): {gain_at_focal_db:.4f} dB")
+print(f"Ganancia de Arreglo en el nulo ({np.rad2deg(null_direction_rad):.0f}°): {gain_at_null_db:.4f} dB")
+
+# 4.4. EL NUEVO TEST: Verificar que la atenuación es significativa
+attenuation = gain_at_focal_db - gain_at_null_db
+min_expected_attenuation = 15.0  # Umbral razonable: esperamos al menos 15 dB de atenuación
+
+print(f"Atenuación entre foco y nulo: {attenuation:.2f} dB")
+
+if attenuation > min_expected_attenuation:
+    print(f"✅ TEST PASADO: La directividad es buena. La atenuación ({attenuation:.2f} dB) supera el umbral de {min_expected_attenuation} dB.")
+else:
+    print(f"❌ TEST FALLIDO: La directividad es pobre. La atenuación ({attenuation:.2f} dB) no alcanza el umbral de {min_expected_attenuation} dB.")
+
+# --- El resto del script (sección 5) permanece exactamente igual ---
+# --- 5. CÁLCULO Y GRÁFICO DEL PATRÓN POLAR (USANDO FUNCIONES MODULARES) ---
+print("\n--- Calculando y graficando el Patrón Polar ---")
+
+# 5.1. Generar la geometría de los puntos de prueba
+points = 181
+source_points_3d, angles_deg = source_rotation(radius=source_distance, samples=points)
+source_points_transposed = source_points_3d.T # Convertir de (3, P) a (P, 3)
+
+# 5.2. Calcular la ganancia para todos los puntos con UNA SOLA LLAMADA
+gains_absolute_db = synthetic_gain(
+    f=f_test,
+    fs=fs,
+    mic_array=mic_array,
+    weights=w_lcmv,
+    source_points=source_points_transposed
+)
+
+# 5.3. Normalizar la ganancia para que el pico sea 0 dB (requerido para el patrón polar)
+gains_normalized_db = gains_absolute_db - np.max(gains_absolute_db)
+
+# 5.4. Graficar el resultado con UNA SOLA LLAMADA a la función de ploteo
+plot_polar_pattern(
+    gains_normalized_db,
+    angles_deg,
+    title=f"Patrón Polar LCMV a {f_test} Hz (Foco a {np.rad2deg(look_direction_rad):.0f}°)"
+)
+
+print("Script finalizado.")
+
+============================================================
+ARCHIVO: tests/region.py
+============================================================
+import numpy as np
+from scipy.constants import speed_of_sound
+
+# --- Importaciones de tu lista ---
+from beamforming.algorithms.lmcv import  compute_fixed_weights_optimized
+from beamforming.algorithms.constrains import point_constraint
+from beamforming.signal_model import near_field_steering_vector_multi, near_field_steering_vector
+from beamforming.evaluation.gain import analytical_gain
+from utils.geometry import source_rotation, cartesian_to_spherical, spherical_to_cartesian
+from utils.polar_plot import plot_polar_pattern
+from beamforming.algorithms.region_constriant import build_region_constraints
+
+# --- 1. CONFIGURACIÓN DEL ESCENARIO ---
+# Parámetros físicos
+FS = 48000
+K = 50      # Número de taps
+C_SOUND = speed_of_sound
+
+# Geometría del Arreglo (ULA en el eje X, 7 micrófonos, 4cm de espacio)
+M = 7
+D = 0.04
+mic_x = np.linspace(0, (M - 1) * D, M) - (M - 1) * D / 2
+mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
+
+# Punto de enfoque central (Cartesiano)
+focal_point_cartesian = np.array([0.8, .80, 0.0]) # 2 metros al frente
+f_test = 3000.0 # Frecuencia de prueba
+
+print("Escenario definido. Calculando pesos...")
+
+# --- 2. PATH 1: Beamformer "Simple" (Point Constraint) ---
+# Calcula las restricciones para un solo punto
+C_point, h_point = point_constraint(
+    target_point=focal_point_cartesian,
+    K_taps=K,
+    mic_array=mic_array,
+    f=f_test,
+    fs=FS
+)
+# Calcula los pesos usando la función que proporcionaste
+w_point = compute_fixed_weights_optimized(C_point, h_point)
+print("Pesos 'Simples' calculados.")
+
+# --- 3. PATH 2: Beamformer "Robusto" (Region Constraint) ---
+# Define la región de robustez alrededor del punto focal
+delta_r = 0.2           # +/- 50 cm de robustez en distancia
+delta_azimut = np.deg2rad(2) # +/- 10 grados de robustez en azimut
+delta_elevation = np.deg2rad(2) # +/- 5 grados de robustez en elevación
+
+# Frecuencias para la robustez de banda ancha
+f_min = 250.0
+f_max = 4000.0
+num_freq_points = 50  # J
+num_spatial_points = 100 # I
+
+# Calcula las restricciones robustas
+C_robust, h_robust = build_region_constraints(
+    Rs=focal_point_cartesian,
+    delta_r=delta_r,
+    delta_azimut=delta_azimut,
+    delta_elevation=delta_elevation,
+    mic_array=mic_array,
+    fs=FS,
+    K=K,
+    f_min=f_min,
+    f_max=f_max,
+    num_points=num_spatial_points,
+    num_freqs=num_freq_points
+)
+# Calcula los pesos usando la MISMA función
+w_robust = compute_fixed_weights_optimized(C_robust, h_robust)
+print("Pesos 'Robustos' calculados.")
+
+# --- 4. EVALUACIÓN Y GRÁFICO ---
+print("Evaluando patrones polares...")
+# Definir los puntos de ploteo (un círculo a 2m)
+plot_radius = 2.0
+plot_points, plot_angles = source_rotation(plot_radius, 360, 'h')
+plot_points_cartesian = plot_points.T # (P, 3)
+
+# Calcular la ganancia para ambos conjuntos de pesos
+gain_point_2d = analytical_gain(
+    frecs=np.array([f_test]),
+    source_points=plot_points_cartesian,
+    fs=FS,
+    mic_array=mic_array,
+    weights=w_point,
+    
+)
+gain_robust_2d = analytical_gain(
+    frecs=np.array([f_test]),
+    source_points=plot_points_cartesian,
+    fs=FS,
+    mic_array=mic_array,
+    weights=w_robust,
+    
+)
+
+# Extraer el array 1D de ganancia
+gain_point = gain_point_2d[0]
+gain_robust = gain_robust_2d[0]
+
+# Normalizar para el gráfico (pico en 0 dB)
+gain_point_norm = gain_point - np.max(gain_point)
+gain_robust_norm = gain_robust - np.max(gain_robust)
+
+# --- 5. PLOTEO COMPARATIVO ---
+plot_polar_pattern(
+    gains_list=[gain_point_norm, gain_robust_norm],
+    angles_deg=plot_angles,
+    labels_list=["Simple (Point)", "Robusto (Region)"],
+    title=f"Comparación de Beamformers a {f_test} Hz"
+)
+print("Script finalizado.")
+
+============================================================
+ARCHIVO: tests/chat.py
+============================================================
+import numpy as np
+import matplotlib.pyplot as plt
+
+# -----------------------------------------------------------
+# Parámetros del array
+# -----------------------------------------------------------
+c = 343.0                     # velocidad del sonido
+f = 2000                      # frecuencia de trabajo (Hz)
+w = 2 * np.pi * f
+lam = c / f
+
+M = 8                         # número de micrófonos
+d = lam / 2                   # espaciado inter-elemento
+x_mic = np.arange(M) * d      # posiciones en un ULA 1D en el eje x
+
+# -----------------------------------------------------------
+# Función: steering vector near-field
+# -----------------------------------------------------------
+def steering_vector(theta_deg, r):
+    """
+    Near-field steering vector para un ULA 1D.
+    theta: ángulo en grados
+    r: distancia a la fuente
+    """
+    theta = np.deg2rad(theta_deg)
+    
+    # posición de la fuente en coordenadas cartesianas
+    xs = r * np.cos(theta)
+    ys = r * np.sin(theta)
+    
+    # distancia desde cada micrófono a la fuente
+    dist = np.sqrt((x_mic - xs)**2 + ys**2)
+    
+    # steering vector (fase es k * d)
+    k = w / c
+    return np.exp(-1j * k * dist)
+
+# -----------------------------------------------------------
+# Construcción de la matriz A (región objetivo)
+# -----------------------------------------------------------
+# Definimos una región pequeña alrededor del ángulo 90°
+thetas_region = np.linspace(80, 100, 5)   # +-10 grados
+r_region = 1.0                             # distancia fija de referencia
+
+A = []
+
+for th in thetas_region:
+    a = steering_vector(th, r_region)
+    
+    # Según el paper, A se arma con partes real e imaginaria separadas:
+    A.append(np.real(a))
+    A.append(np.imag(a))
+
+A = np.array(A)   # dimensión (2*N_region) x M
+
+# -----------------------------------------------------------
+# SVD de A y construcción de C y f
+# -----------------------------------------------------------
+U, S, Vh = np.linalg.svd(A, full_matrices=False)
+
+# Seleccionamos las L singular values más grandes.
+# Para ejemplo, tomemos L=2
+L = 2
+C = Vh[:L, :].T     # cada columna es un vector de restricción
+f = np.ones(L)      # unit gain en la región objetivo
+
+# -----------------------------------------------------------
+# Construcción de w_opt usando R = I
+# -----------------------------------------------------------
+R = np.eye(M)
+Rinv = R            # trivial
+w_opt = Rinv @ C @ np.linalg.inv(C.conj().T @ Rinv @ C) @ f
+
+# -----------------------------------------------------------
+# Cálculo de la sensibilidad angular
+# -----------------------------------------------------------
+thetas_test = np.linspace(0, 180, 720)
+gain = []
+
+for th in thetas_test:
+    a = steering_vector(th, r_region)
+    g = np.abs(np.vdot(w_opt, a))**2   # |w^H a|^2
+    gain.append(g)
+
+gain = np.array(gain)
+
+# Normalizar por el valor en el ángulo focal (aprox 90°)
+idx_focal = np.argmin(np.abs(thetas_test - 90))
+gain_norm = gain / gain[idx_focal]
+
+# -----------------------------------------------------------
+# Graficar
+# -----------------------------------------------------------
+plt.figure(figsize=(10,5))
+plt.plot(thetas_test, 10*np.log10(gain_norm + 1e-12))
+plt.axvline(90, color='r', linestyle='--')
+plt.title("Array Gain Sensitivity (normalizada)")
+plt.xlabel("Ángulo (deg)")
+plt.ylabel("Sensibilidad (dB)")
+plt.grid(True)
+plt.show()
+
+
+============================================================
+ARCHIVO: tests/objetcts_test.py
+============================================================
+from beamforming.array.mic_array import MicArray, custom, ULA 
+from beamforming.algorithms.optimizer import WeightOptimizer
+from beamforming.algorithms.lmcv import LmcvOptimizer
+from beamforming.algorithms.constrains import ConstrainGenerator, NarrowbandPointConstrain
+from beamforming.beamformer import Beamformer
+import numpy as np
+
+from utils.geometry import source_rotation
+from utils.polar_plot import plot_polar_pattern
+
+arreglo = ULA(10, 0.1)
+arreglo.Plot_Geometry()
+K = 20
+fs = 44000
+
+focal_point = np.array([0, -1,0])
+distance = np.linalg.norm(focal_point)
+
+f_target = 1000.0 #Hz
+
+narrow_point_constrain = NarrowbandPointConstrain( f_target)
+optimizador = LmcvOptimizer( narrow_point_constrain  )
+
+my_beamformer = Beamformer(arreglo, optimizador, K, fs )
+
+points, angles = source_rotation(distance, 360, 'h')
+
+
+my_beamformer.compute_weights(focal_point=focal_point)
+
+gains = my_beamformer.compute_gain(frecs = f_target, points =points.T )
+
+plot_polar_pattern(
+    gains_list=[gains[0]], 
+    angles_deg= angles, 
+    labels_list=["Ganancia Analítica"]
+)
+
+
+
+============================================================
+ARCHIVO: tests/synth_vs_analitical_gain.py
+============================================================
+import numpy as np
+# Asumimos que los nombres de las funciones son los que definimos
+from beamforming.processors import point_constraint, compute_fixed_weights_optimized 
+from beamforming.models import near_field_steering_vector, near_field_steering_vector_multi # Usamos la versión vectorizada
+from beamforming.evaluation.gain import synthetic_gain, analytical_gain # Nombres más claros y correctos
+from utils.geometry import source_rotation
+from utils.polar_plot import plot_polar_pattern
+
+# --- 2. PARÁMETROS DEL ESCENARIO ---
+fs = 48000
+c = 343.0
+M = 7      # Número de micrófonos
+K = 50      # Número de taps
+f_test = 3000.0 # Frecuencia de prueba para LCMV
+
+# Geometría del Array (ULA en el eje X, centrado)
+d = 0.04
+mic_x = np.linspace(0, (M - 1) * d, M) - (M - 1) * d / 2
+mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
+
+# Dirección y distancia de enfoque
+look_direction_rad = np.deg2rad(70)
+source_distance = 2.0
+focal_point = source_distance * np.array([np.cos(look_direction_rad), np.sin(look_direction_rad), 0])
+
+# --- 3. CÁLCULO DE PESOS LCMV ---
+# Este paso no cambia: se calculan los pesos una sola vez.
+print("--- Calculando pesos del beamformer LCMV ---")
+C, h = point_constraint(focal_point, K, mic_array, f_test, fs)
+w_lcmv = compute_fixed_weights_optimized(C, h)
+print("Pesos calculados.")
+
+# --- 4. VERIFICACIÓN DE LA DIRECTIVIDAD DEL BEAMFORMER ---
+# Esta sección no se modifica, sigue usando un método para la prueba.
+print("\n--- Verificando la directividad del beamformer (método sintético) ---")
+null_direction_rad = look_direction_rad + np.pi / 2 
+null_point = source_distance * np.array([np.cos(null_direction_rad), np.sin(null_direction_rad), 0])
+points_to_test = np.array([focal_point, null_point])
+
+gains_db = synthetic_gain(
+    f=f_test,
+    fs=fs,
+    mic_array=mic_array,
+    weights=w_lcmv,
+    source_points=points_to_test
+)
+attenuation = gains_db[0] - gains_db[1]
+min_expected_attenuation = 15.0
+print(f"Atenuación entre foco y nulo: {attenuation:.2f} dB")
+if attenuation > min_expected_attenuation:
+    print(f"✅ TEST PASADO: La directividad es buena.")
+else:
+    print(f"❌ TEST FALLIDO: La directividad es pobre.")
+
+
+# --- 5. CÁLCULO Y GRÁFICO DE AMBOS PATRONES POLARES ---
+print("\n--- Calculando y graficando Patrones Polares (Sintético vs. Analítico) ---")
+
+# 5.1. Generar la geometría de los puntos de prueba (no cambia)
+points = 181
+source_points_3d, angles_deg = source_rotation(radius=source_distance, samples=points)
+source_points_transposed = source_points_3d.T # Convertir de (3, P) a (P, 3)
+
+# 5.2. Calcular la ganancia con AMBOS métodos
+# Método 1: Simulación Sintética (como antes)
+print("Calculando ganancia con método sintético...")
+gains_synthetic_db = synthetic_gain(
+    f=f_test,
+    fs=fs,
+    mic_array=mic_array,
+    weights=w_lcmv,
+    source_points=source_points_transposed
+)
+
+### NUEVO ###
+# Método 2: Cálculo Analítico
+print("Calculando ganancia con método analítico...")
+# La función analítica espera un array de frecuencias, aunque sea una sola.
+freqs_to_test = np.array([f_test])
+gains_analytical_2d = analytical_gain(
+    frecs=freqs_to_test,
+    fs=fs,
+    mic_array=mic_array,
+    weights=w_lcmv,
+    source_points=source_points_transposed
+)
+# El resultado tiene forma (F, P). Como F=1, seleccionamos la primera fila.
+gains_analytical_db = gains_analytical_2d[0]
+print("Cálculos finalizados.")
+
+# 5.3. Normalizar AMBOS resultados para que el pico de cada uno sea 0 dB
+gains_synthetic_normalized = gains_synthetic_db - np.max(gains_synthetic_db)
+### NUEVO ###
+gains_analytical_normalized = gains_analytical_db - np.max(gains_analytical_db)
+
+# 5.4. Graficar los resultados superpuestos
+### MODIFICADO ###
+# Para lograr esto, tu función plot_polar_pattern debe ser modificada para
+# aceptar una lista de ganancias y una lista de etiquetas.
+# Ejemplo de la nueva firma esperada:
+# def plot_polar_pattern(gains_list, angles_deg, labels_list, title=""):
+
+plot_polar_pattern(
+    gains_list=[gains_synthetic_normalized, gains_analytical_normalized],
+    angles_deg=angles_deg,
+    labels_list=["Sintético", "Analítico"],
+    title=f"Patrón Polar LCMV a {f_test} Hz (Foco a {np.rad2deg(look_direction_rad):.0f}°)"
+)
+
+print("Script finalizado.")
+
+============================================================
+ARCHIVO: tests/1_steering_vector.py
+============================================================
+import numpy as np
+from scipy.constants import speed_of_sound
+from matplotlib import pyplot as plt 
+
+# --- Importaciones de tus módulos (asume que están en el path) ---
+from beamforming.signal_model import near_field_steering_vector_multi
+from beamforming.evaluation.gain import analytical_gain
+from beamforming.algorithms.lmcv import compute_fixed_weights_optimized
+from utils.geometry import source_rotation
+
+print("Configurando parámetros (MODIFICADOS PARA COINCIDIR CON FIG. 3)...")
+fs = 48000
+
+# Parámetros físicos
+FS = 48000
+C_SOUND = speed_of_sound
+f_test = 3000.0 # Frecuencia de prueba (nuestra lambda de referencia)
+
+# --- PARÁMETROS MODIFICADOS ---
+# Lambda de referencia (lambda = c / f)
+LAMBDA_REF = C_SOUND / f_test  # Aprox 0.114m
+
+# K (Taps) como en el paper
+K = 25  # 
+
+# M (Micrófonos) como en el paper
+M = 9   # 
+
+# Geometría del Arreglo (D = lambda/2, R_a = 4*lambda)
+D = LAMBDA_REF / 2  # 
+mic_x = np.linspace(0, (M - 1) * D, M) - (M - 1) * D / 2
+mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
+
+# Punto de enfoque central (r_F = 5*lambda, 90 grados)
+radius = 5 * LAMBDA_REF  # 
+focal_angle_rad = np.deg2rad(90.0) # 
+
+focal_point_cartesian = np.array([
+    radius * np.cos(focal_angle_rad), 
+    radius * np.sin(focal_angle_rad), 
+    0.0
+])
+# ------------------------- Define Point Constraint (LCMV) -----------------------
+print("Calculando restricciones LCMV...")
+sv = near_field_steering_vector_multi(f_test, 
+                                      focal_point_cartesian, 
+                                      fs ,mic_array, 
+                                      K,
+                                      C_SOUND)
+
+sv = sv.squeeze()
+C = np.stack([np.real(sv), np.imag(sv)], axis = 1)
+
+tau_center = ((K - 1) / 2) / fs
+phase = 2 * np.pi* f_test * tau_center
+g_real = np.cos(phase)
+g_im = np.sin(phase)
+g = np.hstack([g_real, g_im])
+
+print("Restricciones y ganancias definidas.")
+
+# -------------------------- Optimize weights (LCMV) ---------------------------------
+w_lcmv = compute_fixed_weights_optimized(C, g)
+print("Pesos LCMV optimizados.")
+
+# -------------------------- Compute DAS Weights -----------------------------------
+print("Calculando pesos Delay-and-Sum (DAS)...")
+w_das = np.zeros(M * K)
+mic_distances = np.linalg.norm(focal_point_cartesian[np.newaxis, :] - mic_array, axis=1)
+delays_sec = mic_distances / C_SOUND
+ref_delay_sec = radius / C_SOUND
+relative_delays_sec = ref_delay_sec - delays_sec
+relative_delays_taps = np.round(relative_delays_sec * fs).astype(int)
+k_center_tap = (K - 1) // 2
+
+for m in range(M):
+    k = k_center_tap + relative_delays_taps[m]
+    if 0 <= k < K:
+        w_das[m * K + k] = 1.0 / M 
+    else:
+        print(f"Advertencia: El tap del DAS para el mic {m} está fuera de rango (k={k})")
+print("Pesos DAS calculados.")
+
+# -------------------------- Calculate Gains (Angular Scan) --------------------------
+print("Calculando ganancia (Escaneo Angular)...")
+polar_points, deg = source_rotation(radius, 360, axis='h')
+polar_points = polar_points.T
+gains_db_lcmv_angular = analytical_gain(f_test, fs, mic_array, w_lcmv, polar_points)
+gains_db_das_angular = analytical_gain(f_test, fs, mic_array, w_das, polar_points)
+
+# -------------------------- Calculate Gains (Distance Scan) -------------------------
+print("Calculando ganancia (Escaneo de Distancia)...")
+focal_angle_rad = np.arctan2(focal_point_cartesian[1], focal_point_cartesian[0])
+scan_distances = np.linspace(0.1, 2.0, 200) # Escanea de 0.1m a 2.0m
+
+# Crea los puntos de escaneo (x, y, z) a lo largo del ángulo focal
+dist_x = scan_distances * np.cos(focal_angle_rad)
+dist_y = scan_distances * np.sin(focal_angle_rad)
+dist_z = np.zeros_like(scan_distances)
+distance_scan_points = np.stack([dist_x, dist_y, dist_z], axis=1)
+
+gains_db_lcmv_dist = analytical_gain(f_test, fs, mic_array, w_lcmv, distance_scan_points)
+gains_db_das_dist = analytical_gain(f_test, fs, mic_array, w_das, distance_scan_points)
+
+# -------------------------- Plot (Comparativo) -----------------------------------
+print("Graficando beampatterns...")
+
+# --- 1. Squeezing y Normalización ---
+# Colapsar formas
+gains_lcmv_sq_ang = gains_db_lcmv_angular.squeeze()
+gains_das_sq_ang = gains_db_das_angular.squeeze()
+gains_lcmv_sq_dist = gains_db_lcmv_dist.squeeze()
+gains_das_sq_dist = gains_db_das_dist.squeeze()
+
+# Normalizar ambas curvas al PICO MÁXIMO ABSOLUTO del escaneo angular
+# (Este pico es la ganancia en el punto focal)
+abs_max_peak_lcmv = np.max([np.max(gains_lcmv_sq_ang)])
+abs_max_peak_das =   np.max([np.max(gains_das_sq_ang)])
+gains_lcmv_norm_ang = gains_lcmv_sq_ang - abs_max_peak_lcmv
+gains_das_norm_ang = gains_das_sq_ang - abs_max_peak_das
+
+# Normalizamos el escaneo de distancia con el MISMO pico para que sean comparables
+gains_lcmv_norm_dist = gains_lcmv_sq_dist - abs_max_peak_lcmv
+gains_das_norm_dist = gains_das_sq_dist - abs_max_peak_das
+
+# --- 2. Filtrado Angular (0-180 grados) ---
+filter_mask = (deg >= 0) & (deg <= 180) 
+deg_filtered = deg[filter_mask]
+gains_lcmv_filtered = gains_lcmv_norm_ang[filter_mask]
+gains_das_filtered = gains_das_norm_ang[filter_mask]
+
+# --- 3. Crear los subplots ---
+# Creamos una figura con 2 filas, 1 columna
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+
+# --- 4. Plot 1: Escaneo Angular (Tu gráfico original) ---
+ax1.plot(deg_filtered, gains_lcmv_filtered, label="LCMV (Optimizado)")
+ax1.plot(deg_filtered, gains_das_filtered, label="Delay-and-Sum (Simple)", linestyle='--', alpha=0.8)
+ax1.set_ylim(-40, 5) 
+ax1.set_xlim(0, 180) 
+ax1.set_xlabel("Ángulo (grados)")
+ax1.set_ylabel("Ganancia Normalizada (dB)")
+ax1.grid(True)
+focal_angle_deg = np.degrees(focal_angle_rad)
+ax1.set_title(f"Beampattern @ {f_test} Hz (Focal point: {focal_angle_deg:.1f}°)")
+ax1.legend()
+ax1.axvline(x=focal_angle_deg, color='r', linestyle=':', label=f"Ángulo Focal ({focal_angle_deg:.1f}°) ")
+
+# --- 5. Plot 2: Escaneo de Distancia (El nuevo gráfico) ---
+ax2.plot(scan_distances, gains_lcmv_norm_dist, label="LCMV (Optimizado)")
+ax2.plot(scan_distances, gains_das_norm_dist, label="Delay-and-Sum (Simple)", linestyle='--', alpha=0.8)
+ax2.set_ylim(-40, 5)
+ax2.set_xlabel("Distancia (metros)")
+ax2.set_ylabel("Ganancia Normalizada (dB)")
+ax2.grid(True)
+ax2.set_title(f"Sensibilidad vs. Distancia (en {focal_angle_deg:.1f}°)")
+ax2.axvline(x=radius, color='r', linestyle=':', label=f"Distancia Focal ({radius:.2f} m)")
+ax2.legend()
+
+# --- 6. Mostrar el gráfico ---
+fig.tight_layout() # Ajusta el espacio entre plots
+print("Mostrando gráfico.")
+plt.show()# Delays relativos (en segundos)
+# --- LÍNEA CORREGIDA ---
+# El retardo debe ser (origen - mic) para ser consistente con el steering vector
+relative_delays_sec = ref_delay_sec - delays_sec
+
+# Convertir a taps relativos
+relative_delays_taps = np.round(relative_delays_sec * fs).astype(int)
+
+# Tap central del filtro como referencia
+k_center_tap = (K - 1) // 2
+
+# Construir el vector de pesos DAS (un '1' en el tap correcto por cada mic)
+for m in range(M):
+    k = k_center_tap + relative_delays_taps[m]
+    if 0 <= k < K:
+        w_das[m * K + k] = 1.0 / M 
+    else:
+        print(f"Advertencia: El tap del DAS para el mic {m} está fuera de rango (k={k})")
+
+print("Pesos DAS calculados.")
+
+# -------------------------- Calculate Gains ---------------------------------------
+print("Generando puntos de escaneo...")
+# Generamos 360 puntos y luego filtraremos para el plot
+polar_points, deg = source_rotation(radius, 360, axis='h')
+polar_points = polar_points.T
+
+print("Calculando ganancia LCMV...")
+gains_db_lcmv = analytical_gain(f_test, fs, mic_array, w_lcmv, polar_points)
+
+print("Calculando ganancia DAS...")
+gains_db_das = analytical_gain(f_test, fs, mic_array, w_das, polar_points)
+
+# -------------------------- Plot (Comparativo) -----------------------------------
+print("Graficando beampatterns...")
+
+# 1. Colapsar formas (ej. de (1, 360) a (360,))
+gains_lcmv_sq = gains_db_lcmv.squeeze()
+gains_das_sq = gains_db_das.squeeze()
+
+# 2. Normalizar ambas curvas al PICO MÁXIMO ABSOLUTO
+abs_max_lcmv = np.max([np.max(gains_lcmv_sq)])
+abs_max_das = np.max([ np.max(gains_das_sq)])
+
+gains_lcmv_norm = gains_lcmv_sq - abs_max_lcmv
+gains_das_norm = gains_das_sq - abs_max_das
+
+# -------------------------- FILTRADO PARA PLOT DE 180 GRADOS --------------------------
+# La función source_rotation devuelve ángulos de 0 a 360.
+# Queremos plotear de 0 a 180 grados para evitar la ambigüedad.
+filter_mask = (deg >= 0) & (deg <= 180) 
+
+deg_filtered = deg[filter_mask]
+gains_lcmv_filtered = gains_lcmv_norm[filter_mask]
+gains_das_filtered = gains_das_norm[filter_mask]
+# -------------------------------------------------------------------------------------
+
+# 3. Crear el gráfico cartesiano
+fig, ax = plt.subplots()
+
+# Graficamos ambas curvas (usando los datos filtrados)
+ax.plot(deg_filtered, gains_lcmv_filtered, label="LCMV (Optimizado)")
+ax.plot(deg_filtered, gains_das_filtered, label="Delay-and-Sum (Simple)", linestyle='--', alpha=0.8)
+# 4. Configurar la apariencia del gráfico
+ax.set_ylim(-40, 5) # Damos 5dB de margen superior
+ax.set_xlim(0, 180) # --- MANTENEMOS el xlim para 0-180 grados ---
+ax.set_xlabel("Ángulo (grados)")
+ax.set_ylabel("Ganancia Normalizada (dB)")
+ax.grid(True)
+# Ajustamos el título para indicar el ángulo focal
+focal_angle_deg = np.degrees(np.arctan2(focal_point_cartesian[1], focal_point_cartesian[0]))
+ax.set_title(f"Beampattern @ {f_test} Hz (Focal point: {focal_angle_deg:.1f}°)")
+ax.legend() # Añadimos la leyenda
+ax.axvline(x =focal_angle_deg, color = 'r') 
+
+#Print data for GEMINI 
+print("DATA OUTPUT [angle, lcmv_gain, das_gain]")
+
+output_gains = np.stack([deg_filtered, gains_lcmv_filtered, gains_das_filtered], axis = 1)
+print(output_gains)
+
+# 5. Mostrar el gráfico
+print("Mostrando gráfico.")
+plt.show()
+
+============================================================
+ARCHIVO: tests/adaptive_test.py
+============================================================
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.constants import speed_of_sound
+from scipy.io import wavfile
+
+# --- IMPORTACIONES DE TUS MÓDULOS ---
+# Asumo que el path es correcto y los archivos existen
+from beamforming.signal_model import near_field_steering_vector_multi
+from beamforming.algorithms.region_constriant import build_region_constraints
+from beamforming.processors import gsc_adaptive_beamformer
+
+# ==============================================================================
+# 0. FUNCIÓN AUXILIAR PARA EXPORTAR AUDIO
+# ==============================================================================
+def save_normalized_wav(filename, rate, data, folder="resultados_audio"):
+    """
+    Normaliza el audio (float), lo convierte a int16 y lo guarda en una carpeta.
+    """
+    # Crear carpeta si no existe
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+        print(f"Carpeta creada: {folder}")
+    
+    filepath = os.path.join(folder, filename)
+    
+    # Asegurar parte real
+    data_real = np.real(data)
+    
+    # Normalizar al pico máximo (evitar clipping)
+    max_val = np.max(np.abs(data_real))
+    if max_val > 0:
+        data_norm = data_real / max_val
+        # Bajamos un poquito el volumen (-1 dB) para margen de seguridad
+        data_norm = data_norm * 0.9
+    else:
+        data_norm = data_real
+        
+    # Convertir a int16
+    data_int16 = (data_norm * 32767).astype(np.int16)
+    
+    wavfile.write(filepath, rate, data_int16)
+    print(f"  -> Guardado: {filepath}")
+
+# ==============================================================================
+# 1. CONFIGURACIÓN DEL ESCENARIO
+# ==============================================================================
+print("\n--- 1. Configurando Parámetros ---")
+fs = 48000
+K = 25
+C_SOUND = speed_of_sound
+
+# Banda de diseño (Broadband)
+f_min_band = 1000.0
+f_max_band = 4000.0
+num_freqs_band = 50 
+num_points_space = 50
+
+# Geometría del Arreglo (9 micrófonos, ULA)
+f_ref_geometry = 3000.0
+LAMBDA_REF = C_SOUND / f_ref_geometry
+M = 9
+D = LAMBDA_REF / 2
+mic_x = np.linspace(0, (M - 1) * D, M) - (M - 1) * D / 2
+mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
+
+# Punto Focal (90 grados)
+radius = 5 * LAMBDA_REF
+focal_angle_rad = np.deg2rad(90.0)
+focal_point_cartesian = np.array([
+    radius * np.cos(focal_angle_rad), 
+    radius * np.sin(focal_angle_rad), 
+    0.0
+])
+
+# ==============================================================================
+# 2. DISEÑO DEL BEAMFORMER (OFFLINE - REGIONAL ROBUSTO)
+# ==============================================================================
+print("\n--- 2. Diseñando Filtro Robusto (LCMV-RB) ---")
+
+delta_r_val = radius * 0.2     # +/- 10% distancia
+delta_azimut_val = np.deg2rad(8.0) # +/- 4 grados
+delta_elev_val = np.deg2rad(2.0) 
+
+# Obtenemos Restricciones (C), Respuesta Deseada (h) y Matriz de Bloqueo (Ca)
+C_rb, h_rb, Ca_rb = build_region_constraints(
+    Rs=focal_point_cartesian, 
+    delta_r=delta_r_val, 
+    delta_azimut=delta_azimut_val,
+    delta_elevation=delta_elev_val, 
+    mic_array=mic_array, 
+    fs=fs, 
+    K=K,
+    f_min=f_min_band, 
+    f_max=f_max_band, 
+    num_points=num_points_space, 
+    num_freqs=num_freqs_band
+)
+
+# Calculamos pesos fijos w_q = C * h
+w_lcmv_rb = (C_rb @ h_rb.flatten())
+
+print(f"Diseño listo. Rango L={C_rb.shape[1]}. Ca shape={Ca_rb.shape}")
+
+# ==============================================================================
+# 3. GENERACIÓN DE SEÑALES (SIMULACIÓN TEMPORAL)
+# ==============================================================================
+print("\n--- 3. Generando Señales (5 segundos) ---")
+duration = 5.0 # 5 segundos para escuchar bien
+t = np.arange(int(duration * fs)) / fs
+n_samples = len(t)
+
+# A. Señal Deseada (Target) en el FOCO (3000 Hz) - "Beep" limpio
+freq_target = 3000.0
+# Hacemos que pulse para distinguirla mejor
+target_envelope = np.sin(2 * np.pi * 1.0 * t)**2 # Pulsa 2 veces por segundo
+target_signal = 0.05 * np.sin(2 * np.pi * freq_target * t) # * target_envelope
+
+# Steering vector focal (usamos narrowband para simular la propagación simple)
+sv_target = near_field_steering_vector_multi(freq_target, focal_point_cartesian, fs, mic_array, 1).squeeze()
+mic_target = np.outer(sv_target, target_signal)
+
+# B. Interferencia (40 GRADOS) - Ruido + Tono molesto
+angle_int = np.deg2rad(40.0)
+pos_int = np.array([radius * np.cos(angle_int), radius * np.sin(angle_int), 0.0])
+freq_int = 1200.0 # Tono molesto
+# Ruido blanco fuerte + Tono
+interference_signal = 0.3 * np.random.randn(n_samples) + 0.15 * np.sin(2 * np.pi * freq_int * t)
+
+sv_interf = near_field_steering_vector_multi(freq_int, pos_int, fs, mic_array, 1).squeeze()
+mic_interf = np.outer(sv_interf, interference_signal)
+
+# C. Mezcla Total (Entrada a los micros) + Ruido Térmico de fondo
+mic_data = mic_target + mic_interf + 0.002 * np.random.randn(M, n_samples)
+
+print("Señales generadas. La interferencia es mucho más fuerte que el target.")
+
+# ==============================================================================
+# 4. PROCESAMIENTO (GSC y FIJO)
+# ==============================================================================
+print("\n--- 4. Procesando Audio ---")
+
+# A. Caso Adaptativo (GSC)
+print("  -> Corriendo GSC Adaptativo (mu=0.05)...")
+y_adaptive, w_log = gsc_adaptive_beamformer(
+    input_signal=mic_data,
+    w_q=w_lcmv_rb,    
+    Ca=Ca_rb,         
+    K=K,
+    mu=0.05           
+)
+
+# B. Caso Fijo (Referencia)
+print("  -> Corriendo Beamformer Fijo (Solo w_q)...")
+y_fixed, _ = gsc_adaptive_beamformer(
+    input_signal=mic_data,
+    w_q=w_lcmv_rb,
+    Ca=Ca_rb,
+    K=K,
+    mu=0.0            
+)
+
+# ==============================================================================
+# 5. EXPORTACIÓN DE AUDIO
+# ==============================================================================
+print("\n--- 5. Exportando WAVs ---")
+out_folder = "resultados_audio"
+
+# Guardar Target puro (Referencia de cómo debería sonar)
+save_normalized_wav("0_target_limpio_ref.wav", fs, target_signal, out_folder)
+
+# Guardar Entrada Mic 0 (Lo que se escucha sin procesar)
+save_normalized_wav("1_entrada_mic0.wav", fs, mic_data[0, :], out_folder)
+
+# Guardar Salida Fija (Solo atenuación espacial básica)
+save_normalized_wav("2_salida_fija.wav", fs, y_fixed, out_folder)
+
+# Guardar Salida Adaptativa (Cancelación activa)
+save_normalized_wav("3_salida_gsc_adaptativo.wav", fs, y_adaptive, out_folder)
+
+
+# ==============================================================================
+# 6. PLOTEO RÁPIDO
+# ==============================================================================
+print("\n--- 6. Graficando ---")
+# Zoom al principio (donde hay interferencia) y al medio (donde ya convergió)
+t_zoom = t[:2000] * 1000 # Primeros 2000 samples
+
+plt.figure(figsize=(10, 10))
+
+plt.subplot(3, 1, 1)
+plt.title("Entrada Mic 0 (Ruidosa)")
+plt.plot(t_zoom, np.real(mic_data[0, :2000]), color='gray')
+plt.grid(True)
+
+plt.subplot(3, 1, 2)
+plt.title("Salida Fija (Atenuación parcial)")
+plt.plot(t_zoom, np.real(y_fixed[:2000]), color='orange')
+plt.grid(True)
+
+plt.subplot(3, 1, 3)
+plt.title("Salida GSC (Convergencia y Limpieza)")
+plt.plot(t_zoom, np.real(y_adaptive[:2000]), color='green', label='GSC')
+plt.plot(t_zoom, target_signal[:2000], 'k--', alpha=0.5, label='Target')
+plt.legend(loc='upper right')
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+print(f"\nPROCESO TERMINADO. Revisa la carpeta '{out_folder}'.")
+
+============================================================
+ARCHIVO: src/utils/geometry.py
+============================================================
+import numpy as np 
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+
+def source_rotation(radius, samples, axis = 'h'):
+    """
+    Generates an array of source points distributed uniformly 
+    in a circle around the origin (assumed location of the mic array).
+
+    The function outputs a matrix of Cartesian coordinates (3, N) 
+    and the corresponding array of azimuthal angles.
+
+    Parameters
+    ----------
+    radius : float
+        The radius of the source circle (distance from the source to the array center) in meters.
+    samples : int
+        The number of source points (samples) to generate along the circle.
+    axis : {'h', 'v', 'l'}, optional
+        Defines the plane of rotation:
+        - 'h' (horizontal, default): XY plane (Z=0). Rotation around the Z-axis.
+        - 'v' (vertical): XZ plane (Y=0). Rotation around the Y-axis.
+        - 'l' (lateral): YZ plane (X=0). Rotation around the X-axis.
+
+    Returns
+    -------
+    points : numpy.ndarray
+        Matrix of Cartesian coordinates for the source points. 
+        Shape: (3, samples), where Row 0=X, Row 1=Y, Row 2=Z.
+    degrees : numpy.ndarray
+        1D array of the azimuthal angles used to generate the points, 
+        expressed in degrees. Shape: (samples,).
+    """
+
+    angles = np.arange(0, 2*np.pi, 2*np.pi/samples)
+
+    cos = np.cos(angles)
+    sin = np.sin(angles)
+    zeros = np.zeros(len(angles))
+
+    degrees = np.degrees(angles)
+
+    if axis == "h":
+        points = np.stack([cos, sin, zeros], axis = 0)
+    elif axis == "v": 
+        points = np.stack([cos, zeros, sin], axis = 0)
+    elif axis == "l":
+        points = np.stack([zeros, sin,  cos], axis = 0)
+    else:
+        # Error
+        raise ValueError("Parameter must be: 'h', 'v' o 'l'.")
+
+    points = radius * points
+
+    return points, degrees 
+    
+import numpy as np
+
+def spherical_to_cartesian(
+    radius: np.ndarray, 
+    azimuth: np.ndarray, 
+    elevation: np.ndarray
+) -> np.ndarray:
+    """
+    Converts arrays of Spherical coordinates to Cartesian (x, y, z).
+
+    This function assumes the ISO 80000-2 standard (physics convention):
+    - radius (r): Distance from the origin.
+    - azimuth (θ): Angle in the XY-plane from the X-axis (in radians).
+    - elevation (φ): Angle from the positive Z-axis (in radians).
+
+    Args:
+        radius (np.ndarray): Array of radial distances. Shape (N,).
+        azimuth (np.ndarray): Array of azimuth angles (theta) in radians. Shape (N,).
+        elevation (np.ndarray): Array of elevation angles (phi) in radians. Shape (N,).
+
+    Returns:
+        np.ndarray: Array of (x, y, z) Cartesian coordinates. Shape (N, 3).
+    """
+    
+    # Calculate Cartesian coordinates using element-wise operations
+    x = radius * np.sin(elevation) * np.cos(azimuth)
+    y = radius * np.sin(elevation) * np.sin(azimuth)
+    z = radius * np.cos(elevation)
+    
+    # Stack the (N,) coordinate arrays as columns to create an (N, 3) matrix
+    cartesian_coords = np.stack([x, y, z], axis=1)
+    
+    return cartesian_coords
+
+
+import numpy as np
+
+def cartesian_to_spherical(cartesian_coords: np.ndarray) -> np.ndarray:
+    """
+    Converts Cartesian coordinates (x, y, z) to Spherical (radius, azimuth, elevation).
+
+    This function robustly handles both a single point (1D array of shape (3,))
+    and a batch of points (2D array of shape (N, 3)).
+
+    Args:
+        cartesian_coords (np.ndarray): Array of (x, y, z) points.
+                                     Shape can be (3,) or (N, 3).
+
+    Returns:
+        np.ndarray: Array of (radius, azimuth, elevation) points.
+                    Shape will be (3,) or (N, 3), matching the input shape.
+                    Azimuth and elevation are in radians.
+    """
+    # 1. Convertir a un array de NumPy (por si el usuario pasó una lista)
+    coords = np.asarray(cartesian_coords)
+    
+    # 2. Detectar si la entrada es 1D (un solo punto)
+    if coords.ndim == 1:
+        if coords.shape[0] != 3:
+            raise ValueError(f"Single point must have shape (3,), but got {coords.shape}")
+        # Es 1D. Guardamos este hecho y la promovemos a 2D para el cálculo.
+        was_1d = True
+        coords_2d = coords.reshape(1, 3)
+    elif coords.ndim == 2:
+        if coords.shape[1] != 3:
+            raise ValueError(f"Array of points must have shape (N, 3), but got {coords.shape}")
+        # Es 2D, la usamos tal cual.
+        was_1d = False
+        coords_2d = coords
+    else:
+        raise ValueError(f"Input must be a 1D or 2D array, but got {coords.ndim} dimensions.")
+
+    # --- 3. Cálculos (Este bloque es idéntico al anterior) ---
+    # (Ahora 'coords_2d' está garantizado que es 2D)
+    x = coords_2d[:, 0]
+    y = coords_2d[:, 1]
+    z = coords_2d[:, 2]
+
+    radius = np.linalg.norm(coords_2d, axis=1)
+    radius_safe = np.where(radius == 0, 1e-12, radius)
+    
+    elevation = np.arccos(np.clip(z / radius_safe, -1.0, 1.0))
+    azimuth = np.arctan2(y, x)
+
+    elevation[radius == 0] = 0.0
+    azimuth[radius == 0] = 0.0
+    
+    spherical_coords = np.stack([radius, azimuth, elevation], axis=1)
+    
+    # --- 4. Devolver el formato original ---
+    if was_1d:
+        # Si la entrada era 1D, devolvemos un array 1D (shape (3,))
+        return spherical_coords.squeeze()
+    else:
+        # Si la entrada era 2D, devolvemos el array 2D (shape (N, 3))
+        return spherical_coords
+
+def source_sphere_grid(radius, samples_azimut, samples_elevation):
+    """
+    Genera puntos de fuente en una Malla de Cuadrícula Esférica.
+
+    Parameters
+    ----------
+    radius : float
+        Radio de la esfera.
+    samples_azimut : int
+        Número de divisiones angulares para el ángulo Azimutal (phi).
+    samples_elevation : int
+        Número de divisiones angulares para el ángulo de Elevación (theta).
+
+    Returns
+    -------
+    coords_grid (ndarray): Matriz de coordenadas (3, N*M).
+    azimut_flat (ndarray): Vector 1D de todos los ángulos azimutales usados (N*M).
+    elevation_flat (ndarray): Vector 1D de todos los ángulos de elevación usados (N*M).
+    """
+
+    # 1. Crear vectores 1D para cada eje angular (Delta angular constante)
+    # Azimut (phi): 0 a 2*pi
+    azimut_1d = np.linspace(0, 2 * np.pi, samples_azimut, endpoint=False) # No incluye 2*pi
+    
+    # Elevación (theta): 0 a pi (desde el eje Z)
+    elevation_1d = np.linspace(0, np.pi, samples_elevation)
+
+    # 2. Generar la Malla de Cuadrícula (Grid)
+    # Genera dos matrices 2D (azimut_mesh, elevation_mesh)
+    azimut_mesh, elevation_mesh = np.meshgrid(azimut_1d, elevation_1d)
+
+    # 3. Aplanar las mallas a vectores 1D
+    # Esto crea los dos vectores de longitud (N*M) con todas las combinaciones.
+    azimut_flat = azimut_mesh.flatten()
+    elevation_flat = elevation_mesh.flatten()
+
+    # 4. Uso de Broadcasting
+    # La función vectorizada (sferical_to_coord) usa estos vectores N*M para generar la cuadrícula.
+    coords_grid = spherical_to_cartesian(radius, azimut_flat, elevation_flat)
+    
+    # coords_grid tendrá forma (3, N*M)
+    return coords_grid, azimut_flat, elevation_flat
+
+
+
+
+============================================================
+ARCHIVO: src/utils/__init__.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/utils/audio.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/utils/polar_plot.py
+============================================================
+from matplotlib import pyplot as plt 
+import numpy as np
+from scipy.constants import speed_of_sound
+
+from utils.geometry import source_rotation
+from beamforming.processors import beamforming
+from propagation.free_field import space_delay
+from beamforming.processors import snapshots
+# EN: utils/polar_plot.py
+import matplotlib.pyplot as plt
+import numpy as np
+from typing import List
+
+def plot_polar_pattern(gains_list: List[np.ndarray], angles_deg: np.ndarray, labels_list: List[str], title: str = ""):
+    """
+    Grafica uno o más patrones polares superpuestos.
+
+    Args:
+        gains_list (List[np.ndarray]): Una lista de arrays de ganancia en dB.
+        angles_deg (np.ndarray): Un array de ángulos en grados.
+        labels_list (List[str]): Una lista de etiquetas para la leyenda, una para cada array de ganancia.
+        title (str): El título del gráfico.
+    """
+    fig, ax = plt.subplots(subplot_kw={'projection': 'polar'})
+
+    # --- Bucle para dibujar cada patrón ---
+    for gains_db, label in zip(gains_list, labels_list):
+        # Asume que angles_deg es 0=Eje X, 90=Eje Y
+        ax.plot(np.deg2rad(angles_deg), gains_db, label=label)
+    
+    # Mueve la leyenda fuera del gráfico para que no tape los datos
+    ax.legend(loc='upper right', bbox_to_anchor=(1.35, 1.1))
+    
+    # --- INICIO DE MODIFICACIONES ---
+
+    # 1. Ajustar el eje angular (Dirección X/Y)
+    # Pone 0° en el Este (eje X), que es la convención matemática estándar
+    ax.set_theta_zero_location('E') 
+    # Define los grids angulares y sus etiquetas para X e Y
+    ax.set_thetagrids(
+        [0, 90, 180, 270], 
+        labels=['X (0°)', 'Y (90°)', '-X (180°)', '-Y (270°)']
+    )
+
+    # 2. Ajustar el eje radial (Etiqueta de Ganancia)
+    ax.set_rlim(-50, 5) # Límite radial
+    ax.set_rticks(np.arange(-40, 1, 10)) # Marcas radiales
+    
+    # Posiciona los números de los ticks (ej. a 22.5 grados)
+    ax.set_rlabel_position(22.5) 
+    
+    # Añade la etiqueta "Ganancia (dB)" al eje radial
+    # Se usa ax.text para un control preciso de la posición
+    ax.text(np.deg2rad(22.5), ax.get_rmin() - 15, 'Ganancia (dB)', 
+            ha='center', va='center', fontsize=9, color='gray')
+    
+    # --- FIN DE MODIFICACIONES ---
+    
+    ax.set_title(title, va='bottom', pad=20)
+    plt.tight_layout()
+    plt.show()
+
+============================================================
+ARCHIVO: src/propagation/image_source.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/propagation/__init__.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/propagation/free_field.py
+============================================================
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.constants import speed_of_sound
+from scipy.io import wavfile
+
+# --- IMPORTACIONES ---
+from beamforming.signal_model import near_field_steering_vector_multi
+from beamforming.algorithms.region_constriant import build_region_constraints
+from beamforming.processors import gsc_adaptive_beamformer
+
+# ------------------------------------------------------------------------------
+# 1. TU FUNCIÓN DE PROPAGACIÓN (Copiada aquí para integración)
+# ------------------------------------------------------------------------------
+def space_delay(signal, fs, source_pos, mic_array):
+    """
+    Simula la propagación banda ancha usando FFT para retardos fraccionarios exactos.
+    """
+    N_original = len(signal)
+    source_pos = np.atleast_2d(source_pos) 
+    
+    # 1. Cálculo de retardos
+    diff_vectors = source_pos[:, np.newaxis, :] - mic_array[np.newaxis, :, :]
+    distancias = np.linalg.norm(diff_vectors, axis=2) 
+    tau_array = distancias / speed_of_sound 
+    
+    # 2. Longitud FFT (Potencia de 2)
+    max_delay_samples = int(np.ceil(np.max(tau_array) * fs))
+    N_fft = 2**(int(np.ceil(np.log2(N_original + max_delay_samples))))
+    
+    # 3. FFT
+    signal_padded = np.pad(signal, (0, N_fft - N_original), 'constant')
+    X = np.fft.fft(signal_padded)
+    k = np.fft.fftfreq(N_fft, d=1/fs)
+    
+    # 4. Fase
+    phase_shift_matrix = np.exp(-1j * 2 * np.pi * k * tau_array[..., np.newaxis])
+    
+    # 5. IFFT
+    Y_matrix = X * phase_shift_matrix
+    array_retardado_complex = np.fft.ifft(Y_matrix, axis=-1)
+    array_retardado = array_retardado_complex.real
+    
+    return array_retardado, signal_padded, tau_array
+
+# ------------------------------------------------------------------------------
+# 2. FUNCIÓN AUXILIAR DE EXPORTACIÓN
+# ------------------------------------------------------------------------------
+def save_normalized_wav(filename, rate, data, folder="resultados_audio"):
+    if not os.path.exists(folder): os.makedirs(folder)
+    filepath = os.path.join(folder, filename)
+    data_real = np.real(data)
+    max_val = np.max(np.abs(data_real))
+    data_norm = (data_real / max_val * 0.9) if max_val > 0 else data_real
+    wavfile.write(filepath, rate, (data_norm * 32767).astype(np.int16))
+    print(f"  -> Guardado: {filepath}")
+
+# ==============================================================================
+# 3. CONFIGURACIÓN Y DISEÑO DEL BEAMFORMER (Igual que antes)
+# ==============================================================================
+print("\n--- 1. Configurando Parámetros ---")
+fs = 48000
+K = 25
+C_SOUND = speed_of_sound
+
+# Geometría
+f_ref_geometry = 3000.0
+LAMBDA_REF = C_SOUND / f_ref_geometry
+M = 9
+D = LAMBDA_REF / 2
+mic_x = np.linspace(0, (M - 1) * D, M) - (M - 1) * D / 2
+mic_array = np.stack([mic_x, np.zeros(M), np.zeros(M)], axis=1)
+
+# Foco
+radius = 5 * LAMBDA_REF
+focal_angle_rad = np.deg2rad(90.0)
+focal_point_cartesian = np.array([
+    radius * np.cos(focal_angle_rad), radius * np.sin(focal_angle_rad), 0.0
+])
+
+print("\n--- 2. Diseñando Filtro Robusto (LCMV-RB) ---")
+# Usamos parámetros banda ancha para el diseño de pesos w_q
+C_rb, h_rb, Ca_rb = build_region_constraints(
+    Rs=focal_point_cartesian, 
+    delta_r=radius * 0.2, 
+    delta_azimut=np.deg2rad(8.0),
+    delta_elevation=np.deg2rad(2.0), 
+    mic_array=mic_array, fs=fs, K=K,
+    f_min=1000.0, f_max=4000.0, num_points=50, num_freqs=50
+)
+w_lcmv_rb = (C_rb @ h_rb.flatten())
+print("Diseño listo.")
+
+# ==============================================================================
+# 4. GENERACIÓN DE SEÑALES (USANDO TU NUEVA FUNCIÓN)
+# ==============================================================================
+print("\n--- 3. Generando Señales (Propagación Banda Ancha) ---")
+duration = 4.0 
+t_src = np.arange(int(duration * fs)) / fs
+
+# A. Señal Deseada (Fuente Mono 1D)
+# "Beep" pulsante a 3kHz
+target_mono = 0.05 * np.sin(2 * np.pi * 3000.0 * t_src) * (np.sin(2 * np.pi * 2.0 * t_src)**2)
+
+# B. Interferencia (Fuente Mono 1D)
+# Ruido + tono molesto
+interf_mono = 0.3 * np.random.randn(len(t_src)) + 0.1 * np.sin(2 * np.pi * 1200.0 * t_src)
+
+# C. Posición de Interferencia
+angle_int = np.deg2rad(40.0)
+pos_int = np.array([radius * np.cos(angle_int), radius * np.sin(angle_int), 0.0])
+
+
+# --- APLICANDO TU FUNCIÓN SPACE_DELAY ---
+print("  Propagando Target...")
+# Retorna (1, M, N_fft) porque pasamos 1 posición
+mics_target_prop, ref_target_padded, _ = space_delay(target_mono, fs, focal_point_cartesian, mic_array)
+mics_target_prop = mics_target_prop[0] # Quitamos la dimensión de fuente (M, N_fft)
+
+print("  Propagando Interferencia...")
+mics_interf_prop, _, _ = space_delay(interf_mono, fs, pos_int, mic_array)
+mics_interf_prop = mics_interf_prop[0] # (M, N_fft)
+
+# --- ALINEACIÓN DE LONGITUDES ---
+# Como space_delay usa potencias de 2, si las distancias son muy distintas podría
+# dar longitudes distintas. Normalizamos al máximo.
+len_t = mics_target_prop.shape[1]
+len_i = mics_interf_prop.shape[1]
+max_len = max(len_t, len_i)
+
+# Padding si es necesario
+if len_t < max_len:
+    mics_target_prop = np.pad(mics_target_prop, ((0,0), (0, max_len-len_t)))
+    ref_target_padded = np.pad(ref_target_padded, (0, max_len-len_t))
+if len_i < max_len:
+    mics_interf_prop = np.pad(mics_interf_prop, ((0,0), (0, max_len-len_i)))
+
+# D. Mezcla Final
+# Suma coherente + Ruido térmico no correlacionado
+print("  Mezclando señales...")
+mic_data = mics_target_prop + mics_interf_prop 
+mic_data += 0.002 * np.random.randn(M, max_len) # Ruido térmico en cada mic
+
+# Nuevo vector de tiempo para plotear (basado en N_fft)
+t_sim = np.arange(max_len) / fs
+
+print(f"Simulación lista. Muestras procesadas: {max_len}")
+
+# ==============================================================================
+# 5. PROCESAMIENTO (GSC)
+# ==============================================================================
+print("\n--- 4. Procesando Audio ---")
+
+print("  -> Corriendo GSC Adaptativo (mu=0.05)...")
+y_adaptive, w_log = gsc_adaptive_beamformer(
+    input_signal=mic_data,
+    w_q=w_lcmv_rb,    
+    Ca=Ca_rb,         
+    K=K,
+    mu=0.05           
+)
+
+print("  -> Corriendo Beamformer Fijo...")
+y_fixed, _ = gsc_adaptive_beamformer(
+    input_signal=mic_data,
+    w_q=w_lcmv_rb,
+    Ca=Ca_rb,
+    K=K,
+    mu=0.0            
+)
+
+# ==============================================================================
+# 6. PLOTEO Y EXPORTACIÓN
+# ==============================================================================
+print("\n--- 5. Resultados ---")
+
+# Exportar WAVs
+folder = "resultados_audio_broadband"
+save_normalized_wav("0_target_ref.wav", fs, ref_target_padded, folder) # Usamos el padded como referencia
+save_normalized_wav("1_mic0_input.wav", fs, mic_data[0, :], folder)
+save_normalized_wav("2_output_fijo.wav", fs, y_fixed, folder)
+save_normalized_wav("3_output_gsc.wav", fs, y_adaptive, folder)
+
+# Gráficos
+plt.figure(figsize=(10, 10))
+
+# Zoom para ver detalles (aprox en el medio del audio)
+zoom_s = int(max_len/2)
+zoom_e = zoom_s + 2000
+t_zoom = t_sim[zoom_s:zoom_e] * 1000
+
+plt.subplot(3, 1, 1)
+plt.title("Entrada Mic 0 (Interferencia domina)")
+plt.plot(t_zoom, np.real(mic_data[0, zoom_s:zoom_e]), 'gray')
+plt.grid(True)
+
+plt.subplot(3, 1, 2)
+plt.title("Salida GSC vs Target")
+plt.plot(t_zoom, np.real(y_adaptive[zoom_s:zoom_e]), 'green', label='GSC Output')
+plt.plot(t_zoom, ref_target_padded[zoom_s:zoom_e], 'k--', alpha=0.8, label='Target Limpio')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(3, 1, 3)
+plt.title("Evolución de Pesos (Adaptación)")
+plt.plot(w_log)
+plt.xlabel("Iteraciones"); plt.ylabel("Norma |wa|")
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+============================================================
+ARCHIVO: src/beamforming/processors.py
+============================================================
+import numpy as np
+from scipy.constants import speed_of_sound
+from beamforming.signal_model import near_field_steering_vector
+from numpy.lib.stride_tricks import sliding_window_view
+
+
+
+
+
+def snapshots(array_signals, K):
+    """
+    Creates the snapshot matrix U for a multi-channel time-domain beamformer.
+
+    This function efficiently transforms a 2D array of microphone signals 
+    (M mics, N samples) into the 2D snapshot matrix required by a 
+    tapped-delay-line (FIR) beamformer. Each column of the output matrix 
+    represents a concatenated snapshot vector u(k).
+
+    Args:
+        array_signals (np.ndarray): 
+            Input signal matrix of shape (M, N_samples). M is the number 
+            of microphones, N_samples is the number of time samples.
+        K (int): 
+            The number of FIR taps per microphone (the window size).
+
+    Returns:
+        np.ndarray: 
+            The snapshot matrix U of shape (M * K, N_snapshots), where 
+            N_snapshots = N_samples - K + 1.
+    """
+    M, _ = array_signals.shape
+
+    # Create a sliding window view of size K along the time axis (axis=1).
+    # This results in a 3D tensor of shape (M, N_snapshots, K).
+    signals_window = sliding_window_view(array_signals, window_shape=K, axis=1)
+
+    # Reverse the tap axis to ensure a causal FIR filter structure [x(n), x(n-1), ...].
+    # The steering vector is defined for this order.
+    reversed_taps = signals_window[:, :, ::-1]
+
+    # Reorder axes to group taps by microphone, then reshape to the final
+    # (M*K, N_snapshots) matrix by concatenating all tap blocks.
+    snapshot_matrix = reversed_taps.transpose(0, 2, 1).reshape(M * K, -1)
+
+    return snapshot_matrix
+
+import numpy as np
+
+def beamforming(signals, weights):
+    """
+    Applies a time-domain beamformer to a snapshot matrix of signals.
+
+    This function performs the core beamforming operation by taking the dot product
+    of the Hermitian transpose of the weight vector with the snapshot matrix. This
+    is equivalent to applying a multi-channel FIR filter and summing the result.
+
+    Args:
+        signals (np.ndarray): 
+            The snapshot matrix U, where each column is a concatenated snapshot
+            vector u(k). Expected shape: (N, T), where N = M * K is the total 
+            number of weights, and T is the number of time snapshots.
+        weights (np.ndarray): 
+            The beamformer weight vector w. Expected shape: (N, 1).
+
+    Returns:
+        np.ndarray: 
+            The single-channel output signal y. Shape: (1, T).
+    """
+    # Calculate the beamformer output via matrix multiplication (y = w^H * U).
+    # The Hermitian transpose (.conj().T) is used for potentially complex weights,
+    # but works correctly for real-valued weights as well (where it's just .T).
+    y = weights.conj().T @ signals
+    
+    return y
+
+
+def gsc_adaptive_beamformer(
+    input_signal: np.ndarray, 
+    w_q: np.ndarray, 
+    Ca: np.ndarray, 
+    K: int, 
+    mu: float = 0.1,
+    epsilon: float = 1e-6
+):
+    """
+    Implementación funcional del Generalized Sidelobe Canceller (GSC) con NLMS.
+    
+    Args:
+        input_signal: Señal multicanal de entrada (M micrófonos x T muestras).
+        w_q: Pesos fijos del beamformer (vector de N = M*K).
+        Ca: Matriz de bloqueo (N x N_adapt). Ortogonal a C.
+        K: Número de Taps (retardos temporales).
+        mu: Paso de adaptación (Step size) para NLMS.
+        epsilon: Factor de regularización para evitar división por cero.
+        
+    Returns:
+        y_out: Señal de salida del beamformer (1D array de longitud T).
+        w_log: Historial de los pesos adaptativos (para análisis).
+    """
+    
+    M, T = input_signal.shape
+    N = w_q.shape[0] # N = M * K
+    
+    # Verificación de dimensiones
+    if N != M * K:
+        raise ValueError(f"Error de dimensiones: w_q tiene {N}, pero debería ser M*K={M*K}")
+
+    # Inicialización
+    y_out = np.zeros(T, dtype=complex)
+    
+    # El filtro adaptativo wa tiene el tamaño del espacio nulo (columnas de Ca)
+    n_adapt = Ca.shape[1]
+    wa = np.zeros(n_adapt, dtype=complex) 
+    
+    # Buffer para la línea de retardo (TDL) de cada micrófono
+    # Almacena las últimas K muestras de los M micrófonos
+    # Lo aplanaremos para formar el vector u(k) de tamaño N
+    buffer = np.zeros((M, K), dtype=complex)
+    
+    # Historial de pesos (opcional, para ver convergencia)
+    # Guardamos un snapshot cada 100 muestras para no llenar la RAM
+    w_log = [] 
+
+    print(f"Procesando {T} muestras con GSC-NLMS (mu={mu})...")
+
+    # --- Bucle Temporal (Muestra a Muestra) ---
+    for k in range(T):
+        
+        # 1. Actualizar Buffer (TDL)
+        # Desplazamos el buffer y metemos la nueva muestra al final
+        buffer[:, 1:] = buffer[:, :-1]     # Shift derecha
+        buffer[:, 0]  = input_signal[:, k] # Nueva muestra en posición 0
+        
+        # 2. Construir vector de entrada u(k)
+        # Aplanamos el buffer para que coincida con la estructura de los pesos
+        # (Mic1_t0, Mic1_t1..., Mic2_t0...)
+        u_k = buffer.reshape(-1) # Vector de (N,)
+        
+        # -----------------------------------------------------------
+        # ESTRUCTURA GSC
+        # -----------------------------------------------------------
+        
+        # 3. Rama Superior (Fixed Beamformer)
+        # y_q = w_q^H * u(k)
+        y_q = np.dot(np.conj(w_q), u_k)
+        
+        # 4. Rama Inferior (Blocking Matrix)
+        # x_a = Ca^H * u(k) -> Señal de referencia de ruido/interferencia
+        x_a = np.dot(np.conj(Ca.T), u_k)
+        
+        # 5. Filtro Adaptativo
+        # y_a = wa^H * x_a -> Estimación del ruido en la salida fija
+        y_a = np.dot(np.conj(wa), x_a)
+        
+        # 6. Salida del Sistema (y cálculo del error)
+        # e(k) = y_q - y_a
+        e = y_q - y_a
+        y_out[k] = e # La salida final ES el error de la cancelación
+        
+        # 7. Actualización NLMS de los pesos adaptativos
+        # wa_new = wa + mu * (x_a * e*) / (|x_a|^2 + eps)
+        energy = np.real(np.dot(np.conj(x_a), x_a))
+        step = (mu / (energy + epsilon)) * x_a * np.conj(e)
+        wa = wa + step
+        
+        # Logueo (opcional)
+        if k % 1000 == 0:
+            w_log.append(np.abs(wa).mean()) # Guardamos la magnitud media
+
+    return y_out, w_log
+
+============================================================
+ARCHIVO: src/beamforming/signal_model.py
+============================================================
+import numpy as np
+from scipy.constants import speed_of_sound
+
+def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
+    """
+    Calcula los steering vectors de campo cercano para múltiples frecuencias y puntos de la fuente.
+    Esta versión está corregida para manejar el broadcasting de dimensiones correctamente.
+    """
+    f = np.atleast_1d(f)
+    Rs = np.atleast_2d(Rs)
+    
+    F = f.shape[0]
+    P = Rs.shape[0]
+    M = mic_array.shape[0]
+    
+    # --- Cálculos dependientes de Rs (dimensión de Puntos, P) ---
+    # Distancia de cada punto de fuente al origen (d_s en el paper)
+    source_dist_origin = np.linalg.norm(Rs, axis=1) # Shape: (P,)
+    # Distancia de cada punto de fuente a cada micrófono (d_m en el paper)
+    mic_distances = np.linalg.norm(Rs[:, np.newaxis, :] - mic_array[np.newaxis, :, :], axis=2) # Shape: (P, M)
+    
+    # --- Delays ---
+    mic_delay = mic_distances / c # Shape: (P, M)
+    source_delay_origin = source_dist_origin / c # Shape: (P,)
+    T = 1/fs
+    tap_delays = np.arange(K) * T # Shape: (K,)
+
+    # --- CORRECCIÓN CLAVE: Añadir el retardo de referencia del centro del filtro ---
+    ref_delay = (K - 1) / (2 * fs)
+    
+    # --- Cálculo del Steering Vector (CORREGIDO) ---
+    # Fase = 2*pi*f * ( (d_m - d_s)/c + k/fs )
+    # El paper no usa el ref_delay, pero es necesario para que g sea consistente.
+    # La fase correcta que es consistente con g es: 2*pi*f * (ref_delay - (d_m - d_s)/c - k/fs)
+    # Esto es equivalente a: 2*pi*f * (ref_delay + d_s/c - d_m/c - k/fs)
+    f_bcast = f.reshape(F, 1, 1, 1)
+    phase_term = np.exp(1j * 2 * np.pi * f_bcast * (ref_delay + source_delay_origin[np.newaxis, :, np.newaxis, np.newaxis] - mic_delay[np.newaxis, :, :, np.newaxis] - tap_delays[np.newaxis, np.newaxis, np.newaxis, :]))
+    
+    steering_vector = phase_term / mic_distances[np.newaxis, :, :, np.newaxis]
+    
+    # --- Reshape Final (sin cambios) ---
+    final_sv = steering_vector.reshape(F, P, M * K)
+    
+    return final_sv
+
+def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
+    """
+    Calculathes the steering vector for a specific frecuency
+    norlmaliced in the origin of coords. 
+        Args: 
+        f (np.array or float): Frequency in Hz.
+        fs (int): frecuency sample of the signal. (to determin tabs lenght)
+        Rs (np.array): Source location (x, y, z), the focal point.
+        K(int)_ number of tabs
+        mic_array (np.array): Array of M microphones with 3D coordinates (x, y, z).
+        c (float): Speed of sound in m/s.
+    Returns:
+        steering_vector (np.array): returns M.Kx1 array.
+    """
+
+    # Distancia de la fuente al origen (d_s)
+    source_dist_origin = np.linalg.norm(Rs)
+    # Distancia de la fuente a cada micrófono (d_m)
+    distances = np.linalg.norm(Rs - mic_array, axis=1).reshape(-1, 1)
+
+    # --- Delays ---
+    mic_delay = distances/c 
+    source_delay_origin = source_dist_origin / c
+    T = 1/fs
+    tap_delays = np.arange(K) * T
+
+    # --- CORRECCIÓN CLAVE: Añadir el retardo de referencia del centro del filtro ---
+    ref_delay = (K - 1) / (2 * fs)
+
+    # --- Cálculo del Steering Vector (CORREGIDO según Ecuación 1 del paper) ---
+    # Fase = 2*pi*f * (ref_delay + d_s/c - d_m/c - k/fs)
+    phase_term = np.exp(1j * 2 * np.pi * f * (ref_delay + source_delay_origin - mic_delay - tap_delays))
+    
+    steering_vector = phase_term / distances
+
+    #Colapsing the matriz into colums 
+    steering_vector_flat = steering_vector.reshape(-1,1)
+
+    return steering_vector_flat
+
+
+============================================================
+ARCHIVO: src/beamforming/__init__.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/beamforming/beamformer.py
+============================================================
+from .array.mic_array import MicArray 
+from .algorithms.optimizer import WeightOptimizer
+import numpy as np
+from  beamforming.evaluation.gain import analytical_gain
+
+class Beamformer():
+    """
+
+    """
+
+    def __init__(self, 
+                 array_obj: MicArray,
+                 optimization_obj: WeightOptimizer,
+                 K: int,
+                 fs : int ):
+        
+        self.array_obj = array_obj
+        self.optimization = optimization_obj
+        self.K = K
+        self.fs = fs
+    
+    def compute_weights( self, **kwargs ):
+
+        self.focal_point = kwargs['focal_point']
+        print("Computing weights")
+
+        weights = self.optimization.calculate(
+            self.array_obj,
+            self.K,
+            self.fs,
+            **kwargs
+        )
+        print("The weights has been updated")
+        self.weights = weights
+
+    def compute_gain(self, frecs: np.ndarray, points: np.ndarray,  **kwargs ):
+        mic_array = self.array_obj.coordinates 
+        gains = analytical_gain(frecs = frecs,          
+                                source_points = points,         
+                                fs = self.fs,   
+                                mic_array = mic_array,
+                                weights= self.weights
+                                )
+        return gains 
+        
+
+
+
+
+
+============================================================
+ARCHIVO: src/beamforming/algorithms/adaptive.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/beamforming/algorithms/constrains.py
+============================================================
+from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
+import numpy as np
+from abc import ABC, abstractmethod
+from typing import Tuple
+from ..array.mic_array import MicArray
+
+
+
+def point_constraint( target_point , K_taps, mic_array , f, fs ):
+    #steering vector of the specific point (shape (M.K , 1))
+    steering_vector = near_field_steering_vector(f, target_point, fs, mic_array, K=K_taps)
+    
+    constrains_C = np.hstack([np.real(steering_vector), np.imag(steering_vector)]) 
+
+    # 3. Definir el vector de respuesta deseada h. (Forma: 2 x 1)
+    # [Ganancia Real Deseada (1)]
+    # [Ganancia Imaginaria Deseada (0)]
+    target_gain_h = np.vstack([1.0, 0.0]) # [1, 0]^T
+
+    return constrains_C, target_gain_h
+
+class ConstrainGenerator(ABC):
+    '''
+    Abstract Class to generate to generate constrains
+    '''
+    @abstractmethod
+    def generate(self, array_obj: MicArray, K: int, fs: float, **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+        pass
+
+class NarrowbandPointConstrain(ConstrainGenerator):
+    '''
+    Defines constrainst structure for unitary gain at focal focal point with f_target. 
+    '''
+    def __init__(self,  f_target : int, **kwargs):
+
+        self.f_target = f_target
+
+    def generate(self, array_obj: MicArray, K: int, fs: float, **kwargs):
+
+        #search the kwargs 
+        if 'focal_point' not in kwargs:
+            raise ValueError("NarrowbandPointConstrain requires 'focal_point' in kwargs")
+        
+        focal_point = kwargs['focal_point']
+
+        mic_array = array_obj.coordinates
+
+        C, H = point_constraint( target_point = focal_point,
+                                 K_taps= K,
+                                 mic_array = mic_array,
+                                 f = self.f_target,
+                                 fs = fs  )
+        return C, H
+    
+
+    
+
+
+
+
+============================================================
+ARCHIVO: src/beamforming/algorithms/__init__.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/beamforming/algorithms/optimizer.py
+============================================================
+from abc import ABC, abstractmethod
+from ..array.mic_array import MicArray
+from typing import Tuple
+import numpy as np
+
+class WeightOptimizer(ABC):
+    """
+    Clase base abstracta (Interfaz) para todas las estrategias de cálculo de pesos.
+    Define el contrato que todos los algoritmos de optimización deben seguir.
+    """
+    @abstractmethod
+    def calculate(self, array_obj: MicArray, K: int, fs: float, **kwargs) -> np.ndarray:
+        """
+        Este método debe ser implementado por cada algoritmo específico.
+
+        Args:
+            array_obj (MicrophoneArray): El objeto que describe la geometría del arreglo.
+            K (int): El número de taps por filtro.
+            fs (float): La frecuencia de muestreo.
+            **kwargs: Argumentos adicionales específicos del algoritmo.
+                      Por ejemplo, LcmvOptimizer esperará recibir 'focal_point'.
+
+        Returns:
+            np.ndarray: El vector de pesos calculado, de forma (M*K,).
+        """
+        pass
+
+============================================================
+ARCHIVO: src/beamforming/algorithms/region_constriant.py
+============================================================
+import numpy as np 
+from scipy.constants import speed_of_sound
+from beamforming.signal_model import near_field_steering_vector_multi 
+from utils.geometry import cartesian_to_spherical, spherical_to_cartesian
+from typing import Tuple
+
+
+def set_domains(Rs, delta_r, delta_azimut, delta_elevation, fmin, fmax, P, J):
+
+    #Frecuencya array 
+    f_array = np.linspace(fmin, fmax, J)
+    
+    
+    Rs_sferical = cartesian_to_spherical(Rs)
+
+    #Generate P random points inside the domain
+    radius = np.random.uniform(Rs_sferical[0] - delta_r/2,  Rs_sferical[0] + delta_r/2, P )
+    azimut = np.random.uniform(Rs_sferical[1] - delta_azimut/2, Rs_sferical[1]+ delta_azimut/2, P)
+    elevation = np.random.uniform( Rs_sferical[2] - delta_elevation/2, Rs_sferical[2]+ delta_elevation/2, P)
+
+    #generate a single vector with all the points in cartesian coordinates 
+    points = spherical_to_cartesian(radius, azimut, elevation)
+
+    return f_array, points
+
+def build_A_and_g(
+    freqs: np.ndarray, 
+    source_points: np.ndarray, 
+    fs: int, 
+    mic_array: np.ndarray, 
+    K: int, 
+    c: float = speed_of_sound
+) -> Tuple[np.ndarray, np.ndarray]: 
+    """
+    Calculates the real-valued constraint matrix A (Eq. 13) and
+    the real-valued desired response vector g (Eq. 15).
+
+    Both are sampled at J frequencies and I spatial points.
+
+    Args:
+        freqs (np.ndarray): Array of J frequency samples (Hz). Shape: (J,).
+        source_points (np.ndarray): Array of I spatial sample points (m). Shape: (I, 3).
+        fs (int): Sampling frequency (Hz), used to determine tap delays.
+        mic_array (np.ndarray): Array of M microphone coordinates (m). Shape: (M, 3).
+        K (int): Number of taps per microphone (defines N = M * K).
+        c (float, optional): Speed of sound (m/s).
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            A (np.ndarray): The real-valued constraint matrix A.
+                            Shape: (N, 2*P) where N=M*K, P=J*I.
+            g (np.ndarray): The real-valued desired response vector g.
+                            Shape: (2*P, 1).
+    """
+    
+    num_freqs = len(freqs)      # J
+    num_points = len(source_points) # I
+    
+    if num_freqs == 0 or num_points == 0:
+        raise ValueError("Frequency and source point arrays cannot be empty.")
+        
+    P_total = num_freqs * num_points # P = J * I
+
+    # --- 1. Construcción de la Matriz A (Tu código original) ---
+    
+    a_tensor_complex = near_field_steering_vector_multi(
+        f=freqs, 
+        Rs=source_points, 
+        fs=fs,
+        mic_array=mic_array,
+        K=K,
+        c=c
+    )
+    
+    N = a_tensor_complex.shape[2] 
+    a_transpose_complex = np.transpose(a_tensor_complex, axes=(2, 0, 1))
+    a_complex_flat = a_transpose_complex.reshape(N, -1)
+    A = np.hstack([np.real(a_complex_flat), np.imag(a_complex_flat)])
+
+    # --- 2. Construcción del Vector g (NUEVO) ---
+    #    Basado en la Ecuación 15: g = [g_real, g_imag]^T
+    
+    # [cite_start]a. Establecer la ganancia de amplitud g_ij = 1 (para ganancia unitaria) [cite: 219]
+    gain_amplitude = 1.0
+
+    # b. [cite_start]Establecer el retardo de grupo 'tau' al centro temporal del filtro [cite: 219]
+    #    tau = (K-1)/2 * T_s = (K-1)/(2*fs)
+    tau_center = ((K - 1) / 2) / fs
+    
+    # c. Crear un array de frecuencias (shape P,) que coincida con el orden
+    #    de las columnas de A. 'reshape' en NumPy (orden C) hace que el
+    #    índice más a la derecha ('I') cambie más rápido.
+    #    Orden: [f_0p_0, f_0p_1, ..., f_0p_I, f_1p_0, ...]
+    #    Necesitamos repetir cada frecuencia 'num_points' (I) veces.
+    freqs_P = np.repeat(freqs, num_points) # Shape (P_total,)
+
+    # d. Calcular los componentes de fase (Eq. 15)
+    phi = 2 * np.pi * freqs_P * tau_center
+    
+    g_real = gain_amplitude * np.cos(phi) # Shape (P_total,)
+    g_imag = gain_amplitude * np.sin(phi) # Shape (P_total,)
+
+    # e. Concatenar para formar g (shape (2*P_total,)) y darle forma de vector columna
+    g = np.hstack([g_real, g_imag]).reshape(-1, 1) # Shape (2*P, 1)
+
+    # --- 3. Devolver ambos ---
+    return A, g
+
+
+def compute_svd_and_rank(
+    A: np.ndarray, 
+    energy_threshold: float = 0.999
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Performs SVD on the real matrix A and calculates the rank L and error.
+
+    This function implements the core of the robust beamformer design:
+    1. Performs SVD on the (N, 2P) real matrix A.
+    2. Calculates the eigenvalues (lambda_n) of the underlying Rss.
+    3. Determines the rank L (number of components to keep) based on a
+       cumulative energy threshold.
+    4. Calculates the approximation error epsilon(L) (sum of discarded energy).
+
+    Args:
+        A (np.ndarray): The (N, 2P) real constraint matrix from build_A_matrix.
+        energy_threshold (float, optional): The fraction of total energy to
+                                            preserve (e.g., 0.999 for 99.9%).
+
+    Returns:
+        tuple:
+            L (int): The calculated rank (number of components).
+            U (np.ndarray): The left singular vectors (V in the paper). Shape (N, N).
+            s (np.ndarray): The singular values (sigma_n). Shape (N,).
+            Vh (np.ndarray): The right singular vectors (U^T in the paper). Shape (N, 2P).
+            epsilon_L (float): The approximation error (sum of discarded eigenvalues).
+    """
+    
+    # 1. Infer P (I*J) from the shape of A (N, 2P)
+    N, two_P = A.shape
+    if two_P % 2 != 0:
+        raise ValueError("Matrix A has an odd number of columns. Should be (N, 2*P).")
+    P = two_P // 2
+
+    # 2. Perform SVD on the real matrix A
+    # We set full_matrices=False for efficiency.
+    # A is (N, 2P). Assuming N < 2P:
+    # U will be (N, N), s will be (N,), Vh will be (N, 2P)
+    # This U corresponds to V in the paper (Eq. 16).
+    U, s, Vh = np.linalg.svd(A, full_matrices=False)
+    
+    # 3. Calculate the eigenvalues (lambda_n) of the related Rss
+    # The paper shows the error epsilon(L) is based on the sum of 
+    # eigenvalues of Rss. These are related to the singular values (s)
+    # of A by: lambda_n = (sigma_n^2) / P.
+    
+    # We square the singular values 's' (sigma_n)
+    lambdas = (s**2) / P
+    
+    # 4. Calculate total energy and find L
+    total_energy = np.sum(lambdas)
+    
+    if total_energy < 1e-12:
+        # Avoid division by zero if the signal is all zeros
+        return 0, U, s, Vh, 0.0
+
+    # Calculate cumulative energy (already sorted by svd)
+    cumulative_energy = np.cumsum(lambdas)
+    
+    # Find the first index 'L' where cumulative energy exceeds the threshold
+    # np.searchsorted finds where to insert to maintain order
+    # We add 1 because index 0 represents L=1 component.
+    L = np.searchsorted(cumulative_energy / total_energy, energy_threshold) + 1
+    
+    # Ensure L does not exceed the total number of components
+    L = min(L, N)
+    
+    # 5. Calculate the approximation error epsilon(L)
+    # This is the sum of all energy (eigenvalues) we are discarding
+    epsilon_L = np.sum(lambdas[L:])
+    
+    return L, U, s, Vh, epsilon_L
+
+def build_region_constraints(
+    Rs: np.ndarray, 
+    delta_r: float, 
+    delta_azimut: float, 
+    delta_elevation: float, 
+    mic_array: np.ndarray, 
+    fs: int, 
+    K: int,
+    f_min: int = 200,
+    f_max: int = 10000,
+    num_points: int = 100, # I
+    num_freqs: int = 100,  # J
+    c: float = speed_of_sound
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]: # Actualizado type hint
+    """
+    Orchestrates the calculation of the robust constraints C, h, and blocking matrix Ca.
+    """
+    
+    # 1. Define sample points for the integration
+    freqs, points = set_domains(Rs, delta_r, delta_azimut, delta_elevation, f_min, f_max, num_points, num_freqs)
+
+    # 2. Build the A matrix and g vector based on these points
+    A, g = build_A_and_g(freqs, points, fs, mic_array, K, c)
+
+    # 3. Perform SVD and find the rank L
+    # U tiene forma (N, N) si N < 2P (que es lo usual)
+    L, U, s, Vh, epsilon = compute_svd_and_rank(A, energy_threshold=0.999)
+
+    # --- 4. Build C, h, and Ca ---
+    
+    # a. Build C = V_L (Primeras L columnas de U)
+    C = U[:, :L] # Shape (N, L)
+
+    # b. Build Ca (Blocking Matrix) = Resto de columnas de U
+    # Esto es el complemento ortogonal de C.
+    Ca = U[:, L:] # Shape (N, N-L)
+
+    # c. Build h = (Sigma_L)^-1 * (U_L)^T * g
+    s_L_inv = 1.0 / (s[:L] + 1e-12)
+    Sigma_L_inv = np.diag(s_L_inv) # Shape (L, L)
+    
+    U_L_T = Vh[:L, :] # Shape (L, 2P)
+
+    # Calculate h
+    h = Sigma_L_inv @ U_L_T @ g
+
+    return C, h, Ca
+
+
+============================================================
+ARCHIVO: src/beamforming/algorithms/lmcv.py
+============================================================
+from beamforming.signal_model import near_field_steering_vector
+import numpy as np 
+from .optimizer import WeightOptimizer
+from .constrains import ConstrainGenerator
+from ..array.mic_array import MicArray
+
+
+def compute_fixed_weights_optimized(Constrains, Target_gain):
+    '''
+    Fixed weights computation given by the equation
+             w_q = C(C^[H]C)^-1 h.
+    Uses np.linalg.solve for improved numerical stability and efficiency 
+    compared to explicit matrix inversion.
+    '''
+    C_H = Constrains.conj().T
+    
+    # M = C^H C (La matriz que va a ser invertida)
+    M = C_H @ Constrains
+    
+    # V = h (El vector de la derecha)
+    V = Target_gain
+    
+    # X = (C^H C)^-1 h  --> Resuelve M X = V para X
+    X = np.linalg.solve(M, V)
+    
+    # w_q = C X
+    fixed_weights = Constrains @ X
+
+    return fixed_weights
+
+
+class LmcvOptimizer(WeightOptimizer):
+    def __init__(self, constrains_generator : ConstrainGenerator):
+        '''
+        Indicates constrain strategy.
+        '''
+        self.constrains_generator = constrains_generator
+    
+    def calculate(self, array_obj: MicArray, K: int, fs: float, **kwargs):
+        """
+        Calcula los pesos del beamformer.
+        
+        Args:
+            array_obj (MicrophoneArray): El objeto de la geometría del arreglo.
+            K (int): Número de taps.
+            fs (float): Frecuencia de muestreo.
+            **kwargs: Este optimizador no los usa directamente, pero los pasa
+                      al generador de restricciones si este los necesita.
+        """
+        C, H = self.constrains_generator.generate(array_obj, K, fs, **kwargs)
+        
+        weights = compute_fixed_weights_optimized(C, H)
+        return weights
+
+
+============================================================
+ARCHIVO: src/beamforming/evaluation/gain.py
+============================================================
+import numpy as np
+from scipy.constants import speed_of_sound
+
+from utils.geometry import source_rotation
+from beamforming.processors import beamforming, snapshots
+from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
+from propagation.free_field import space_delay
+
+
+
+
+def polar_gain(f, fs, mic_array, weights, focal_point, points=360):
+    """Calculates the 2D polar pattern of a time-domain beamformer.
+
+    This function evaluates the directivity of a given beamformer by simulating
+    a sinusoidal signal arriving from multiple angles in a single plane.
+    It processes the simulated signals through the beamformer pipeline 
+    (snapshots and filtering) and computes the output power for each angle.
+
+    The number of microphones (M) and FIR taps (K) are automatically inferred
+    from the shapes of the input arrays (`mic_array` and `weights`). The final
+    output is normalized relative to the maximum output power, resulting in a
+    beampattern with a peak of 0 dB.
+
+    Args:
+        f (float): The test frequency of the source signal in Hz.
+        fs (float): The sampling frequency in Hz.
+        mic_array (np.ndarray): A matrix of microphone coordinates, with shape (M, 3).
+        weights (np.ndarray): The beamformer's weight vector, with shape (M * K, 1).
+        focal_point (np.ndarray): The Cartesian coordinates (x, y, z) of the beamformer's focal
+                                  point. The norm of this vector is used as the radius.
+        points (int, optional): The number of angular points to compute. Defaults to 360.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]:
+            - gain_db (np.ndarray): A 1D array of the beampattern gain in dB.
+            - angles (np.ndarray): A 1D array of the corresponding angles in degrees.
+    """
+    # 1. Validar entradas y derivar M y K (tu código original está bien aquí)
+    if mic_array.ndim != 2 or mic_array.shape[1] != 3:
+        raise ValueError("mic_array must be a 2D array of shape (M, 3)")
+    M = mic_array.shape[0]
+
+    if weights.ndim != 2 or weights.shape[1] != 1:
+        raise ValueError("weights must be a 2D vector with shape (M*K, 1)")
+    M_K = weights.shape[0]
+    
+    if M == 0: raise ValueError("mic_array cannot be empty.")
+    if M_K % M != 0:
+        raise ValueError(f"The length of the weights vector ({M_K}) is not divisible by the number of microphones ({M}).")
+    K = int(M_K / M)
+
+    # 2. Definir la señal de prueba
+    duration_s = 0.1
+    t = np.arange(int(duration_s * fs)) / fs
+    signal_source = np.sin(2 * np.pi * f * t)
+
+    # 3. Definir los puntos de evaluación del patrón polar
+    distance = np.linalg.norm(focal_point)
+    # Asumo que tienes una función source_rotation, si no, hay que definirla
+    # source_points debería tener forma (points, 3)
+    angles_rad = np.linspace(0, 2 * np.pi, points, endpoint=False)
+    source_points = np.zeros((points, 3))
+    source_points[:, 0] = distance * np.cos(angles_rad)
+    source_points[:, 1] = distance * np.sin(angles_rad)
+    # Asumimos un plano z=0 para el patrón 2D
+    angles_deg = np.rad2deg(angles_rad)
+
+    # 4. Simular la propagación para TODOS los puntos a la vez.
+    # space_delay debe devolver un array 3D de forma (points, M, N_samples)
+    signals_array, _, _ = space_delay(signal_source, fs, source_points, mic_array)
+
+    # Verificar que la salida es 3D. Si P=1, space_delay devuelve 2D, hay que corregirlo.
+    if signals_array.ndim == 2 and points == 1:
+        # Añadir la dimensión que fue eliminada por .squeeze()
+        signals_array = signals_array[np.newaxis, :, :]
+
+    if signals_array.shape[0] != points:
+        raise ValueError("La salida de space_delay no tiene la dimensión de puntos esperada.")
+
+    # 5. Bucle para procesar cada punto y calcular su potencia de salida
+    output_power = np.zeros(points)
+    for i in range(points):
+        # Extraemos las señales de los M micrófonos para el i-ésimo ángulo
+        mic_signals_at_angle_i = signals_array[i, :, :]  # Esto ahora es seguro
+        snapshots_matrix = snapshots(mic_signals_at_angle_i, K)
+        beamformer_output = beamforming(snapshots_matrix, weights)
+        output_power[i] = np.mean(np.real(beamformer_output)**2)
+
+    # 6. Normalización para el patrón polar (el pico más alto es 0 dB)
+    max_power = np.max(output_power)
+    if max_power > 1e-12: # Usar umbral para evitar division por cero
+        gain_db = 10 * np.log10(output_power / max_power + 1e-12)
+    else:
+        gain_db = np.full_like(output_power, -120.0) # Potencia muy baja si todo es cero
+
+    return gain_db, angles_deg
+
+def synthetic_gain(f, fs, mic_array, weights, source_points):
+    """
+    Calculates the beamformer's time-domain gain at a set of specified spatial points.
+
+    This function simulates a source signal from each point in `source_points`,
+    processes the resulting array signals through the beamformer pipeline, and
+    computes the output power. The gain is returned relative to the input
+    signal's power.
+
+    Args:
+        f (float): The test frequency in Hz.
+        fs (float): The sampling frequency in Hz.
+        mic_array (np.ndarray): Microphone array coordinates of shape (M, 3).
+        weights (np.ndarray): Beamformer weight vector of shape (M*K, 1).
+        source_points (np.ndarray): A matrix of Cartesian coordinates (x, y, z)
+                                     for each point to be tested. Shape: (P, 3).
+
+    Returns:
+        np.ndarray: A 1D array of gains in decibels (dB) for each of the P points.
+    """
+    # 1. Derivar M y K a partir de las formas de los arrays (como hiciste antes)
+    M = mic_array.shape[0]
+    M_K = weights.shape[0]
+    # ... (añadir las comprobaciones de error)
+    K = int(M_K / M)
+    
+    # 2. Definir la señal de prueba y su potencia de referencia
+    duration_s = 0.1
+    t = np.arange(int(duration_s * fs)) / fs
+    signal_source = np.sin(2 * np.pi * f * t)
+    source_power_ref = np.mean(signal_source**2)
+
+    # 3. Simular la propagación para TODOS los puntos a la vez
+    # Tu función space_delay ya maneja esto de forma eficiente
+    signals_array, _, _ = space_delay(signal_source, fs, source_points, mic_array)
+    
+    num_points = source_points.shape[0]
+    output_powers = np.zeros(num_points)
+
+    # 4. Bucle para procesar cada punto y calcular su potencia de salida
+    for i in range(num_points):
+        mic_signals = signals_array[i, :, :]
+        U_snapshots = snapshots(mic_signals, K)
+        y_output = beamforming(U_snapshots, weights)
+        output_powers[i] = np.mean(np.real(y_output)**2)
+        
+    # 5. Calcular la ganancia en dB relativa a la potencia de ENTRADA
+    # Esto devuelve la "ganancia de array", que es más general.
+    # La normalización para el patrón polar se hará en la función de ploteo.
+    gain_db = 10 * np.log10(output_powers / source_power_ref + 1e-12)
+
+    return gain_db
+
+def analytical_gain(frecs, fs, mic_array, weights, source_points):
+    # 1. Derivar M y K a partir de las formas de los arrays (como hiciste antes)
+    M = mic_array.shape[0]
+    M_K = weights.shape[0]
+    if weights.size % mic_array.shape[0] != 0:
+        raise ValueError("The length of weights must be a multiple of the number of mics.")
+    K = int(M_K / M)
+
+    #Caclulate the steering vector for each pointa and frecuency (F, P, KxM)
+    steering_vectors = near_field_steering_vector_multi(frecs, source_points, fs, mic_array, K )
+
+    #hermitian traspoese fo the weights (as dim: 1D no need to transpose)
+    w_H = np.conj(weights).flatten()
+
+    #Calculate response using ecuation:
+    # b(f,x) = w^T a(f,x) 
+    b = np.einsum('k,fpk->fp', w_H, steering_vectors)
+
+    epsilon = 1e-20
+    gain_dB = 20 * np.log10(np.abs(b)+ epsilon)
+
+    return gain_dB 
+
+============================================================
+ARCHIVO: src/beamforming/evaluation/__init__.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/beamforming/evaluation/array_sensitivity_gain.py
+============================================================
+
+
+============================================================
+ARCHIVO: src/beamforming/array/mic_array.py
+============================================================
+import numpy as np
+import matplotlib.pyplot as plt
+
+class MicArray:
+    def __init__(self, M: int, coordinates: np.ndarray):
+        if coordinates.shape != (M,3):
+            raise ValueError("Array Coordinates must be (M,3)")
+        
+        self.M = M
+        self.coordinates = coordinates 
+
+    def Plot_Geometry(self):
+            print("Ploting Array")
+            x = self.coordinates[:,0]
+            y = self.coordinates[:,1]
+            plt.figure()
+            plt.scatter(x, y)
+            plt.show
+            plt.title("Geometría del Arreglo de Micrófonos")
+            plt.xlabel("Posición X (m)")
+            plt.ylabel("Posición Y (m)")
+            plt.grid(True)
+            plt.axis('equal') # Para que las escalas en X e Y sean iguales
+            plt.show()    
+
+class ULA(MicArray): 
+    def __init__(self, M: int, d: float):
+        x_position = np.linspace(-(M-1)*d/2, (M-1)*d/2, M)
+        coordinates = np.stack([x_position, np.zeros(M) , np.zeros(M)], axis = 1)
+        super().__init__(M=M, coordinates=coordinates)
+        print("   -> Geometría específica: ULA")
+
+class custom(MicArray):
+    def __init__(self, coordinates: np.ndarray):
+        self.coordinates = coordinates
+        M = coordinates.shape[0]
+        super().__init__(M=M, coordinates=coordinates)
+        print("  -> Custom Array Build")
+
+
+mic_array = np.stack([np.arange(0,3,1), np.zeros(3), np.zeros(3)], axis = 1)
+
+
+            
+            
+
