@@ -60,7 +60,7 @@ import numpy as np
 def spherical_to_cartesian(
     radius: np.ndarray, 
     azimuth: np.ndarray, 
-    elevation: np.ndarray
+    inclination: np.ndarray
 ) -> np.ndarray:
     """
     Converts arrays of Spherical coordinates to Cartesian (x, y, z).
@@ -68,21 +68,21 @@ def spherical_to_cartesian(
     This function assumes the ISO 80000-2 standard (physics convention):
     - radius (r): Distance from the origin.
     - azimuth (θ): Angle in the XY-plane from the X-axis (in radians).
-    - elevation (φ): Angle from the positive Z-axis (in radians).
+    - inclination (φ): Angle from the positive Z-axis (in radians).
 
     Args:
         radius (np.ndarray): Array of radial distances. Shape (N,).
         azimuth (np.ndarray): Array of azimuth angles (theta) in radians. Shape (N,).
-        elevation (np.ndarray): Array of elevation angles (phi) in radians. Shape (N,).
+        inclination (np.ndarray): Array of inclination angles (phi) in radians. Shape (N,).
 
     Returns:
         np.ndarray: Array of (x, y, z) Cartesian coordinates. Shape (N, 3).
     """
     
     # Calculate Cartesian coordinates using element-wise operations
-    x = radius * np.sin(elevation) * np.cos(azimuth)
-    y = radius * np.sin(elevation) * np.sin(azimuth)
-    z = radius * np.cos(elevation)
+    x = radius * np.sin(inclination) * np.cos(azimuth)
+    y = radius * np.sin(inclination) * np.sin(azimuth)
+    z = radius * np.cos(inclination)
     
     # Stack the (N,) coordinate arrays as columns to create an (N, 3) matrix
     cartesian_coords = np.stack([x, y, z], axis=1)
@@ -94,7 +94,7 @@ import numpy as np
 
 def cartesian_to_spherical(cartesian_coords: np.ndarray) -> np.ndarray:
     """
-    Converts Cartesian coordinates (x, y, z) to Spherical (radius, azimuth, elevation).
+    Converts Cartesian coordinates (x, y, z) to Spherical (radius, azimuth, inclination).
 
     This function robustly handles both a single point (1D array of shape (3,))
     and a batch of points (2D array of shape (N, 3)).
@@ -104,9 +104,9 @@ def cartesian_to_spherical(cartesian_coords: np.ndarray) -> np.ndarray:
                                      Shape can be (3,) or (N, 3).
 
     Returns:
-        np.ndarray: Array of (radius, azimuth, elevation) points.
+        np.ndarray: Array of (radius, azimuth, inclination) points.
                     Shape will be (3,) or (N, 3), matching the input shape.
-                    Azimuth and elevation are in radians.
+                    Azimuth and inclination are in radians.
     """
     # 1. Convertir a un array de NumPy (por si el usuario pasó una lista)
     coords = np.asarray(cartesian_coords)
@@ -136,13 +136,13 @@ def cartesian_to_spherical(cartesian_coords: np.ndarray) -> np.ndarray:
     radius = np.linalg.norm(coords_2d, axis=1)
     radius_safe = np.where(radius == 0, 1e-12, radius)
     
-    elevation = np.arccos(np.clip(z / radius_safe, -1.0, 1.0))
+    inclination = np.arccos(np.clip(z / radius_safe, -1.0, 1.0))
     azimuth = np.arctan2(y, x)
 
-    elevation[radius == 0] = 0.0
+    inclination[radius == 0] = 0.0
     azimuth[radius == 0] = 0.0
     
-    spherical_coords = np.stack([radius, azimuth, elevation], axis=1)
+    spherical_coords = np.stack([radius, azimuth, inclination], axis=1)
     
     # --- 4. Devolver el formato original ---
     if was_1d:
@@ -152,7 +152,7 @@ def cartesian_to_spherical(cartesian_coords: np.ndarray) -> np.ndarray:
         # Si la entrada era 2D, devolvemos el array 2D (shape (N, 3))
         return spherical_coords
 
-def source_sphere_grid(radius, samples_azimut, samples_elevation):
+def source_sphere_grid(radius, samples_azimut, samples_inclination):
     """
     Genera puntos de fuente en una Malla de Cuadrícula Esférica.
 
@@ -162,14 +162,14 @@ def source_sphere_grid(radius, samples_azimut, samples_elevation):
         Radio de la esfera.
     samples_azimut : int
         Número de divisiones angulares para el ángulo Azimutal (phi).
-    samples_elevation : int
+    samples_inclination : int
         Número de divisiones angulares para el ángulo de Elevación (theta).
 
     Returns
     -------
     coords_grid (ndarray): Matriz de coordenadas (3, N*M).
     azimut_flat (ndarray): Vector 1D de todos los ángulos azimutales usados (N*M).
-    elevation_flat (ndarray): Vector 1D de todos los ángulos de elevación usados (N*M).
+    inclination_flat (ndarray): Vector 1D de todos los ángulos de elevación usados (N*M).
     """
 
     # 1. Crear vectores 1D para cada eje angular (Delta angular constante)
@@ -177,22 +177,56 @@ def source_sphere_grid(radius, samples_azimut, samples_elevation):
     azimut_1d = np.linspace(0, 2 * np.pi, samples_azimut, endpoint=False) # No incluye 2*pi
     
     # Elevación (theta): 0 a pi (desde el eje Z)
-    elevation_1d = np.linspace(0, np.pi, samples_elevation)
+    inclination_1d = np.linspace(0, np.pi, samples_inclination)
 
     # 2. Generar la Malla de Cuadrícula (Grid)
-    # Genera dos matrices 2D (azimut_mesh, elevation_mesh)
-    azimut_mesh, elevation_mesh = np.meshgrid(azimut_1d, elevation_1d)
+    # Genera dos matrices 2D (azimut_mesh, inclination_mesh)
+    azimut_mesh, inclination_mesh = np.meshgrid(azimut_1d, inclination_1d)
 
     # 3. Aplanar las mallas a vectores 1D
     # Esto crea los dos vectores de longitud (N*M) con todas las combinaciones.
     azimut_flat = azimut_mesh.flatten()
-    elevation_flat = elevation_mesh.flatten()
+    inclination_flat = inclination_mesh.flatten()
 
     # 4. Uso de Broadcasting
     # La función vectorizada (sferical_to_coord) usa estos vectores N*M para generar la cuadrícula.
-    coords_grid = spherical_to_cartesian(radius, azimut_flat, elevation_flat)
+    coords_grid = spherical_to_cartesian(radius, azimut_flat, inclination_flat)
     
     # coords_grid tendrá forma (3, N*M)
-    return coords_grid, azimut_flat, elevation_flat
+    return coords_grid, azimut_flat, inclination_flat
 
+
+
+
+def spatial_grid(delta_radius, delta_azimut, delta_inclination ,center, points, mode = 'cart'):
+
+    #defines a set of equi agled points for each dimention
+
+    radius = np.linspace( -delta_radius/2 + center[0],
+                                delta_radius/2 + center[0],
+                                points
+                                )
+    
+    azimut = np.linspace( -delta_azimut/ 2 + center[2],
+                                delta_azimut/ 2 + center[2],
+                                points
+                                )
+    
+    inclination = np.linspace( -delta_inclination/ 2 + center[1],
+                                delta_inclination/2 + center[1],
+                                points
+                                )
+
+    R, Inc, Az = np.meshgrid(radius, azimut, inclination, indexing='ij')
+
+    spatial_grid = np.stack([R.flatten(), Inc.flatten(), Az.flatten()], axis=1)
+
+    if mode == "sphr":
+        return spatial_grid
+    
+    elif mode=="cart":
+        return spherical_to_cartesian( spatial_grid[:, 0],
+                                       spatial_grid[:, 1],
+                                       spatial_grid[:, 2])
+        
 
