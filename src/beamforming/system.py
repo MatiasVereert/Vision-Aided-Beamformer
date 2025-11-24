@@ -1,6 +1,6 @@
 import numpy as np 
 from scipy.spatial import KDTree
-
+import os 
 # Asegúrate que estos imports existan en tu proyecto
 from utils.geometry import spatial_grid
 from beamforming.algorithms.region_constriant import build_region_constraints
@@ -26,6 +26,7 @@ class AdaptiveBeamformer:
         
         self.current_wq = None
         self.current_Ca = None
+        self.current_wa = None
         
         # 3. Estado de Foco (Coordenadas)
         self.active_coords = np.zeros(3)  # Dónde estamos mirando realmente
@@ -36,7 +37,13 @@ class AdaptiveBeamformer:
         self.weight_bank = None
         self.grid_tree = None
 
-    def generate_bank(self, radius, azimut, inclination, points, center):
+        #adaptive
+        self.MU = .65
+        self.EPSILON = e-12
+
+        self.bank_metadata = {}
+
+    def generate_bank(self, r_spam, az_spam, inc_spam, points, center):
         """
         Calcula el banco de pesos (Offline).
         radius, azimut, inclination: Son los 'deltas' (anchos) del ROI.
@@ -45,9 +52,9 @@ class AdaptiveBeamformer:
         
         # 1. Generar Grilla
         grid_points = spatial_grid(
-            delta_radius=radius, 
-            delta_azimut=azimut, 
-            delta_inclination=inclination, 
+            delta_radius= r_spam, 
+            delta_azimut= az_spam, 
+            delta_inclination= inc_spam , 
             center=center, 
             points=points, 
             mode='cart' # Importante pedir cartesianas para el KDTree
@@ -88,6 +95,59 @@ class AdaptiveBeamformer:
         self.grid_tree = KDTree(grid_points)
         print(f"\n[LISTO] Banco generado con {total} puntos.")
 
+        # Save the metadata 
+        self.bank_metadata['r_spam'] = r_spam
+        self.bank_metadata['az_spam'] = az_spam
+        self.bank_metadata['inc_spam'] = inc_spam
+        self.bank_metadata['points'] = points
+        self.bank_metadata['center'] = center
+
+
+    def save_weights_to_disk(self, filename = "weights_bank.npz", folder = "weights_storage" ):
+        #Verifies that the bank has been computed
+        if self.weight_bank is None:
+            print('ERROR: Please generate bank before saving.')
+            return
+        
+        full_path = os.path.join(folder, filename)
+
+        #Creates new folder if its necesary 
+        if not os.path.exists(folder):
+            print(f'[System]: creating new folder as {folder}')
+            os.makedirs(folder)
+        
+        weight_bank_obj = np.array(self.weight_bank, dtype = object)
+
+        
+        print('Saving Filters')
+        np.savez_compressed(file=full_path,
+                            metadata = self.bank_metadata,
+                            weights_bank = weight_bank_obj,
+                            grid_points = self.grid_points
+                            )
+        print(f'The bank has been saved into: {filename}')
+
+    def load_weights_from_disk(self, full_path ):
+        if not os.path.exists(full_path):
+            print(f"[System]: the file does not exist")
+            return False
+        
+        try:
+            data = np.load(full_path, allow_pickle= True)
+
+            self.grid_points = data['grid_points']
+            self.weight_bank = data['weights_bank']
+            self.bank_metadata = data['metadata'].item()
+
+            self.grid_tree = KDTree(self.grid_points)   
+
+            print("The bank has been loaded")
+
+        except Exception as e:
+            print(f'[Critical Error] Loading the file {e}')
+            
+
+
     def update_focal_point(self, camera_coords):
         """Interfaz pública: Recibe coordenadas y decide si actualizar."""
         self.target_coords = np.array(camera_coords)
@@ -113,11 +173,59 @@ class AdaptiveBeamformer:
         # 3. Protección de Memoria (wa)
         cols_Ca = new_Ca.shape[1]
         
-        if self.wa is None or self.wa.shape[0] != cols_Ca:
-            self.wa = np.zeros(cols_Ca, dtype=np.complex64) # O float32
+        if self.current_wa is None or self.current_wa.shape[0] != cols_Ca:
+            self.current_wa = np.zeros(cols_Ca, dtype=np.complex64) # O float32
             # print("DEBUG: Reset adaptativo")
 
         # 4. Asignar
         self.current_wq = new_wq
         self.current_Ca = new_Ca
         self.active_coords = self.grid_points[idx]
+
+    def procces_block(self, input):
+        #Definin length
+        tot_samples = len(input)
+        output = np.zeros(tot_samples)
+
+        #Buffer size
+        
+
+        for i in range(tot_samples):
+            #Shift & Incert
+            self.buffer[:, 1:] = self.buffer[: ,: -1]
+            self.buffer[:,0] = input[i]
+
+            #Adapt dimensions
+            u_k  = self.buffer.flatten()
+
+            #Fixed output branch
+            y_q = np.dot(np.conj(self.current_wq), u_k) 
+
+            #Blocking matrix
+            x_a = np.dot(np.conj(self.current_Ca.T), u_k )
+
+            #Inicializate wa 
+            if self.current_wa is None:
+                self.current_wa = np.zeros_like(x_a) 
+
+            #Adaptive Branch
+            y_a = np.dot(np.conj(self.current_wa), x_a)
+
+            #error (OUTPUT)
+            error = y_q - y_a 
+            output[i] = error
+
+            #Update adaptive weights by NLMS
+            energy = np.real(np.dot(np.conj(x_a.T), x_a)) + self.EPSILON
+
+            update =  self.MU * np.conj(x_a) * error / energy
+
+            self.current_wa += update
+
+            
+
+
+
+
+
+
