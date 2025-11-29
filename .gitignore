@@ -9,6 +9,15 @@ __pycache__/
 *.pdf
 *.png
 *.jpeg
+*.wav
 
 # VS Code
 .vscode/
+
+#Dataset audio
+data/
+datasets/
+snapshots_contexto/
+resutlados_test/
+*.hdf5
+*.h5

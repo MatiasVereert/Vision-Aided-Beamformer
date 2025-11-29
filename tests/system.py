@@ -26,12 +26,13 @@ def test_pipeline():
     mic_array.Plot_Geometry() # Esto debería abrir una ventanita 2D
     plt.close() # Cerramos para seguir
 
+    mic_array = mic_array.coordinates
     # ---------------------------------------------------------
     # 2. INSTANCIAR EL MOTOR (Beamformer)
     # ---------------------------------------------------------
     print("[2] Inicializando Motor Beamformer...")
     bf = AdaptiveBeamformer(
-        MicArrayObj=mic_array, 
+        mic_array=mic_array, 
         K=K, 
         fs=fs, 
         fmin=f_min, 
@@ -61,9 +62,9 @@ def test_pipeline():
     points_per_dim = 6 # Total puntos = 6*6*6 = 216 puntos
     
     bf.generate_bank(
-        radius=delta_r,
-        azimut=delta_az, 
-        inclination=delta_inc,
+        r_spam=delta_r,
+        az_spam=delta_az, 
+        inc_spam=delta_inc,
         points=points_per_dim, 
         center=roi_center_sph
     )

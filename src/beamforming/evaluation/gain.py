@@ -6,7 +6,7 @@ from beamforming.processors import beamforming, snapshots
 from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
 from propagation.free_field import space_delay
 
-
+from beamforming.algorithms import region_constriant
 
 
 def polar_gain(f, fs, mic_array, weights, focal_point, points=360):
@@ -171,3 +171,156 @@ def analytical_gain(frecs, fs, mic_array, weights, source_points):
     gain_dB = 20 * np.log10(np.abs(b)+ epsilon)
 
     return gain_dB 
+
+def compute_mismatched_ags(
+    f_test: float, 
+    fs: int, 
+    mic_array: np.ndarray, 
+    K: int, 
+    scan_points: np.ndarray,
+    C_focal: np.ndarray, 
+    h_focal: np.ndarray
+) -> np.ndarray:
+    """
+    Versión VECTORIZADA y OPTIMIZADA del cálculo de AGS.
+    Resuelve w_opt para todos los puntos de escaneo simultáneamente.
+    """
+    
+    N = mic_array.shape[0] * K
+    num_scan_points = scan_points.shape[0]
+    
+    # 1. Calcular TODOS los steering vectors a la vez
+    # Shape resultante: (P, N)
+    a_s_all = near_field_steering_vector_multi(f_test, scan_points, fs, mic_array, K).squeeze()
+    
+    # Asegurar formas correctas si hay un solo punto
+    if a_s_all.ndim == 1: a_s_all = a_s_all[np.newaxis, :]
+        
+    # 2. Construir el cubo de matrices de covarianza Ruu
+    # Broadcasting: (P, N, 1) @ (P, 1, N) -> (P, N, N)
+    # Esto crea 360 matrices de 225x225 de un golpe.
+    # Ruu(x) = a(x)a(x)^H + I
+    Rn = np.eye(N)
+    Ruu_stack = np.matmul(a_s_all[..., None], a_s_all[:, None, :].conj()) + Rn[None, ...]
+    
+    # ---------------------------------------------------------
+    # SOLUCIÓN VECTORIZADA DEL SISTEMA LINEAL
+    # w_opt = Ruu^-1 * C * (C^H * Ruu^-1 * C)^-1 * h
+    # Usamos 'solve' en lugar de 'inv' por estabilidad y velocidad.
+    # ---------------------------------------------------------
+    
+    # A. Resolver Ruu * Y = C  (para todos los P a la vez)
+    # np.linalg.solve maneja broadcasting: (P, N, N) y (N, L) -> (P, N, L)
+    try:
+        Y_stack = np.linalg.solve(Ruu_stack, C_focal[None, ...])
+    except np.linalg.LinAlgError:
+        # Fallback (lento) si alguna matriz es singular
+        print("Advertencia: Matriz singular detectada, usando pinv...")
+        Ruu_inv = np.linalg.pinv(Ruu_stack)
+        Y_stack = np.matmul(Ruu_inv, C_focal[None, ...])
+
+    # B. Calcular matriz interna: M = C^H * Y
+    # (N, L).T -> (L, N) @ (P, N, L) -> (P, L, L)
+    # Matmul hace broadcasting sobre P automáticamente
+    M_stack = np.matmul(C_focal.T, Y_stack) # C_focal es real, .T == .H
+
+    # C. Resolver M * z = h
+    # (P, L, L) y (L, 1) -> (P, L, 1)
+    # Aseguramos que h sea columna (L, 1)
+    if h_focal.ndim == 1: h_focal = h_focal[:, None]
+    
+    try:
+        z_stack = np.linalg.solve(M_stack, h_focal[None, ...])
+    except np.linalg.LinAlgError:
+         M_inv = np.linalg.pinv(M_stack)
+         z_stack = np.matmul(M_inv, h_focal[None, ...])
+
+    # D. Reconstruir w_opt = Y * z
+    # (P, N, L) @ (P, L, 1) -> (P, N, 1)
+    w_opt_stack = np.matmul(Y_stack, z_stack).squeeze() # (P, N)
+
+    # ---------------------------------------------------------
+    # CÁLCULO DE GANANCIA (VECTORIZADO)
+    # ---------------------------------------------------------
+    
+    # Numerador: |w^H a|^2
+    # Dot product fila a fila: sum(conj(w) * a, axis=1)
+    response_power = np.abs(np.sum(np.conj(w_opt_stack) * a_s_all, axis=1))**2
+    
+    # Denominador: w^H w (Ruido blanco de salida)
+    noise_power = np.sum(np.conj(w_opt_stack) * w_opt_stack, axis=1).real
+    
+    # Evitar división por cero
+    noise_power = np.maximum(noise_power, 1e-12)
+    
+    array_gain_db = 10 * np.log10(response_power / noise_power + 1e-12)
+    
+    return array_gain_db
+
+
+def compute_ags_vectorized(
+    f_test: float, 
+    fs: int, 
+    mic_array: np.ndarray, 
+    K: int, 
+    scan_points: np.ndarray,
+    C_fixed: np.ndarray, 
+    h_fixed: np.ndarray
+) -> np.ndarray:
+    """
+    Calcula la Array Gain Sensitivity simulando la adaptación (w_opt) en cada punto.
+    Vectorizado para velocidad.
+    """
+    N = mic_array.shape[0] * K
+    
+    # 1. Steering Vectors de todos los puntos de escaneo (P, N)
+    # Usamos tu función 'near_field_steering_vector_multi'
+    a_s_all = near_field_steering_vector_multi(f_test, scan_points, fs, mic_array, K).squeeze()
+    if a_s_all.ndim == 1: a_s_all = a_s_all[np.newaxis, :]
+
+    # 2. Construir cubo de Covarianzas Ruu (P, N, N)
+    # Asumimos ruido blanco: Rn = I
+    # Ruu = a * a^H + I
+    Rn = np.eye(N)
+    # Broadcasting: (P, N, 1) @ (P, 1, N) -> (P, N, N)
+    Ruu_stack = np.matmul(a_s_all[..., None], a_s_all[:, None, :].conj()) + Rn[None, ...]
+    
+    # 3. Resolver w_opt para cada punto: w = Ruu^-1 * C * (C^H * Ruu^-1 * C)^-1 * h
+    
+    # Paso A: Y = Ruu^-1 * C  --> Resolvemos Ruu * Y = C
+    # C_fixed shape: (N, L)
+    try:
+        Y_stack = np.linalg.solve(Ruu_stack, C_fixed[None, ...])
+    except np.linalg.LinAlgError:
+        # Fallback a pseudo-inversa si es singular (raro con carga diagonal I)
+        Y_stack = np.matmul(np.linalg.pinv(Ruu_stack), C_fixed[None, ...])
+
+    # Paso B: M = C^H * Y (Matriz interna L x L)
+    # (N, L).T @ (P, N, L) -> (P, L, L)
+    M_stack = np.matmul(C_fixed.T, Y_stack) 
+
+    # Paso C: z = M^-1 * h --> Resolvemos M * z = h
+    # Aseguramos h shape (L, 1)
+    if h_fixed.ndim == 1: h_fixed = h_fixed[:, None]
+    
+    try:
+        z_stack = np.linalg.solve(M_stack, h_fixed[None, ...])
+    except np.linalg.LinAlgError:
+         z_stack = np.matmul(np.linalg.pinv(M_stack), h_fixed[None, ...])
+
+    # Paso D: w_opt = Y * z
+    # (P, N, L) @ (P, L, 1) -> (P, N, 1)
+    w_opt_stack = np.matmul(Y_stack, z_stack).squeeze() # (P, N)
+
+    # 4. Calcular Ganancia (AG)
+    # Numerador: |w^H a|^2
+    # Denominador: w^H w (Ruido blanco amplificado)
+    
+    # Dot product fila a fila
+    num = np.abs(np.sum(np.conj(w_opt_stack) * a_s_all, axis=1))**2
+    den = np.sum(np.conj(w_opt_stack) * w_opt_stack, axis=1).real
+    
+    ags_lin = num / (den + 1e-15)
+    ags_db = 10 * np.log10(ags_lin + 1e-15)
+    
+    return ags_db

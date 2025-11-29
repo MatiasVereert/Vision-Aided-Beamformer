@@ -1,111 +1,85 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
+from scipy import signal
 import os
 
 # --- Imports del Sistema ---
-# Ajusta los imports según tu estructura de carpetas real
 from beamforming.array.mic_array import ULA
 from beamforming.system import AdaptiveBeamformer
 from propagation.free_field import space_delay
 from beamforming.algorithms.region_constriant import build_region_constraints
 from beamforming.algorithms.weights import compute_fixed_weights_optimized
+from utils.audio import load_audio_source, save_wav
 
-def generate_synthetic_voice(fs, duration, f0=120.0, f_max=4000.0):
-    """
-    Genera una señal armónica que imita la estructura de la voz (Buzz).
-    f0: Frecuencia fundamental (aprox 120Hz para voz masculina grave).
-    f_max: Ancho de banda máximo.
-    """
-    t = np.arange(int(duration * fs)) / fs
-    signal = np.zeros_like(t)
-    
-    # Suma de armónicos para cubrir el espectro de voz (Sawtooth-like)
-    current_f = f0
-    while current_f < f_max:
-        # Spectral tilt: La amplitud cae con la frecuencia (1/f)
-        amp = 1.0 / (1 + (current_f/500)**1.5) 
-        signal += amp * np.sin(2 * np.pi * current_f * t)
-        current_f += f0
-        
-    # Normalizar
-    signal = signal / np.max(np.abs(signal))
-    
-    # Aplicar una envolvente (silabas) para simular el habla
-    # Modulación lenta (1.5 Hz) + Silencios
-    envelope = 0.5 * (1 + np.sin(2 * np.pi * 1.5 * t)) 
-    
-    return signal * envelope
 
-def save_wav(filename, rate, data, folder="resultados_test"):
-    if not os.path.exists(folder): os.makedirs(folder)
-    # Normalización segura a int16 para evitar clipping
-    data = np.real(data)
-    m = np.max(np.abs(data))
-    if m > 0: 
-        # Dejamos un margen de seguridad (-1dB aprox)
-        data = data / m * 0.9
-    wavfile.write(os.path.join(folder, filename), rate, (data * 32767).astype(np.int16))
-    print(f"-> Guardado: {filename}")
 
 def run_test():
-    print("=== INICIANDO PRUEBA DE SISTEMA ADAPTATIVO (SINTÉTICO) ===")
+    print("=== INICIANDO PRUEBA DE SISTEMA ADAPTATIVO (VOZ REAL) ===")
 
     # 1. Parámetros de Simulación
     FS = 48000
-    K = 25          # Taps del filtro
-    DURATION = 4.0  # Segundos
-    MU_TEST = 0.1   # <--- SUBIMOS EL MU A 0.1 (Convergencia más rápida para el test)
+    K = 25          
+    DURATION = 4.0  # Segundos (El audio se recortará o repetirá a esto)
+    MU_TEST = 0.1   
     
+    # --- CONFIGURACIÓN DEL ARCHIVO DE AUDIO ---
+    # Cambia esto por la ruta de tu archivo wav
+    AUDIO_FILENAME = "tests/FK62_01.wav" 
+    
+    # Crear un archivo dummy si no existe para probar el script
+    if not os.path.exists(AUDIO_FILENAME):
+        print(f"[Alerta] No existe {AUDIO_FILENAME}. Generando uno de prueba temporal...")
+        t_dummy = np.linspace(0, 1, 48000)
+        dummy_data = np.sin(2*np.pi*440*t_dummy) * 0.5
+        wavfile.write(AUDIO_FILENAME, 48000, (dummy_data*32767).astype(np.int16))
+
     # Geometría (ULA 9 mics, 4cm spacing)
     M_MICS = 9
     D_SPACING = 0.04 
     mic_array_obj = ULA(M=M_MICS, d=D_SPACING)
+    mic_array = mic_array_obj.coordinates
     
-    # Banda de diseño (Voz humana estándar)
     F_MIN = 100.0
     F_MAX = 4000.0
     
     # 2. Instanciar el Sistema
     print(f"[Sistema] Inicializando Beamformer (M={M_MICS}, K={K})...")
     bf = AdaptiveBeamformer(
-        MicArrayObj=mic_array_obj,
+        mic_array =mic_array,
         K=K,
         fs=FS,
         fmin=F_MIN,
         fmax=F_MAX
     )
-    
-    # --- INYECCIÓN DE PARÁMETRO MU ---
-    # Sobrescribimos el valor por defecto de la clase para este test
     bf.MU = MU_TEST
-    print(f"[Config] MU establecido en: {bf.MU}")
 
     # 3. Generar Señales (Fuente y Ruido)
     print("\n[Generación] Creando escenario acústico virtual...")
     
-    # POSICIONES (Coordenadas Cartesianas)
-    # Target: Frente (90 grados, 2 metros) -> (0, 2, 0)
-    target_pos = np.array([0.0, 2.0, 0.0]) 
+    # POSICIONES
+    target_pos = np.array([0.0, 2.0, 0.0]) # Frente
     
-    # Interferencia: Derecha (45 grados, 2 metros)
-    # x = r*cos(theta), y = r*sin(theta) -> theta=45 deg
     angle_int = np.deg2rad(45)
     interf_pos = np.array([2.0 * np.cos(angle_int), 2.0 * np.sin(angle_int), 0.0])
     
-    # AUDIOS MONO
-    target_clean = generate_synthetic_voice(FS, DURATION)
+    # --- CARGA DE VOZ REAL ---
+    print(f"[Carga] Leyendo archivo: {AUDIO_FILENAME}")
+    try:
+        target_clean = load_audio_source(AUDIO_FILENAME, FS, DURATION)
+    except Exception as e:
+        print(f"[Error Crítico] Fallo al cargar audio: {e}")
+        return
     
-    # Interferencia: Ruido Blanco + un tono molesto de 1kHz
+    # Interferencia: Ruido Blanco + tono 1kHz
     noise_len = len(target_clean)
     t = np.arange(noise_len) / FS
     interf_clean = 0.3 * np.random.randn(noise_len) + 0.1 * np.sin(2*np.pi*1000*t)
     
     # 4. Simulación de Propagación (Broadband)
-    print("[Propagación] Simulando retardos fraccionarios (space_delay)...")
+    print("[Propagación] Simulando retardos fraccionarios...")
     
-    # Propagar Target hacia los micros
-    # space_delay retorna (Fuentes, Mics, Muestras), tomamos fuente 0
+    # Propagar Target (Voz Real)
     mics_target, _, _ = space_delay(target_clean, FS, target_pos, mic_array_obj.coordinates)
     mics_target = mics_target[0] 
     
@@ -113,27 +87,24 @@ def run_test():
     mics_interf, _, _ = space_delay(interf_clean, FS, interf_pos, mic_array_obj.coordinates)
     mics_interf = mics_interf[0]
 
-    # Suma en el micrófono (Mezcla)
-    # Alinear longitudes con padding si es necesario
+    # Mezcla
     len_max = max(mics_target.shape[1], mics_interf.shape[1])
     input_signal = np.zeros((M_MICS, len_max), dtype=np.float32)
     
     input_signal[:, :mics_target.shape[1]] += mics_target
     input_signal[:, :mics_interf.shape[1]] += mics_interf
     
-    # Añadir piso de ruido térmico (blanco, no correlacionado) - Importante para robustez
+    # Ruido térmico
     input_signal += 0.002 * np.random.randn(M_MICS, len_max)
     
     print(f"[Input] Señal mezclada lista. Shape: {input_signal.shape}")
 
-    # 5. Calcular Pesos (Bypass de generate_bank)
-    # Calculamos los filtros óptimos para la posición del target 'on-the-fly'
+    # 5. Calcular Pesos (Bypass)
     print("\n[Configuración] Calculando filtros LCMV Regionales (Bypass)...")
-    
     C, h, Ca = build_region_constraints(
         Rs=target_pos,
-        delta_r=0.2,            # +/- 20cm
-        delta_azimut=np.deg2rad(5), # +/- 5 grados
+        delta_r=0.2,            
+        delta_azimut=np.deg2rad(5), 
         delta_elevation=np.deg2rad(2),
         mic_array=mic_array_obj.coordinates,
         fs=FS,
@@ -144,54 +115,59 @@ def run_test():
         num_freqs=30
     )
     
-    # Resolver pesos fijos w_q
     w_q = compute_fixed_weights_optimized(C, h).flatten()
     
-    # Inyectar estado al sistema (Simulamos que el Tracker encontró al target)
-    bf.current_wq = w_q.astype(np.float32) # Asegurar float32
+    # Inyectar estado
+    bf.current_wq = w_q.astype(np.float32)
     bf.current_Ca = Ca.astype(np.float32)
     bf.active_coords = target_pos
-    # Reset del filtro adaptativo
     bf.current_wa = None 
     
-    print(" -> Pesos inyectados correctamente.")
-
     # 6. Procesamiento
     print("\n[Procesamiento] Ejecutando GSC (process_block)...")
     
-    # Procesar todo el bloque de audio de una vez
-    output_signal = bf.process_block(input_signal)
+    # NOTA: Verifica si tu método en AdaptiveBeamformer se llama 
+    # 'process_block' o 'procces_block' (error tipográfico en src/beamforming/system.py)
+    if hasattr(bf, 'process_block'):
+        output_signal = bf.process_block(input_signal)
+    elif hasattr(bf, 'procces_block'):
+        output_signal = bf.procces_block(input_signal)
+    else:
+        raise AttributeError("No se encontró el método process_block en AdaptiveBeamformer")
     
     # 7. Resultados y Gráficas
     print("\n[Resultados] Generando reporte...")
     
-    # Guardar audio
-    save_wav("TEST_1_Input_Mic0.wav", FS, input_signal[0,:])
-    save_wav("TEST_2_Output_GSC.wav", FS, output_signal)
-    save_wav("TEST_3_Ref_Target.wav", FS, target_clean)
+    save_wav("TEST_VOZ_1_Input_Mic0.wav", FS, input_signal[0,:])
+    save_wav("TEST_VOZ_2_Output_GSC.wav", FS, output_signal)
+    save_wav("TEST_VOZ_3_Ref_Target.wav", FS, target_clean)
     
     # Graficar
     plt.figure(figsize=(14, 10))
     
-    # A. Dominio del Tiempo (Zoom en una transición)
+    # A. Dominio del Tiempo
     plt.subplot(3, 1, 1)
-    plt.title(f"Dominio del Tiempo (Zoom) - mu={MU_TEST}")
-    start_s = int(FS * 1.5) # Mirar al segundo 1.5
-    end_s = start_s + 4000  # 4000 muestras
-    t_zoom = np.arange(4000) / FS * 1000 # ms
+    plt.title(f"Dominio del Tiempo - Voz Real - mu={MU_TEST}")
+    # Zoom arbitrario en el medio del audio
+    center_idx = len(output_signal) // 2
+    window_view = 4000 
+    start_s = center_idx 
+    end_s = start_s + window_view
+    if end_s > len(output_signal): end_s = len(output_signal)
+    
+    t_zoom = np.arange(end_s - start_s) / FS * 1000 # ms
     
     plt.plot(t_zoom, input_signal[0, start_s:end_s], label="Mic 0 (Sucio)", color='lightgray')
     plt.plot(t_zoom, output_signal[start_s:end_s], label="Salida GSC", color='green', linewidth=1.5)
-    plt.plot(t_zoom, target_clean[start_s:end_s]*0.8, label="Target (Ref)", color='black', linestyle='--', alpha=0.5)
+    plt.plot(t_zoom, target_clean[start_s:end_s]*0.8, label="Voz Limpia (Ref)", color='black', linestyle='--', alpha=0.5)
     plt.legend(loc='upper right')
     plt.ylabel("Amplitud")
     plt.xlabel("Tiempo (ms)")
     plt.grid(True, alpha=0.3)
     
-    # B. Convergencia (Aproximada por energía del error)
+    # B. Convergencia
     plt.subplot(3, 1, 2)
     plt.title("Energía de Salida (Convergencia)")
-    # Media móvil de la energía
     window_size = 1000
     energy_in = np.convolve(input_signal[0]**2, np.ones(window_size)/window_size, mode='same')
     energy_out = np.convolve(output_signal**2, np.ones(window_size)/window_size, mode='same')
@@ -204,7 +180,7 @@ def run_test():
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    # C. Espectrogramas (Comparativa)
+    # C. Espectrogramas
     plt.subplot(3, 2, 5)
     plt.title("Espectro Entrada (Mic 0)")
     plt.specgram(input_signal[0], Fs=FS, NFFT=1024, noverlap=512, cmap='inferno')
@@ -221,3 +197,5 @@ def run_test():
 
 if __name__ == "__main__":
     run_test()
+
+

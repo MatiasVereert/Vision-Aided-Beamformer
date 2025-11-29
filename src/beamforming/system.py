@@ -8,10 +8,10 @@ from beamforming.algorithms.weights import compute_fixed_weights_optimized
 
 class AdaptiveBeamformer:
 
-    def __init__(self, MicArrayObj, K: int, fs: int, fmin, fmax):
+    def __init__(self, mic_array, K: int, fs: int, fmin, fmax):
         # 1. Extraer datos del objeto MicArray
         # Guardamos las coordenadas crudas para la matemática
-        self.mic_coords = MicArrayObj.coordinates 
+        self.mic_coords = mic_array 
         self.M = self.mic_coords.shape[0] # Definimos M PRIMERO
         
         self.K = K
@@ -37,9 +37,14 @@ class AdaptiveBeamformer:
         self.weight_bank = None
         self.grid_tree = None
 
+        # Recroding Atributes
+        self.FPS = 30
+        self.data_log = {}
+       
+
         #adaptive
         self.MU = .65
-        self.EPSILON = e-12
+        self.EPSILON = 10e-12
 
         self.bank_metadata = {}
 
@@ -174,7 +179,7 @@ class AdaptiveBeamformer:
         cols_Ca = new_Ca.shape[1]
         
         if self.current_wa is None or self.current_wa.shape[0] != cols_Ca:
-            self.current_wa = np.zeros(cols_Ca, dtype=np.complex64) # O float32
+            self.current_wa = np.zeros(cols_Ca, dtype=np.float32) # O float32
             # print("DEBUG: Reset adaptativo")
 
         # 4. Asignar
@@ -182,50 +187,77 @@ class AdaptiveBeamformer:
         self.current_Ca = new_Ca
         self.active_coords = self.grid_points[idx]
 
-    def procces_block(self, input):
-        #Definin length
-        tot_samples = len(input)
-        output = np.zeros(tot_samples)
-
-        #Buffer size
+    def process_block(self, input_signal, record_weights = False):
+        # 1. Definir dimensiones (M filas, N columnas)
+        # Asumimos que input_signal viene como (M_mics, Tot_samples)
+        M, tot_samples = input_signal.shape
+        data = {}
         
+        # Validar que M coincida con tu array
+        if M != self.M:
+             raise ValueError(f"Input dimension mismatch. Expected {self.M} rows, got {M}")
+
+        output = np.zeros(tot_samples, dtype=np.float32)
+
+        # Buffer size ya está definido en __init__ (self.buffer)    
+        if record_weights == True:
+            interval = int(self.fs/self.FPS)
+            self.FPS = self.fs / interval
+
+            print("Recroding Activated with: ", self.FPS, "FPS")
+
 
         for i in range(tot_samples):
-            #Shift & Incert
-            self.buffer[:, 1:] = self.buffer[: ,: -1]
-            self.buffer[:,0] = input[i]
+            # 2. Shift & Insert (CORREGIDO)
+            self.buffer[:, 1:] = self.buffer[:, :-1]
+            
+            # ¡OJO AQUÍ! Usamos [:, i] para agarrar la columna (muestra actual de todos los mics)
+            self.buffer[:, 0] = input_signal[:, i] 
 
-            #Adapt dimensions
-            u_k  = self.buffer.flatten()
+            # Adapt dimensions
+            u_k = self.buffer.flatten()
 
-            #Fixed output branch
-            y_q = np.dot(np.conj(self.current_wq), u_k) 
+            # --- RAMAS (Sin np.conj porque es Real) ---
+            
+            # Fixed output branch
+            # Si wq es real, dot(wq.T, u_k) es suficiente
+            y_q = np.dot(self.current_wq, u_k) 
 
-            #Blocking matrix
-            x_a = np.dot(np.conj(self.current_Ca.T), u_k )
+            # Blocking matrix
+            # x_a = Ca^T * u_k
+            x_a = np.dot(self.current_Ca.T, u_k)
 
-            #Inicializate wa 
+            # Initialize wa (Lazy)
             if self.current_wa is None:
                 self.current_wa = np.zeros_like(x_a) 
 
-            #Adaptive Branch
-            y_a = np.dot(np.conj(self.current_wa), x_a)
+            # Adaptive Branch
+            # y_a = wa^T * x_a
+            y_a = np.dot(self.current_wa, x_a)
 
-            #error (OUTPUT)
+            # Error (OUTPUT)
             error = y_q - y_a 
             output[i] = error
 
-            #Update adaptive weights by NLMS
-            energy = np.real(np.dot(np.conj(x_a.T), x_a)) + self.EPSILON
+            # --- NLMS Update (Versión Real) ---
+            # Energía = x_a dot x_a (Suma de cuadrados)
+            energy = np.dot(x_a, x_a) + self.EPSILON
 
-            update =  self.MU * np.conj(x_a) * error / energy
+            # Update: mu * error * vector / energia
+            update = self.MU * error * x_a / energy
 
             self.current_wa += update
 
+            #Recording
+            if record_weights == True and (i%interval ==0):
+                time_sec = i * (1/self.fs)
+                snapshot = {"time": time_sec,
+                            "wq" : self.current_wq.copy,
+                            "wa" : self.current_wa.copy,
+                            "ca" : self.current_Ca.copy
+                        }
+                self.data_log.append(snapshot)
             
-
-
-
-
+        return output
 
 
