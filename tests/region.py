@@ -2,13 +2,13 @@ import numpy as np
 from scipy.constants import speed_of_sound
 
 # --- Importaciones de tu lista ---
-from beamforming.algorithms.lmcv import  compute_fixed_weights_optimized
-from beamforming.algorithms.constrains import point_constraint
+from beamforming.gsc.weights import  compute_fixed_weights_optimized
+from beamforming.gsc.constrains import point_constraint
 from beamforming.signal_model import near_field_steering_vector_multi, near_field_steering_vector
 from beamforming.evaluation.gain import analytical_gain
 from utils.geometry import source_rotation, cartesian_to_spherical, spherical_to_cartesian
 from utils.polar_plot import plot_polar_pattern
-from beamforming.algorithms.region_constriant import build_region_constraints
+from beamforming.gsc.region_constriant import build_region_constraints
 
 # --- 1. CONFIGURACIÓN DEL ESCENARIO ---
 # Parámetros físicos

@@ -6,7 +6,7 @@ from beamforming.processors import beamforming, snapshots
 from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
 from propagation.free_field import space_delay
 
-from beamforming.algorithms import region_constriant
+from beamforming.gsc import region_constriant
 
 
 def polar_gain(f, fs, mic_array, weights, focal_point, points=360):

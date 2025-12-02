@@ -8,8 +8,8 @@ import os
 from beamforming.array.mic_array import ULA
 from beamforming.system import AdaptiveBeamformer
 from propagation.free_field import space_delay
-from beamforming.algorithms.region_constriant import build_region_constraints
-from beamforming.algorithms.weights import compute_fixed_weights_optimized
+from beamforming.gsc.region_constriant import build_region_constraints
+from beamforming.gsc.weights import compute_fixed_weights_optimized
 
 def generate_synthetic_voice(fs, duration, f0=120.0, f_max=4000.0):
     """

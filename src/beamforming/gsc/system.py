@@ -3,8 +3,8 @@ from scipy.spatial import KDTree
 import os 
 # Asegúrate que estos imports existan en tu proyecto
 from utils.geometry import spatial_grid
-from beamforming.algorithms.region_constriant import build_region_constraints
-from beamforming.algorithms.weights import compute_fixed_weights_optimized
+from beamforming.gsc.region_constriant import build_region_constraints
+from beamforming.gsc.weights import compute_fixed_weights_optimized
 
 class AdaptiveBeamformer:
 
@@ -39,11 +39,11 @@ class AdaptiveBeamformer:
 
         # Recroding Atributes
         self.FPS = 30
-        self.data_log = {}
+        self.data_log = []
        
 
         #adaptive
-        self.MU = .65
+        self.MU = .1
         self.EPSILON = 10e-12
 
         self.bank_metadata = {}
@@ -252,12 +252,119 @@ class AdaptiveBeamformer:
             if record_weights == True and (i%interval ==0):
                 time_sec = i * (1/self.fs)
                 snapshot = {"time": time_sec,
-                            "wq" : self.current_wq.copy,
-                            "wa" : self.current_wa.copy,
-                            "ca" : self.current_Ca.copy
+                            "wq" : self.current_wq.copy(),
+                            "wa" : self.current_wa.copy(),
+                            "ca" : self.current_Ca.copy()
                         }
                 self.data_log.append(snapshot)
             
         return output
+
+    def process_block_vad(self, input_signal, record_weights=False):
+            """
+            Procesa un bloque de muestras realizando el filtrado GSC paso a paso.
+            Incluye un VAD energético simple para robustez contra cancelación del target.
+            """
+            # 1. Definir dimensiones
+            M, tot_samples = input_signal.shape
+            
+            # Validar dimensiones
+            if M != self.M:
+                raise ValueError(f"Input dimension mismatch. Expected {self.M} rows, got {M}")
+
+            output = np.zeros(tot_samples, dtype=np.float32)
+
+            # Configuración de grabación (Logging)
+            interval = 0
+            if record_weights:
+                # Asegurar que FPS no sea 0 o infinito
+                if self.FPS <= 0: self.FPS = 30
+                interval = int(self.fs / self.FPS)
+                if interval < 1: interval = 1
+                print(f"Recording Activated with: {self.FPS} FPS (Interval: {interval})")
+
+            # --- PARÁMETROS VAD INTERNO (Robustez) ---
+            # Estimadores de energía para decidir cuándo adaptar
+            avg_energy = 0.0
+            # Umbral relativo: Si la señal instantánea supera X veces al promedio, 
+            # asumimos que es voz fuerte (target) y congelamos.
+            vad_threshold_ratio = 3.0 
+            
+            # Factor de "olvido" suave para evitar deriva de pesos (Leaky NLMS)
+            leakage = 0.9999 
+
+            for i in range(tot_samples):
+                # 2. Shift & Insert (TDL Update)
+                # Desplazar buffer hacia la derecha (taps antiguos)
+                self.buffer[:, 1:] = self.buffer[:, :-1]
+                # Insertar nueva muestra en la posición 0
+                self.buffer[:, 0] = input_signal[:, i] 
+
+                # Aplanar para producto punto (M*K, 1)
+                u_k = self.buffer.flatten()
+
+                # --- ESTRUCTURA GSC ---
+                
+                # A) Rama Fija (Fixed Beamformer) -> Referencia del Target
+                # y_q = w_q^T * u(k)
+                y_q = np.dot(self.current_wq, u_k) 
+
+                # B) Matriz de Bloqueo -> Referencia de Ruido/Interferencia
+                # x_a = Ca^T * u_k
+                x_a = np.dot(self.current_Ca.T, u_k)
+
+                # Inicializar wa si es la primera vez (Lazy Init)
+                if self.current_wa is None:
+                    self.current_wa = np.zeros_like(x_a) 
+
+                # C) Rama Adaptativa
+                # y_a = wa^T * x_a
+                y_a = np.dot(self.current_wa, x_a)
+
+                # D) Salida del Sistema (Error de cancelación)
+                # e = y_q - y_a
+                error = y_q - y_a 
+                output[i] = error
+
+                # --- LÓGICA DE CONTROL DE ADAPTACIÓN (VAD) ---
+                # Calculamos energía instantánea de la salida fija (proxy del target)
+                inst_power = y_q**2
+                
+                # Promedio exponencial (Slow attack, slow decay)
+                avg_energy = 0.99 * avg_energy + 0.01 * inst_power
+                
+                # Decisión: ¿Adaptar o Congelar?
+                # Si la energía actual es mucho mayor que el promedio reciente, 
+                # probablemente entró el locutor -> NO adaptar para no cancelarlo.
+                if inst_power > (avg_energy * vad_threshold_ratio):
+                    effective_mu = 0.0 # Congelar
+                else:
+                    effective_mu = self.MU # Adaptar (aprender ruido)
+
+                # --- ACTUALIZACIÓN DE PESOS (NLMS) ---
+                if effective_mu > 0:
+                    # Energía del vector de referencia de ruido
+                    energy_xa = np.dot(x_a, x_a) + self.EPSILON
+                    
+                    # Update rule: w(n+1) = w(n) + mu * e * x / |x|^2
+                    update = effective_mu * error * x_a / energy_xa
+                    
+                    # Aplicamos update + leakage (estabilidad a largo plazo)
+                    self.current_wa = (self.current_wa * leakage) + update
+
+                # --- GRABACIÓN DE ESTADO ---
+                if record_weights and (i % interval == 0):
+                    time_sec = i * (1/self.fs)
+                    # IMPORTANTE: Usar .copy() con paréntesis, sino guarda la referencia al método
+                    snapshot = {
+                        "time": time_sec,
+                        "wq" : self.current_wq.copy(), 
+                        "wa" : self.current_wa.copy(),
+                        "ca" : self.current_Ca.copy(),
+                        "mu_eff": effective_mu # Útil para debuguear el VAD
+                    }
+                    self.data_log.append(snapshot)
+                
+            return output
 
 

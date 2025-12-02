@@ -3,10 +3,6 @@ from scipy.constants import speed_of_sound
 from beamforming.signal_model import near_field_steering_vector
 from numpy.lib.stride_tricks import sliding_window_view
 
-
-
-
-
 def snapshots(array_signals, K):
     """
     Creates the snapshot matrix U for a multi-channel time-domain beamformer.
@@ -168,3 +164,14 @@ def gsc_adaptive_beamformer(
             w_log.append(np.abs(wa).mean()) # Guardamos la magnitud media
 
     return y_out, w_log
+
+
+class AdaptiveGSC:
+
+    """
+    Procesador Generalized Sideslobe Canceler
+    """
+
+    def __init__(self, w_q, ):
+        pass
+    

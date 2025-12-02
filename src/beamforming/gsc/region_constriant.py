@@ -192,7 +192,9 @@ def build_region_constraints(
     f_max: int = 10000,
     num_points: int = 100, # I
     num_freqs: int = 100,  # J
-    c: float = speed_of_sound
+    c: float = speed_of_sound,
+    energy_threshold = 0.99
+
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]: # Actualizado type hint
     """
     Orchestrates the calculation of the robust constraints C, h, and blocking matrix Ca.
@@ -206,7 +208,7 @@ def build_region_constraints(
 
     # 3. Perform SVD and find the rank L
     # U tiene forma (N, N) si N < 2P (que es lo usual)
-    L, U, s, Vh, epsilon = compute_svd_and_rank(A, energy_threshold=0.999)
+    L, U, s, Vh, epsilon = compute_svd_and_rank(A, energy_threshold)
 
     # --- 4. Build C, h, and Ca ---
     

@@ -10,8 +10,8 @@ import os
 from beamforming.array.mic_array import ULA
 from beamforming.system import AdaptiveBeamformer
 from propagation.free_field import space_delay
-from beamforming.algorithms.region_constriant import build_region_constraints
-from beamforming.algorithms.weights import compute_fixed_weights_optimized
+from beamforming.gsc.region_constriant import build_region_constraints
+from beamforming.gsc.weights import compute_fixed_weights_optimized
 from utils.audio import load_audio_source, save_wav
 
 def run_test_presentation():
@@ -19,29 +19,26 @@ def run_test_presentation():
 
     # 1. Parámetros de Simulación
     FS = 48000
-    K = 25          
-    DURATION = 5.0
-    MU_TEST = 0.1   
+    K = 50
+    DURATION = 5
+    MU_TEST = 0.01
     
+    # Archivos de Audio
     AUDIO_FILENAME = "tests/FK62_01.wav" 
-    
-    # Generar dummy si no existe
-    if not os.path.exists(AUDIO_FILENAME):
-        print(f"[Alerta] Generando archivo dummy en {AUDIO_FILENAME}...")
-        t_dummy = np.linspace(0, 1, 48000)
-        dummy_data = np.sin(2*np.pi*440*t_dummy) * 0.5
-        # Asegurar directorio tests
-        os.makedirs(os.path.dirname(AUDIO_FILENAME), exist_ok=True)
-        wavfile.write(AUDIO_FILENAME, 48000, (dummy_data*32767).astype(np.int16))
+    INTERF_FILENAME = "tools/data/signals/MC15_03.wav" # Nueva interferencia solicitada
+
 
     # Geometría (ULA 9 mics, 4cm spacing)
-    M_MICS = 9
-    D_SPACING = 0.04 
-    mic_array_obj = ULA(M=M_MICS, d=D_SPACING)
-    mic_array_coords = mic_array_obj.coordinates
+    M_MICS = 10
+    D_SPACING = 0.2
+
+    mic_array_coords =np.stack( [[-.12,-.5, 0, 0.15, 0.03, 0.1, 0.12, 0.15, 0.3, 0.6], 
+                               np.zeros(M_MICS), 
+                               np.zeros(M_MICS)], 
+                               axis = 1 )
     
-    F_MIN = 100.0
-    F_MAX = 4000.0
+    F_MIN = 50.0
+    F_MAX = 15000.0
     
     # 2. Instanciar el Sistema
     bf = AdaptiveBeamformer(
@@ -54,23 +51,26 @@ def run_test_presentation():
     bf.MU = MU_TEST
 
     # 3. Generar Señales
-    target_pos = np.array([0.0, 0.8, 0.0]) # Frente (0 grados, 0.8 metros) -> CAMPO CERCANO
+    # Target: 0.8 metros (Campo Cercano)
+    target_pos = np.array([0.0, .6, 0.0]) 
     
-    angle_int = np.deg2rad(45)
+    angle_int = np.deg2rad(40)
     interf_pos = np.array([2.0 * np.cos(angle_int), 2.0 * np.sin(angle_int), 0.0])
     
+    # Carga de Audios
     try:
+        print(f"[Carga] Fuente deseada: {AUDIO_FILENAME}")
         target_clean = load_audio_source(AUDIO_FILENAME, FS, DURATION)
+        
+        print(f"[Carga] Interferencia: {INTERF_FILENAME}")
+        interf_clean = load_audio_source(INTERF_FILENAME, FS, DURATION)
+        
     except Exception as e:
-        print(f"[Error] {e}")
+        print(f"[Error] Fallo al cargar audio: {e}")
         return
     
-    # Interferencia
-    noise_len = len(target_clean)
-    t = np.arange(noise_len) / FS
-    interf_clean = 0.3 * np.random.randn(noise_len) + 0.1 * np.sin(2*np.pi*1000*t)
-    
     # 4. Propagación
+    print("[Propagación] Simulando retardos...")
     mics_target, _, _ = space_delay(target_clean, FS, target_pos, mic_array_coords)
     mics_target = mics_target[0] 
     
@@ -87,16 +87,17 @@ def run_test_presentation():
     # 5. Calcular Pesos (Bypass - Beamformer Fijo Inicial)
     C, h, Ca = build_region_constraints(
         Rs=target_pos,
-        delta_r=0.2,            
-        delta_azimut=np.deg2rad(5), 
-        delta_elevation=np.deg2rad(2),
+        delta_r= 0.01,            
+        delta_azimut= .1, 
+        delta_elevation= .1,
         mic_array=mic_array_coords,
         fs=FS,
         K=K,
         f_min=F_MIN,
         f_max=F_MAX,
-        num_points=40, 
-        num_freqs=30
+        num_points=100, 
+        num_freqs=100,
+        energy_threshold = 0.99
     )
     
     w_q = compute_fixed_weights_optimized(C, h).flatten()
@@ -105,22 +106,24 @@ def run_test_presentation():
     bf.current_Ca = Ca.astype(np.float32)
     bf.active_coords = target_pos
     bf.current_wa = None 
+
+
     
     # 6. Procesamiento
     print("[Procesamiento] Ejecutando GSC...")
     if hasattr(bf, 'process_block'):
-        output_signal = bf.process_block(input_signal)
+        output_signal = bf.process_block_vad(input_signal)
     elif hasattr(bf, 'procces_block'): # Typos handling
-        output_signal = bf.procces_block(input_signal)
+        output_signal = bf.procces_block_vad(input_signal)
     else:
         raise AttributeError("Método process_block no encontrado")
 
     # --- EXPORTAR AUDIOS ---
     print(f"[Audios] Exportando resultados a 'audios_presentacion'...")
     FOLDER_OUT = "audios_presentacion"
-    save_wav("Presentacion_Input_Mic0.wav", FS, input_signal[0,:], folder=FOLDER_OUT)
-    save_wav("Presentacion_Output_GSC.wav", FS, output_signal, folder=FOLDER_OUT)
-    save_wav("Presentacion_Ref_Target.wav", FS, target_clean, folder=FOLDER_OUT)
+    save_wav("Voice_Presentacion_Input_Mic0.wav", FS, input_signal[0,:], folder=FOLDER_OUT)
+    save_wav("Voice_Presentacion_Output_GSC.wav", FS, output_signal, folder=FOLDER_OUT)
+    save_wav("Voice_Presentacion_Ref_Target.wav", FS, target_clean, folder=FOLDER_OUT)
     
     # 7. GRÁFICOS PARA PRESENTACIÓN
     print("[Gráficos] Generando figura optimizada...")
@@ -194,8 +197,7 @@ def run_test_presentation():
     ax_spec_out.set_ylabel("Frecuencia (Hz)")
     ax_spec_out.set_xlabel("Tiempo (s)")
 
-    # Título Principal ELIMINADO
-    # plt.suptitle(...)
+
     
     # Guardar
     plt.savefig("Resultados_Presentacion.png", dpi=300, bbox_inches='tight')

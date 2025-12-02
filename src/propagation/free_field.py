@@ -6,7 +6,7 @@ from scipy.io import wavfile
 
 # --- IMPORTACIONES ---
 from beamforming.signal_model import near_field_steering_vector_multi
-from beamforming.algorithms.region_constriant import build_region_constraints
+from beamforming.gsc.region_constriant import build_region_constraints
 from beamforming.processors import gsc_adaptive_beamformer
 
 # ------------------------------------------------------------------------------
@@ -40,5 +40,8 @@ def space_delay(signal, fs, source_pos, mic_array):
     Y_matrix = X * phase_shift_matrix
     array_retardado_complex = np.fft.ifft(Y_matrix, axis=-1)
     array_retardado = array_retardado_complex.real
+
+    if array_retardado.shape[0] == 1:
+        array_retardado = np.squeeze(array_retardado, axis= 0)
     
-    return array_retardado, signal_padded, tau_array
+    return array_retardado

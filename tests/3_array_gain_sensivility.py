@@ -6,11 +6,11 @@ from matplotlib import pyplot as plt
 from beamforming.signal_model import near_field_steering_vector_multi
 # ESTA ES TU FUNCIÓN ORIGINAL (BEAMPATTERN)
 from beamforming.evaluation.gain import analytical_gain 
-from beamforming.algorithms.weights import compute_fixed_weights_optimized
+from beamforming.gsc.weights import compute_fixed_weights_optimized
 from utils.geometry import source_rotation, cartesian_to_spherical, spherical_to_cartesian
 from typing import Tuple
 from beamforming.evaluation.gain import compute_ags_vectorized
-from beamforming.algorithms.region_constriant import build_region_constraints
+from beamforming.gsc.region_constriant import build_region_constraints
 
 from utils.geometry import source_rotation
 

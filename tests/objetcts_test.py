@@ -1,7 +1,7 @@
 from beamforming.array.mic_array import MicArray, custom, ULA 
-from beamforming.algorithms.optimizer import WeightOptimizer
-from beamforming.algorithms.lmcv import LmcvOptimizer
-from beamforming.algorithms.constrains import ConstrainGenerator, NarrowbandPointConstrain
+from beamforming.gsc.optimizer import WeightOptimizer
+from beamforming.gsc.weights import LmcvOptimizer
+from beamforming.gsc.constrains import ConstrainGenerator, NarrowbandPointConstrain
 from beamforming.beamformer import Beamformer
 import numpy as np
 
