@@ -1,124 +1,103 @@
 import numpy as np 
 from matplotlib import pyplot as plt
-from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
-from scipy import signal, fft
-import numpy as np
-from propagation.free_field import space_delay
+from scipy import signal
 
-#Constants 
+# --- 1. TU FUNCIÓN DE RETARDO EXACTO (INTEGRADA) ---
+def space_delay(signal_in, fs, source_pos, mic_array):
+    """
+    Simula la propagación banda ancha usando FFT para retardos fraccionarios exactos.
+    """
+    # Aseguramos arrays
+    signal_in = np.array(signal_in)
+    source_pos = np.atleast_2d(source_pos) 
+    mic_array = np.atleast_2d(mic_array)
+    
+    N_original = len(signal_in)
+    
+    # 1. Cálculo de retardos
+    # diff_vectors: (1, M, 3)
+    diff_vectors = source_pos[:, np.newaxis, :] - mic_array[np.newaxis, :, :]
+    distancias = np.linalg.norm(diff_vectors, axis=2) 
+    
+    # CORRECCIÓN: Usamos la constante global C_SOUND definida abajo
+    tau_array = distancias / C_SOUND 
+    
+    # 2. Longitud FFT (Potencia de 2)
+    max_delay_samples = int(np.ceil(np.max(tau_array) * fs))
+    N_fft = 2**(int(np.ceil(np.log2(N_original + max_delay_samples))))
+    
+    # 3. FFT
+    signal_padded = np.pad(signal_in, (0, N_fft - N_original), 'constant')
+    X = np.fft.fft(signal_padded)
+    k = np.fft.fftfreq(N_fft, d=1/fs)
+    
+    # 4. Fase (Shift Theorem)
+    # tau_array: (1, M), k: (N_fft) -> Broadcasting (1, M, N_fft)
+    phase_shift_matrix = np.exp(-1j * 2 * np.pi * k * tau_array[..., np.newaxis])
+    
+    # 5. IFFT
+    Y_matrix = X * phase_shift_matrix
+    array_retardado_complex = np.fft.ifft(Y_matrix, axis=-1)
+    array_retardado = array_retardado_complex.real
+
+    if array_retardado.shape[0] == 1:
+        array_retardado = np.squeeze(array_retardado, axis=0)
+    
+    # Devolvemos la señal completa (con cola) y las distancias para atenuar después
+    return array_retardado, distancias.flatten()
+
+# --- 2. CONSTANTES Y CONFIGURACIÓN ---
+# Imports adicionales necesarios para tu script original
+from beamforming.signal_model import near_field_steering_vector_multi
+
 fs = 48000
-f_test = 3000.0 
-C_SOUND = 343
+C_SOUND = 343 # Definido aquí para que lo use space_delay
 fmin = 200
-fmax= 10000
+fmax = 10000
 
-#Array dimentions 
-mic_spacing = 0.01
-M = 12
-lenght = M * mic_spacing
-x_coords = (np.arange(M) - (M-1)/2)* mic_spacing
-
-y_coords = z_coords = np.zeros(M)
-mic_coords = np.stack([x_coords, y_coords, z_coords ], axis = 1) # M, 3
-
-#Source Signal and ubicaiton
-source_pos = [1.5 , 1.5, 0]
-f = 1000
-time = 1 #s
-t = np.arange(0, 1 , 1/fs)
-source_signal = np.sin(2 * np.pi * t * f)
-
-#Noise signal
-noise_pos = [-1.5 , 1.5, 0]
-noise = np.random.rand(len(t)) - 0.5
-
-
-plt.figure()
-plt.plot(t, source_signal)
-plt.plot(t, noise, color = 'r')
-plt.show()
-
-#obtain the inputs of the array
-inp_signal  = (source_signal, fs, source_pos, mic_coords)
-inp_noise  = (noise, fs, noise_pos, mic_coords)
-array_input = inp_signal + inp_noise
-
-
-
-# ---- Low Rank Beamforming Sum delay Design ---------
-#Settings
-
+# Dimensiones del Array
+mic_spacing = 0.05 # Aumenté un poco para el ejemplo (5cm), ajustá a tu gusto
 M1 = 3
 M2 = 4
-P = 1
+M = M1 * M2
 
-#Firstly, we obtain de steering vector in the position of the source
-sv = near_field_steering_vector_multi(f , source_pos, fs, mic_coords, 1)
+# Grilla rectangular
+x = np.linspace(0, (M2-1)*mic_spacing, M2)
+y = np.linspace(0, (M1-1)*mic_spacing, M1)
+xv, yv = np.meshgrid(x, y)
+mic_coords = np.column_stack([xv.flatten(), yv.flatten(), np.zeros(M)]) # (M, 3)
 
-#We obtain te coeficients by lowering the rank of the 
+# Señales
+f_source = 1000
+time_duration = 0.5
+t = np.arange(0, time_duration, 1/fs)
+source_signal = np.sin(2 * np.pi * t * f_source)
+noise_signal = np.random.rand(len(t)) - 0.5
 
-steering_m = sv.reshape(M1, M2)
-U, S, Vh = np.linalg.svd(steering_m, full_matrices= False)
+source_pos = [1.5, 1.5, 1.0]
+noise_pos = [-1.5, 1.5, 1.0]
 
-I1 = np.identity(M1)
-I2 = np.identity(M2)
+# --- 3. GENERACIÓN CORRECTA DE ENTRADA (SOLUCIÓN DEL ERROR) ---
+print("Generando señales con space_delay...")
 
-H2_underlined = np.zeros((M, P * M1), dtype=complex)
-H1_underlined = np.zeros((M, P * M2), dtype=complex)
+# A. Fuente: Retardo + Atenuación (1/r)
+raw_src, dists_src = space_delay(source_signal, fs, source_pos, mic_coords)
+mics_src = raw_src[:, :len(t)] / dists_src[:, np.newaxis] # Recortamos y atenuamos
 
-h2_underlined = np.zeros((P * M2), dtype=complex)
-h1_underlined = np.zeros((P * M1), dtype=complex)
+# B. Ruido: Retardo + Atenuación (1/r)
+raw_noise, dists_noise = space_delay(noise_signal, fs, noise_pos, mic_coords)
+mics_noise = raw_noise[:, :len(t)] / dists_noise[:, np.newaxis]
 
-#Compose the h weights for each
-for p in range(P):
-    sigma_p_sqrt = np.sqrt(S[p]) 
-    
-    # 1. Definir Vectores Columna (M1, 1) y (M2, 1)
-    h1_p = (U[:, p] * sigma_p_sqrt).reshape(-1, 1)
-    h2_p = (Vh[p, :] * sigma_p_sqrt).reshape(-1, 1)
+# C. Suma MATRICIAL (Ahora sí son arrays numéricos)
+array_input = mics_src + mics_noise 
+print(f"Input shape: {array_input.shape}") # Debería ser (12, N_muestras)
 
-    # 2. Construir Bloques Kronecker
-    # H2_p: (M2, 1) kron (M1, M1) -> Bloque (M, M1) [Ancho M1]
-    H2_p = np.kron(h2_p.conj(), I1) 
-    
-    # H1_p: (M2, M2) kron (M1, 1) -> Bloque (M, M2) [Ancho M2]
-    H1_p = np.kron(I2, h1_p)
-
-    # --- GUARDADO EN MATRICES GIGANTES (Usan índices cruzados) ---
-    
-    # Matriz H2: Sus bloques tienen ancho M1
-    idx_start_mat_2 = p * M1
-    idx_end_mat_2   = (p + 1) * M1
-    H2_underlined[:, idx_start_mat_2 : idx_end_mat_2] = H2_p
-    
-    # Matriz H1: Sus bloques tienen ancho M2 (¡OJO AQUÍ!)
-    idx_start_mat_1 = p * M2
-    idx_end_mat_1   = (p + 1) * M2
-    H1_underlined[:, idx_start_mat_1 : idx_end_mat_1] = H1_p
-    
-    # --- GUARDADO EN VECTORES COLUMNA (Usan sus dimensiones naturales) ---
-    
-    # Vector h2: Tiene largo M2
-    idx_start_vec_2 = p * M2
-    idx_end_vec_2   = (p + 1) * M2
-    # Asignamos directo (sin .T porque ya es columna, y cuidado con el conj si el libro lo pide)
-    h2_underlined[idx_start_vec_2 : idx_end_vec_2] = h2_p.flatten()
-    
-    # Vector h1: Tiene largo M1
-    idx_start_vec_1 = p * M1
-    idx_end_vec_1   = (p + 1) * M1
-    h1_underlined[idx_start_vec_1 : idx_end_vec_1] = h1_p.flatten()
-
-
-# ------- Procces the Signals ---------
-# singal->convert to frecuency-> process-> invert to time 
-
+# --- 4. BEAMFORMING LOW RANK (TU LÓGICA) ---
 
 n_window = 1024
 n_overlap = 512
 
-# 1. Transformada al Dominio de la Frecuencia (STFT)
-# X shape: (M, Freqs, Time) -> (12, 513, N_frames)
+# STFT
 f_axis, t_axis, X = signal.stft(x=array_input, 
                                 fs=fs, 
                                 nperseg=n_window, 
@@ -126,103 +105,99 @@ f_axis, t_axis, X = signal.stft(x=array_input,
                                 window='hann', 
                                 axis=1)
 
-# Matriz para guardar el resultado (Frecuencia x Tiempo)
-# Ya no tiene dimensión de micrófonos porque el beamformer los colapsa a 1.
 Y_stft = np.zeros((X.shape[1], X.shape[2]), dtype=complex)
+P = 1 
 
-print("Procesando señal Banda Ancha (Low-Rank por frecuencia)...")
+print("Procesando señal Banda Ancha...")
 
-# --- 2. BUCLE DE PROCESAMIENTO (Banda Ancha) ---
-# Iteramos sobre cada bin de frecuencia k
 for k, freq_val in enumerate(f_axis):
     
-    # Evitamos procesar DC (0Hz) o Nyquist si dan problemas numéricos,
-    # y limitamos a fmax para no procesar ruido ultrasónico innecesario.
-    if freq_val < fmin or freq_val > fmax:
+    if freq_val < 20:
         continue
 
-    # -----------------------------------------------------------
-    # PASO A: Recalcular la Matemática Narrowband para ESTA frecuencia
-    # -----------------------------------------------------------
-    
-    # 1. Steering Vector actual (depende de freq_val)
-    # Nota: Usamos tu función con freq_val, NO con la f fija de 1000
+    # A. SVD para esta frecuencia
     sv_k = near_field_steering_vector_multi(freq_val, source_pos, fs, mic_coords, 1)
-    
-    # 2. Reshape y SVD
     steering_m = sv_k.reshape(M1, M2)
     U, S, Vh = np.linalg.svd(steering_m, full_matrices=False)
     
-    # -----------------------------------------------------------
-    # PASO B: Construir los Filtros Separables (h1 y h2)
-    # -----------------------------------------------------------
-    # Usamos P=1 como definiste, pero sumamos las ramas si P>1
-    
-    # Tomamos la "foto" de los micrófonos en esta frecuencia k
-    # X_snapshot shape: (M, Time) -> lo pasamos a (M1, M2, Time)
+    # B. Aplicación Eficiente (Separable)
     X_k_snapshot = X[:, k, :].reshape(M1, M2, -1)
-    
     output_frec_k = np.zeros(X_k_snapshot.shape[2], dtype=complex)
     
     for p in range(P):
         sigma_sqrt = np.sqrt(S[p])
-        
-        # Vectores h para el modo p (Conjugados porque son filtros W = h*)
-        # h1 (Filas): (M1,)
         w1_p = (U[:, p] * sigma_sqrt).conj()
-        # h2 (Columnas): (M2,)
         w2_p = (Vh[p, :] * sigma_sqrt).conj()
         
-        # -----------------------------------------------------------
-        # PASO C: Aplicar Filtro Separable (Eficiencia Pura)
-        # -----------------------------------------------------------
-        # En vez de Kronecker gigante, filtramos columnas y luego filas.
-        
-        # 1. Filtrar dimensión M2 (Columnas)
-        # X_k_snapshot (M1, M2, Time) @ w2_p (M2,) -> Intermedio (M1, Time)
-        # Usamos np.tensordot o einsum. Einsum es más explícito:
-        # "ijk, j -> ik": Indices (M1, M2, Time), (M2) -> (M1, Time)
+        # Filtro Columnas -> Filas
         intermedio = np.einsum('ijk, j -> ik', X_k_snapshot, w2_p)
-        
-        # 2. Filtrar dimensión M1 (Filas)
-        # w1_p (M1,) @ Intermedio (M1, Time) -> Salida (Time)
         salida_rama = w1_p @ intermedio
-        
-        # Sumamos la contribución de este rango p
         output_frec_k += salida_rama
         
-    # Guardamos la fila de frecuencia procesada en la matriz final
     Y_stft[k, :] = output_frec_k
+from scipy.io import wavfile
 
-# --- 3. INVERSA AL TIEMPO (ISTFT) ---
+# --- 5. RESULTADOS Y EXPORTACIÓN ---
+
+# Recortamos para que tengan el mismo largo exacto
 t_out, signal_out = signal.istft(Y_stft, fs=fs, nperseg=n_window, noverlap=n_overlap, window='hann')
+min_len = min(len(t), len(signal_out), array_input.shape[1])
 
-# Ajuste de longitud por padding
-min_len = min(len(t), len(signal_out))
-signal_out = signal_out[:min_len]
+# Señales a comparar
+# Tomamos la parte real (por si quedan residuos imaginarios ínfimos de la IFFT)
+audio_in = array_input[0, :min_len].real
+audio_out = signal_out[:min_len].real
+t_plot = t[:min_len]
 
-# --- 4. VISUALIZACIÓN ---
-plt.figure(figsize=(10,8))
-plt.subplot(3,1,1)
-plt.title("Señal Original (Sucia) - Mic 1")
-plt.plot(t[:min_len], array_input[0, :min_len].real, label='Mic 1')
-plt.legend()
+# --- A. GRÁFICOS COMPARATIVOS ---
+plt.figure(figsize=(12, 10))
 
-plt.subplot(3,1,2)
-plt.title("Salida Beamformer Low-Rank")
-plt.plot(t[:min_len], signal_out.real, color='g', label='Salida')
-plt.legend()
+# 1. Tiempo - Entrada
+plt.subplot(4, 1, 1)
+plt.title("Entrada (Micrófono 1) - Dominio del Tiempo")
+plt.plot(t_plot, audio_in, color='gray', alpha=0.8)
+plt.ylabel("Amplitud")
+plt.grid(True, alpha=0.3)
 
-plt.subplot(3,1,3)
-plt.title("Comparación Espectral")
-plt.psd(array_input[0, :], Fs=fs, NFFT=1024, label='Input (Mic 1)')
-plt.psd(signal_out, Fs=fs, NFFT=1024, label='Output (Beamformed)')
-plt.legend()
+# 2. Espectrograma - Entrada
+plt.subplot(4, 1, 2)
+plt.title("Entrada (Micrófono 1) - Espectrograma")
+plt.specgram(audio_in, Fs=fs, NFFT=1024, noverlap=512, cmap='inferno')
+plt.ylabel("Frecuencia [Hz]")
+
+# 3. Tiempo - Salida
+plt.subplot(4, 1, 3)
+plt.title("Salida Beamformer Low-Rank - Dominio del Tiempo")
+plt.plot(t_plot, audio_out, color='tab:blue')
+plt.ylabel("Amplitud")
+plt.grid(True, alpha=0.3)
+
+# 4. Espectrograma - Salida
+plt.subplot(4, 1, 4)
+plt.title("Salida Beamformer Low-Rank - Espectrograma")
+plt.specgram(audio_out, Fs=fs, NFFT=1024, noverlap=512, cmap='inferno')
+plt.ylabel("Frecuencia [Hz]")
+plt.xlabel("Tiempo [s]")
 
 plt.tight_layout()
 plt.show()
 
+# --- B. EXPORTACIÓN A WAV ---
 
+def save_wav_normalized(filename, data, fs):
+    """Normaliza a float32 entre -1 y 1 y guarda"""
+    # Evitar división por cero
+    max_val = np.max(np.abs(data))
+    if max_val > 0:
+        data_norm = data / max_val
+    else:
+        data_norm = data
+    
+    # Aplicamos un factor de seguridad (0.95) para evitar clipping al reproducir
+    data_norm = data_norm * 0.95
+    wavfile.write(filename, fs, data_norm.astype(np.float32))
+    print(f"Archivo guardado: {filename}")
 
-
-
+print("\n--- Exportando Audio ---")
+save_wav_normalized("input_mic1_noisy.wav", audio_in, fs)
+save_wav_normalized("output_beamformed_clean.wav", audio_out, fs)
