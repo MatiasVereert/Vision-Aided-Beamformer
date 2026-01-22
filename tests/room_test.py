@@ -4,7 +4,7 @@ from utils.data_loader import load_sriracha_selection, get_rir_data_arrays
 from propagation.room_convolution import generate_array_signals
 from utils.audio import load_audio_source, save_wav
 from beamforming.array.mic_array import custom
-from beamforming.system import AdaptiveBeamformer
+from beamforming.gsc.system import AdaptiveBeamformer
 # Importamos las herramientas para el cálculo directo
 from beamforming.gsc.region_constriant import build_region_constraints
 from beamforming.gsc.weights import compute_fixed_weights_optimized

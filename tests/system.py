@@ -4,7 +4,7 @@ from mpl_toolkits.mplot3d import Axes3D # Necesario para plots 3D
 
 # Imports del sistema
 from beamforming.array.mic_array import ULA 
-from beamforming.system import AdaptiveBeamformer
+from beamforming.gsc.system import AdaptiveBeamformer
 
 def test_pipeline():
     print("=== INICIANDO TEST DE SISTEMA ADAPTATIVO ===")

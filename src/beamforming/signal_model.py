@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.constants import speed_of_sound
 
-def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
+def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=speed_of_sound, squeeze = True):
     """
     Calcula los steering vectors de campo cercano para múltiples frecuencias y puntos de la fuente.
     Esta versión está corregida para manejar el broadcasting de dimensiones correctamente.
@@ -25,7 +25,6 @@ def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=speed_of_sound
     T = 1/fs
     tap_delays = np.arange(K) * T # Shape: (K,)
 
-    # --- CORRECCIÓN CLAVE: Añadir el retardo de referencia del centro del filtro ---
     ref_delay = (K - 1) / (2 * fs)
     
     # --- Cálculo del Steering Vector (CORREGIDO) ---
@@ -40,6 +39,11 @@ def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=speed_of_sound
     
     # --- Reshape Final (sin cambios) ---
     final_sv = steering_vector.reshape(F, P, M * K)
+    
+    if squeeze:
+        final_sv = np.squeeze(final_sv)
+
+
     
     return final_sv
 
@@ -60,6 +64,7 @@ def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
 
     # Distancia de la fuente al origen (d_s)
     source_dist_origin = np.linalg.norm(Rs)
+    
     # Distancia de la fuente a cada micrófono (d_m)
     distances = np.linalg.norm(Rs - mic_array, axis=1).reshape(-1, 1)
 

@@ -4,7 +4,7 @@ import numpy as np
 from propagation.free_field import space_delay
 
 class LowRankAdaptive:
-    
+
     def __init__(self, mic_array, fmin, fmax, fs):
         #save atributes
         self.mic_array = mic_array
@@ -58,15 +58,15 @@ class LowRankAdaptive:
         #Inicialice the filters
         h1 = np.zeros((M1, f_len))
         h2 = np.random.random((M2, f_len))
-        H1 = np.zeros((M, P*M1))
-        H2 = np.zeros((M, P*M2))
+        H1 = np.zeros((M, P*M2,f_len ))
+        H2 = np.zeros((M, P*M1, f_len))
 
         #Snapshot window
 
         #Output in f domain
 
         #Iniciate process loop
-        for i in t_len:
+        for i in range(t_len):
             snapshot = X[:,:,i]
 
             #ALS loop
