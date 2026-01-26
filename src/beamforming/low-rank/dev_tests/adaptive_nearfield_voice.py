@@ -106,8 +106,8 @@ y = np.linspace(0, (M1-1)*mic_spacing, M1)
 xv, yv = np.meshgrid(x, y, indexing='xy') 
 mic_coords = np.column_stack([xv.flatten(), yv.flatten(), np.zeros(M)])
 
-# Posiciones en Campo Cercano
-pos_src = [1, 1, 0.5]      # Voz deseada (cerca)
+#Posiciones en Campo Cercano
+pos_src =   [1, 1, 0.5]      # Voz deseada (cerca)
 pos_noise = [-1.5, 2.5, 0.5]   # Voz interferente (cerca)
 
 # --- CARGA DE SEÑALES ---
@@ -155,7 +155,7 @@ f_axis, t_axis, X = signal.stft(array_input, fs=fs, nperseg=n_window, noverlap=n
 Y_stft = np.zeros_like(X[0,:,:], dtype=complex)
 
 # Parámetros Adaptativos
-P = 1
+P = 2
 alpha = 0.95    
 als_iters = 2
 diag_load = 1e-3
