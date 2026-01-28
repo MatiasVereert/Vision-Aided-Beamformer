@@ -3,7 +3,7 @@ from scipy.constants import speed_of_sound
 
 from utils.geometry import source_rotation
 from beamforming.processors import beamforming, snapshots
-from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
+from beamforming.signal_model import near_field_steering_vector, steering_vector
 from propagation.free_field import space_delay
 
 from beamforming.gsc import region_constriant
@@ -158,7 +158,7 @@ def analytical_gain(frecs, fs, mic_array, weights, source_points):
     K = int(M_K / M)
 
     #Caclulate the steering vector for each pointa and frecuency (F, P, KxM)
-    steering_vectors = near_field_steering_vector_multi(frecs, source_points, fs, mic_array, K )
+    steering_vectors = steering_vector(frecs, source_points, fs, mic_array, K )
 
     #hermitian traspoese fo the weights (as dim: 1D no need to transpose)
     w_H = np.conj(weights).flatten()
@@ -191,7 +191,7 @@ def compute_mismatched_ags(
     
     # 1. Calcular TODOS los steering vectors a la vez
     # Shape resultante: (P, N)
-    a_s_all = near_field_steering_vector_multi(f_test, scan_points, fs, mic_array, K).squeeze()
+    a_s_all = steering_vector(f_test, scan_points, fs, mic_array, K).squeeze()
     
     # Asegurar formas correctas si hay un solo punto
     if a_s_all.ndim == 1: a_s_all = a_s_all[np.newaxis, :]
@@ -275,7 +275,7 @@ def compute_ags_vectorized(
     
     # 1. Steering Vectors de todos los puntos de escaneo (P, N)
     # Usamos tu función 'near_field_steering_vector_multi'
-    a_s_all = near_field_steering_vector_multi(f_test, scan_points, fs, mic_array, K).squeeze()
+    a_s_all = steering_vector(f_test, scan_points, fs, mic_array, K).squeeze()
     if a_s_all.ndim == 1: a_s_all = a_s_all[np.newaxis, :]
 
     # 2. Construir cubo de Covarianzas Ruu (P, N, N)

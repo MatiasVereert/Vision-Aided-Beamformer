@@ -1,4 +1,4 @@
-from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi
+from beamforming.signal_model import near_field_steering_vector, steering_vector
 import numpy as np
 from abc import ABC, abstractmethod
 from typing import Tuple

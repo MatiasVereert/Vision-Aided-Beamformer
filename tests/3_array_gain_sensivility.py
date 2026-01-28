@@ -3,7 +3,7 @@ from scipy.constants import speed_of_sound
 from matplotlib import pyplot as plt 
 
 # --- Importaciones de tus módulos ---
-from beamforming.signal_model import near_field_steering_vector_multi
+from beamforming.signal_model import steering_vector
 # ESTA ES TU FUNCIÓN ORIGINAL (BEAMPATTERN)
 from beamforming.evaluation.gain import analytical_gain 
 from beamforming.gsc.weights import compute_fixed_weights_optimized
@@ -51,7 +51,7 @@ print(f"  Foco: {radius:.2f} m @ 90 deg")
 # ==============================================================================
 print("\n--- Diseñando LCMV Puntual ---")
 # Construimos C y h manualmente para un solo punto (Bandwidth narrow para simplicidad de comparación pura)
-sv_focal = near_field_steering_vector_multi(f_test, focal_point, fs, mic_array, K).squeeze()
+sv_focal = steering_vector(f_test, focal_point, fs, mic_array, K).squeeze()
 # C puntual: Parte real e imaginaria del SV focal
 C_point = np.stack([np.real(sv_focal), np.imag(sv_focal)], axis=1) # (N, 2)
 

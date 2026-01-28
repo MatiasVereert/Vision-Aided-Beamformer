@@ -1,7 +1,7 @@
 import numpy as np
 # Asumimos que los nombres de las funciones son los que definimos
 from beamforming.processors import point_constraint, compute_fixed_weights_optimized 
-from beamforming.signal_model import near_field_steering_vector, near_field_steering_vector_multi # Usamos la versión vectorizada
+from beamforming.signal_model import near_field_steering_vector, steering_vector # Usamos la versión vectorizada
 from beamforming.evaluation.gain import synthetic_gain, analytical_gain # Nombres más claros y correctos
 from utils.geometry import source_rotation
 from utils.polar_plot import plot_polar_pattern

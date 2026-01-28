@@ -5,7 +5,7 @@ from scipy.constants import speed_of_sound
 from scipy.io import wavfile
 
 # --- IMPORTACIONES ---
-from beamforming.signal_model import near_field_steering_vector_multi
+from beamforming.signal_model import steering_vector
 from beamforming.gsc.region_constriant import build_region_constraints
 from beamforming.processors import gsc_adaptive_beamformer
 

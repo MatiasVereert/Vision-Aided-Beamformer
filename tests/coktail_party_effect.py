@@ -8,7 +8,7 @@ import os
 # --- Imports del Sistema ---
 # Asegúrate de que las rutas de importación coincidan con tu estructura de carpetas
 from beamforming.array.mic_array import ULA
-from beamforming.system import AdaptiveBeamformer
+from beamforming.gsc.system import AdaptiveBeamformer
 from propagation.free_field import space_delay
 from beamforming.gsc.region_constriant import build_region_constraints
 from beamforming.gsc.weights import compute_fixed_weights_optimized

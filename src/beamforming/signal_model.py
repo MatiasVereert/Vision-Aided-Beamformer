@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.constants import speed_of_sound
 
-def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=speed_of_sound, squeeze = True):
+def steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound, mode = "near_field" , squeeze = True):
     """
     Calcula los steering vectors de campo cercano para múltiples frecuencias y puntos de la fuente.
     Esta versión está corregida para manejar el broadcasting de dimensiones correctamente.
@@ -35,7 +35,8 @@ def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=speed_of_sound
     f_bcast = f.reshape(F, 1, 1, 1)
     phase_term = np.exp(1j * 2 * np.pi * f_bcast * (ref_delay + source_delay_origin[np.newaxis, :, np.newaxis, np.newaxis] - mic_delay[np.newaxis, :, :, np.newaxis] - tap_delays[np.newaxis, np.newaxis, np.newaxis, :]))
     
-    steering_vector = phase_term / mic_distances[np.newaxis, :, :, np.newaxis]
+    if mode == "near_field":
+        steering_vector = phase_term / mic_distances[np.newaxis, :, :, np.newaxis]
     
     # --- Reshape Final (sin cambios) ---
     final_sv = steering_vector.reshape(F, P, M * K)

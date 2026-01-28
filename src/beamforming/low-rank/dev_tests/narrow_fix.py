@@ -48,7 +48,7 @@ def space_delay(signal_in, fs, source_pos, mic_array):
 
 # --- 2. CONSTANTES Y CONFIGURACIÓN ---
 # Imports adicionales necesarios para tu script original
-from beamforming.signal_model import near_field_steering_vector_multi
+from beamforming.signal_model import steering_vector
 
 fs = 48000
 C_SOUND = 343 # Definido aquí para que lo use space_delay
@@ -116,7 +116,7 @@ for k, freq_val in enumerate(f_axis):
         continue
 
     # A. SVD para esta frecuencia
-    sv_k = near_field_steering_vector_multi(freq_val, source_pos, fs, mic_coords, 1)
+    sv_k = steering_vector(freq_val, source_pos, fs, mic_coords, 1)
     steering_m = sv_k.reshape(M1, M2)
     U, S, Vh = np.linalg.svd(steering_m, full_matrices=False)
     

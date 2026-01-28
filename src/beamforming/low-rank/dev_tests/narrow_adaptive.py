@@ -2,7 +2,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 from scipy import signal
 from scipy.io import wavfile
-from beamforming.signal_model import near_field_steering_vector_multi
+from beamforming.signal_model import steering_vector
 
 # --- 1. CONFIGURACIÓN Y FUNCIONES AUXILIARES ---
 
@@ -87,7 +87,7 @@ for k, freq_val in enumerate(f_axis):
     # A. DATOS Y ESTADÍSTICA
     # ----------------------
     # Steering Vector Global (d)
-    d_vec = near_field_steering_vector_multi(freq_val, pos_src, fs, mic_coords, 1)
+    d_vec = steering_vector(freq_val, pos_src, fs, mic_coords, 1)
     
     # Matriz de Covarianza (Phi_v / R) estimada de los datos actuales
     # X_k: (M, TimeFrames)

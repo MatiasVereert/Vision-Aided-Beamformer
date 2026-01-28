@@ -4,40 +4,11 @@ from scipy.io import wavfile
 import os
 import warnings
 C_SOUND = 343.0
-
-
-def near_field_steering_vector_multi(f, Rs, fs, mic_array, K=1, c=343.0, squeeze=True):
-    f = np.atleast_1d(f)
-    Rs = np.atleast_2d(Rs)
-    F = f.shape[0]
-    P_sources = Rs.shape[0]
-    M = mic_array.shape[0]
-    
-    source_dist_origin = np.linalg.norm(Rs, axis=1)
-    mic_distances = np.linalg.norm(Rs[:, np.newaxis, :] - mic_array[np.newaxis, :, :], axis=2)
-    mic_distances = np.maximum(mic_distances, 0.01) 
-
-    mic_delay = mic_distances / c
-    source_delay_origin = source_dist_origin / c
-    T = 1/fs
-    tap_delays = np.arange(K) * T
-    ref_delay = (K - 1) / (2 * fs)
-    
-    f_bcast = f.reshape(F, 1, 1, 1)
-    phase_arg = 2 * np.pi * f_bcast * (ref_delay + source_delay_origin[np.newaxis, :, np.newaxis, np.newaxis] 
-                                       - mic_delay[np.newaxis, :, :, np.newaxis] 
-                                       - tap_delays[np.newaxis, np.newaxis, np.newaxis, :])
-    
-    steering_vector = np.exp(1j * phase_arg) / (mic_distances[np.newaxis, :, :, np.newaxis])
-    final_sv = steering_vector.reshape(F, P_sources, M * K)
-    
-    if squeeze: final_sv = np.squeeze(final_sv)
-    return np.nan_to_num(final_sv)
-
+from beamforming.signal_model import steering_vector
 
 
 # --- 2. CLASE KMVDR RECURSIVA (Lógica del Reference Code) ---
-class LowRankAdaptiveRLS:
+class LowRankAdaptive:
     def __init__(self, mic_array, fs, alpha=0.95):
         self.mic_array = mic_array
         self.fs = fs
@@ -49,8 +20,16 @@ class LowRankAdaptiveRLS:
         self.R_cov = None 
         self.h1 = None
         self.h2 = None
+        self.FPS_rec = 15
 
-    def block_process(self, input_signals, target_pos, M1: int, M2: int, P=2):
+
+
+    def block_process(self, input_signals, target_pos, M1: int, M2: int, P=2, record_scene = True, mode = "near_field"):
+        
+        # Advertencias de compatibilidad campo y rango
+        if P==1 and mode == 'near_field':
+            print("Advertencia: El rango P = 1 es incompatible con campo cercano")
+
         # Normalización
         peak = np.max(np.abs(input_signals))
         if peak > 1e-9: input_signals /= peak
@@ -59,6 +38,8 @@ class LowRankAdaptiveRLS:
         n_window = 1024
         n_overlap = 512
         M = M1 * M2
+
+        
         
         # STFT devuelve: (Mics, Frecuencias, Tiempo) debido a axis=1
         f, t, X = signal.stft(x=input_signals, fs=self.fs, nperseg=n_window, 
@@ -71,6 +52,13 @@ class LowRankAdaptiveRLS:
         X = X.transpose(1, 2, 0)
         
         F_bins, T_frames, _ = X.shape
+
+        #Inicialize the weith recording vector
+        t_frame = n_overlap * 1/ fs
+        rec_per_frame = int( (1/self.FPS_rec)/ t_frame  ) 
+        self.h_record = np.zeros((F_bins, M, int(T_frames/rec_per_frame)+2), dtype = complex)
+        record_idx = 0
+        
         
         # Validación de seguridad para evitar el error confuso
         if F_bins == M: 
@@ -81,7 +69,8 @@ class LowRankAdaptiveRLS:
         Y_stft = np.zeros((F_bins, T_frames), dtype=complex)
 
         # --- A. Steering Vector ---
-        sv = near_field_steering_vector_multi(f, target_pos, self.fs, self.mic_array, 1, squeeze=True)
+
+        sv = steering_vector(f, target_pos, self.fs, self.mic_array, 1, squeeze=True)
         sv = np.nan_to_num(sv)
 
         # --- B. Inicialización de Estado ---
@@ -163,9 +152,20 @@ class LowRankAdaptiveRLS:
                 self.h1 = h1_curr
                 self.h2 = h2_curr
                 
+                
+
                 # Output
                 h_kron = np.einsum('fap, fbp -> fab', self.h1, self.h2)
                 h_total = h_kron.reshape(F_bins, M)
+
+                #record weights
+                resto = t_idx % rec_per_frame
+
+                if record_scene == True and  resto == 0  :
+                    record_idx = record_idx + 1
+                    self.h_record[: , :, record_idx] = h_total
+
+                
                 
                 y_val = h_total.conj()[:, None, :] @ x_t
                 Y_stft[:, t_idx] = y_val[:, 0, 0]
@@ -195,7 +195,7 @@ def load_audio_track(path, target_fs):
         data = np.mean(data, axis=1)
         
     # Resample si es necesario
-    if fs_file != target_fs:
+    if fs_file != target_fs: 
         num_samples = int(len(data) * target_fs / fs_file)
         data = signal.resample(data, num_samples)
         
@@ -286,7 +286,7 @@ if __name__ == "__main__":
     
     print("Procesando con Clase RLS...")
     # INSTANCIAMOS LA NUEVA CLASE
-    bf = LowRankAdaptiveRLS(mic_coords, fs, alpha=0.95)
+    bf = LowRankAdaptive(mic_coords, fs, alpha=0.95)
     
     # PROCESAMOS (P=2 es seguro aquí porque R se adapta bien)
     y_out = bf.block_process(array_input, pos_src, M1, M2, P=2)

@@ -1,6 +1,6 @@
 import numpy as np 
 from scipy.constants import speed_of_sound
-from beamforming.signal_model import near_field_steering_vector_multi 
+from beamforming.signal_model import steering_vector 
 from utils.geometry import cartesian_to_spherical, spherical_to_cartesian
 from typing import Tuple
 
@@ -63,7 +63,7 @@ def build_A_and_g(
 
     # --- 1. Construcción de la Matriz A (Tu código original) ---
     
-    a_tensor_complex = near_field_steering_vector_multi(
+    a_tensor_complex = steering_vector(
         f=freqs, 
         Rs=source_points, 
         fs=fs,

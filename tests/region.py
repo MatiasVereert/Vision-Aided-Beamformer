@@ -4,7 +4,7 @@ from scipy.constants import speed_of_sound
 # --- Importaciones de tu lista ---
 from beamforming.gsc.weights import  compute_fixed_weights_optimized
 from beamforming.gsc.constrains import point_constraint
-from beamforming.signal_model import near_field_steering_vector_multi, near_field_steering_vector
+from beamforming.signal_model import steering_vector, near_field_steering_vector
 from beamforming.evaluation.gain import analytical_gain
 from utils.geometry import source_rotation, cartesian_to_spherical, spherical_to_cartesian
 from utils.polar_plot import plot_polar_pattern
