@@ -3,8 +3,6 @@ import scipy as sc
 from matplotlib import pyplot as plt 
 import json
 
-
-
 class Microphone():
 
     def __init__(self, model="ideal", fs=44800):
@@ -105,7 +103,6 @@ class Microphone():
 
         return array_input
 
-
 if __name__ == "__main__":
 
     from propagation.simulate_acoustics import SimAcoustic
@@ -170,7 +167,6 @@ if __name__ == "__main__":
     # 5. ETAPA 2: EMULACIÓN DE MICRÓFONO (Iterativa)
     print("[Mic] Iniciando emulación de micrófono...")
     microphone = Microphone(model="MP34DT01-M", fs=fs)
-    
 
     signals = microphone.emulate(room_input, show_plots = True)
     save_wav("test_micro.wav",

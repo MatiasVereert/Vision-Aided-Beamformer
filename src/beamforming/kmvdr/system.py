@@ -41,7 +41,6 @@ class LowRankAdaptive:
         M = M1 * M2
 
         
-        
         # STFT devuelve: (Mics, Frecuencias, Tiempo) debido a axis=1
         f, t, X = signal.stft(x=input_signals, fs=self.fs, nperseg=n_window, 
                               noverlap=n_overlap, window='hann', axis=1)
@@ -120,7 +119,7 @@ class LowRankAdaptive:
                 
                 # Opción A: Loading relativo pero con PISO MÍNIMO (Recomendado)
                 # Esto evita que el loading sea cero en silencios
-                min_loading = 1e-6 # Valor pequeño fijo para estabilidad numérica
+                min_loading = 1e-3 # Valor pequeño fijo para estabilidad numérica
                 adaptive_loading = diag_load_factor * tr_R / M
                 
                 # Usamos maximum para que nunca baje del piso
