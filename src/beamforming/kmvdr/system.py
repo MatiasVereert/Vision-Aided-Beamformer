@@ -25,7 +25,8 @@ class LowRankAdaptive:
 
 
     def block_process(self, input_signals, target_pos, M1: int, M2: int, P=2, record_scene = True, mode = "near_field"):
-        
+        fs = self.fs
+
         # Advertencias de compatibilidad campo y rango
         if P==1 and mode == 'near_field':
             print("Advertencia: El rango P = 1 es incompatible con campo cercano")
@@ -35,8 +36,8 @@ class LowRankAdaptive:
         if peak > 1e-9: input_signals /= peak
 
         # Configuración STFT
-        n_window = 1024
-        n_overlap = 512
+        n_window = 256
+        n_overlap = 192
         M = M1 * M2
 
         
@@ -113,9 +114,19 @@ class LowRankAdaptive:
                 update_term = np.matmul(x_t, x_t.conj().transpose(0, 2, 1))
                 self.R_cov = self.alpha * self.R_cov + (1 - self.alpha) * update_term
                 
-                # Loading
+                # --- CORRECCIÓN CRÍTICA: ROBUST DIAGONAL LOADING ---
+                # Calculamos la traza (energía)
                 tr_R = np.real(np.trace(self.R_cov, axis1=1, axis2=2))
-                loading = (diag_load_factor * tr_R / M)[:, None, None]
+                
+                # Opción A: Loading relativo pero con PISO MÍNIMO (Recomendado)
+                # Esto evita que el loading sea cero en silencios
+                min_loading = 1e-6 # Valor pequeño fijo para estabilidad numérica
+                adaptive_loading = diag_load_factor * tr_R / M
+                
+                # Usamos maximum para que nunca baje del piso
+                loading_val = np.maximum(adaptive_loading, min_loading)
+                loading = loading_val[:, None, None]
+                
                 R_loaded = self.R_cov + I_M * loading
 
                 h1_curr = self.h1
@@ -151,8 +162,7 @@ class LowRankAdaptive:
 
                 self.h1 = h1_curr
                 self.h2 = h2_curr
-                
-                
+
 
                 # Output
                 h_kron = np.einsum('fap, fbp -> fab', self.h1, self.h2)
@@ -246,7 +256,6 @@ if __name__ == "__main__":
     t = np.arange(limit)/fs
     
 
-    
     # --- CARGA DE SEÑALES ---
     print("1. Cargando archivos de audio...")
 

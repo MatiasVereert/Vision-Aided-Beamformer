@@ -1,0 +1,22 @@
+{
+  "models": [
+    {
+      "name": "MP34DT01-M",
+      "parameters": {
+        "array_mismatch_dB": 3.0,
+        "phase_mismatch_deg": 5.0,
+        "snr_dB": 61.0
+      },
+      "description": "ST Datasheet based : Sensivility +/- 3dB , avrage SNR 61dB."
+    },
+    {
+      "name": "Ideal_Microphone",
+      "parameters": {
+        "array_mismatch_dB": 0.0,
+        "phase_mismatch_deg": 0.0,
+        "snr_dB": 120.0
+      },
+      "description": "Perfect micrphone with no gain and phase mismatch."
+    }
+  ]
+}

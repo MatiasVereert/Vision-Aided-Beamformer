@@ -123,7 +123,7 @@ class SimAcoustic():
         self._load_audio_struct( audio_path, gain, position, type = "i")
 
 
-    def free_field(self, iSIR_db , normalize = True, mode = "real"):
+    def free_field(self, iSIR_dB , normalize = True, mode = "real"):
         
         #Selects geometry (real/ideal)
         if mode == "real":
@@ -172,7 +172,7 @@ class SimAcoustic():
         source_input_norm = source_delayed / source_rms #Sets the input signal to 0 RMSfs
 
         #Mix signal and interfernce with the desire iSIR
-        iSIR = 10**(iSIR_db / 20)
+        iSIR = 10**(iSIR_dB / 20)
         array_input = source_input_norm  +  interference_input_norm *(1/iSIR)
 
         return array_input
@@ -194,7 +194,7 @@ class SimAcoustic():
 
         if ray_tracing:
             # obtain minimun distance between sensors
-            distances = pdist(mic_coords)
+            distances = pdist(self.real_array)
             min_spacing = np.min(distances[distances > 0])
 
             # get best setings for the room
@@ -337,7 +337,7 @@ if __name__ == "__main__":
     acoustic_scene.set_interference(interference_path1, gain = 1,position =  interf_pos1 )
 
     # FREE FIELD
-    array_input = acoustic_scene.free_field( iSIR_db = 0)
+    array_input = acoustic_scene.free_field( iSIR_dB = 0)
     folder_path = "tests/data"
     save_wav("Array_input.wav", fs, array_input[0], folder_path)
 
