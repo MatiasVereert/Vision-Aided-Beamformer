@@ -12,7 +12,7 @@ if __name__ == "__main__":
     
     # 1. SETUP & GEOMETRY
     fs = 48000
-    mic_spacing = 0.03
+    mic_spacing = 0.05
     folder_path = "tests/data"
     if not os.path.exists(folder_path): os.makedirs(folder_path)
     
@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
     # 3. ACOUSTIC SCENE SETUP
     # Nota: array_mismatch en SimAcoustic es posicional, el error de sensor se añade después con Microphone()
-    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=1e-3, duration=4)
+    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=1e-3, duration=8)
     room_dimensions = np.array([2.5, 4, 2.5])
 
     # Load audio files
@@ -63,7 +63,7 @@ if __name__ == "__main__":
     acoustic_scene.set_interference(int_path2, gain=1, position=interf_pos2)
 
     # 4. BEAMFORMER & MICROPHONE INSTANTIATION
-    bf = LowRankAdaptive(mic_coords, fs, alpha=0.97)
+    bf = LowRankAdaptive(mic_coords, fs, alpha=0.96)
     target_pos_flat = source_pos.flatten()
     Rank_P = 1
     
@@ -81,7 +81,7 @@ if __name__ == "__main__":
         room_input_raw = np.load(cache_file)
     else:
         print("[Cache] MISS: Computando simulación de sala (esto puede tardar)...")
-        room_input_raw = acoustic_scene.compute_room_ISB(room_dimensions, desire_RT=1, iSIR_dB=5)
+        room_input_raw = acoustic_scene.compute_room_ISB(room_dimensions, desire_RT=.5, iSIR_dB=0)
         np.save(cache_file, room_input_raw)
         print(f"[Cache] Simulación guardada en {cache_file}")
 
@@ -99,7 +99,8 @@ if __name__ == "__main__":
         target_pos=target_pos_flat, 
         M1=M1, M2=M2, P=Rank_P,
         record_scene=True,
-        mode="near_field"
+        mode="near_field",
+        min_loading = 1e-4
     )
 
     # Save Output
@@ -126,7 +127,8 @@ if __name__ == "__main__":
         target_pos=target_pos_flat, 
         M1=M1, M2=M2, P=Rank_P,
         record_scene=True, 
-        mode="near_field"
+        mode="near_field",
+        min_loading = 1e-4
     )
 
     # Save Output

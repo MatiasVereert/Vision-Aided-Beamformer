@@ -1,108 +1,173 @@
-import numpy as np 
-import scipy as sc 
-from matplotlib import pyplot as plt 
+import numpy as np
+import scipy.signal as signal
+import scipy.fft as fft
 import json
+import matplotlib.pyplot as plt
 
 class Microphone():
 
     def __init__(self, model="ideal", fs=44800):
         self.fs = fs 
-        # LOAD MODELS 
-        with open('src/beamforming/array/models.json', 'r') as f:
-            data = json.load(f)
+        
+        # --- 1. CARGA DE MODELOS ---
+        # Ajusta la ruta si es necesario
+        try:
+            with open('src/beamforming/array/models.json', 'r') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print("Error: No se encontró 'src/beamforming/array/models.json'.")
+            raise
 
-        # 1. Crear un diccionario de búsqueda (Lookup Table)
-        # Convertimos la lista de modelos en un diccionario donde la clave es el 'name'
         models_dict = {m["name"]: m for m in data["models"]}
 
-        names = list(models_dict.keys())
-
-        # AGREGAR IMPORTACION
-        if model not in names:
-            print("Model not found, the avalable list is:")
-            print(names)
-        else: 
-            self.model = model
-            # 2. Seleccionar el objeto del modelo
-            target_model_data = models_dict[model]
-            
-            # 3. Acceder a la sub-clave 'parameters' (según tu JSON)
-            params = target_model_data["parameters"]
-
-            #save an convert to standar deviation MDE/3
-            self.gain_mismatch = params["array_mismatch_dB"] /3
-            self.phase_mismatch_deg = params["phase_mismatch_deg"] /3
-            self.snr_dB = params["snr_dB"] 
-    
-    def emulate(self, array_input, show_plots = False):
-        '''
-            This mode emulates the respose of the microphone adding the most 
-            important caracteristics that afect the beamforming performance, including
-            noise, gain and phase mismatch.
-
-            Arguments:
-                array_input (np.array) : Audio signals with shape (M, N_len )
-                fs (int): sample rate
-            Returns:
-                array_input
-        '''
-        # 1  -----   Apply Gain Mismatch
-        M = np.shape(array_input[:,0])
-        random_gain_dB = np.random.normal(loc =0, scale = self.gain_mismatch, size = M)
-        random_gain = 10**(random_gain_dB / 20 )
-        random_phase = np.random.normal(loc =0, scale = self.phase_mismatch_deg , size = M)
-        random_phase_rad = np.deg2rad( random_phase)
-
-        # unify in a phasor
-        unitary_phasor = np.exp(1j * random_phase_rad)
-        mismatch_phasor = random_gain * unitary_phasor
-
-        #Transform to frecuency domain to apply phase deviation with acurracy
-        array_input_f = sc.fft.rfft(array_input, axis = 1)
-
-        #Apply mismatchs
-        array_input_f = array_input_f * mismatch_phasor[ :, np.newaxis]
+        if model not in models_dict:
+            raise ValueError(f"Model not found. Available: {list(models_dict.keys())}")
         
-        #Transform to time
-        array_input = np.fft.irfft(array_input_f, axis = 1)
+        target_model_data = models_dict[model]
+        params = target_model_data["parameters"]
+
+        # Guardamos parámetros estadísticos (asumiendo que el JSON trae valores máx o 3-sigma)
+        self.std_gain_dB = params["array_mismatch_dB"] / 3
+        self.std_phase_deg = params["phase_mismatch_deg"] / 3
+        self.snr_dB = params["snr_dB"]
         
-        # 2 ---- Add Gaussian noise acording to the SNR  
-        noise_signals = np.random.normal(loc =0, scale = 1, size = np.shape(array_input))#shape( M, N_samples)
+        # --- 2. PERSISTENCIA DEL MISMATCH ---
+        # Se inicializan vacíos y se calculan en la primera llamada a emulate
+        self.fixed_gain_mismatch = None
+        self.fixed_phase_mismatch = None
+        self.last_M = 0
 
-        #Measure Signal power
-        input_rms = np.sqrt(np.mean(array_input**2))
-        snr = 10**( self.snr_dB /20)
-        n_gain = input_rms / snr
-        array_input = array_input + noise_signals * n_gain
-        
-        # --- filtrate signals bandwid
-        # Filter parameters
-        f_min = 100
-        f_max = 8000
-        band = [f_min, f_max]
+        # --- 3. DISEÑO DEL FILTRO FIR (Pasa-Banda 100Hz - 8kHz) ---
+        # Se calcula una sola vez al instanciar para ahorrar cómputo
+        f_min, f_max = 100, 8000
+        attenuation = 50 # dB
+        gap = 50 # Hz (Transition width)
 
-        attenuation = 50
-        gap = 50
+        # Longitud del filtro FIR (Estimación para cumplir la atenuación)
+        n_taps = int(attenuation * self.fs / (22 * gap))
+        if n_taps % 2 == 0: n_taps += 1 # Impar es preferible para FIR
 
-        # Define lenght of the FIR filter
-        n_tabs = int( attenuation * self.fs / (22 *gap))
         edges = [0, f_min - gap, f_min, f_max, f_max + gap, 0.5 * self.fs]
-        tabs = sc.signal.remez(n_tabs, edges, [0, 1, 0], fs = self.fs )
+        
+        # Coeficientes del filtro (b)
+        self.taps = signal.remez(n_taps, edges, [0, 1, 0], fs=self.fs)
+        # En filtros FIR, el denominador 'a' es siempre 1.0
+        self.a = 1.0
 
-        # Apply the filter 
-        array_input = sc.signal.lfilter(tabs, 1.0, array_input, axis = 1)
+    def _apply_mismatch(self, array_input):
+        """
+        Aplica ganancia y fase aleatoria fija a los micrófonos.
+        Simula el error de fabricación del hardware.
+        """
+        M = array_input.shape[0]
 
-        # Plot spectrogram
+        # Si cambia la cantidad de mics o es la primera vez, generamos el perfil
+        if self.fixed_gain_mismatch is None or self.last_M != M:
+            # Ganancia (Distribución Log-Normal)
+            random_gain_dB = np.random.normal(loc=0, scale=self.std_gain_dB, size=M)
+            self.fixed_gain_mismatch = 10**(random_gain_dB / 20)
+            
+            # Fase (Convertimos a fasor complejo unitario)
+            random_phase = np.random.normal(loc=0, scale=self.std_phase_deg, size=M)
+            random_phase_rad = np.deg2rad(random_phase)
+            self.fixed_phase_mismatch = np.exp(1j * random_phase_rad)
+            
+            self.last_M = M
+
+        # 1. Aplicar Mismatch de Ganancia
+        # Broadcasting: (M,) * (M, N)
+        signal_gain = array_input * self.fixed_gain_mismatch[:, np.newaxis]
+
+        # 2. Aplicar Mismatch de Fase (Vía FFT para precisión en banda ancha)
+        signal_f = fft.rfft(signal_gain, axis=1)
+        signal_f = signal_f * self.fixed_phase_mismatch[:, np.newaxis]
+        signal_out = fft.irfft(signal_f, axis=1)
+        
+        return signal_out
+
+    def _measure_in_band_rms(self, signal_in):
+        """
+        Filtra temporalmente una copia de la señal para medir su energía útil.
+        No modifica la señal original.
+        """
+        # Filtramos copia de la señal solo para medir
+        sig_filtered = signal.lfilter(self.taps, self.a, signal_in, axis=1)
+        # Medimos RMS
+        return np.sqrt(np.mean(sig_filtered**2))
+
+    def emulate(self, array_input, show_plots=False):
+        '''
+        Simula la respuesta del array:
+        1. Aplica Mismatch a la señal de entrada (Broadband).
+        2. Genera Ruido Blanco y lo filtra (Band-limited).
+        3. Ajusta la ganancia del ruido basándose en el SNR "En Banda".
+        4. Retorna Señal (con mismatch) + Ruido (filtrado y escalado).
+        
+        Arguments:
+            array_input (np.array) : Audio signals with shape (M, N_samples)
+        Returns:
+            np.array: Señal con imperfecciones y ruido añadido.
+        '''
+        M, N_samples = array_input.shape
+
+        # --- 1. APLICAR MISMATCH ---
+        # Afecta a la señal acústica entrante (Banda ancha)
+        array_input_mismatched = self._apply_mismatch(array_input)
+        
+        # --- 2. MEDIR RMS DE LA SEÑAL ÚTIL ---
+        # Filtramos la señal solo para saber cuánta energía hay en 100Hz-8kHz
+        # Esto evita que el ruido de baja freq (rumble) afecte el cálculo del SNR
+        signal_rms_in_band = self._measure_in_band_rms(array_input_mismatched)
+        
+        if signal_rms_in_band > 0:
+            # --- 3. GENERAR RUIDO ---
+            # Ruido blanco crudo
+            noise_raw = np.random.normal(loc=0, scale=1, size=(M, N_samples))
+            
+            # --- 4. FILTRAR EL RUIDO ---
+            # El ruido eléctrico se limita al ancho de banda del sistema
+            noise_filtered = signal.lfilter(self.taps, self.a, noise_raw, axis=1)
+            
+            # --- 5. CALCULAR GANANCIA DEL RUIDO ---
+            # Medimos RMS del ruido YA filtrado
+            noise_rms_in_band = np.sqrt(np.mean(noise_filtered**2))
+            
+            # Objetivo: SNR = Signal_Band / Noise_Band
+            target_noise_rms = signal_rms_in_band / (10**(self.snr_dB / 20))
+            
+            # Factor de escalado
+            gain_factor = target_noise_rms / (noise_rms_in_band + 1e-12)
+            
+            # --- 6. SUMA FINAL ---
+            # Señal (Mismatched) + Ruido (Filtrado y Escalado)
+            array_output = array_input_mismatched + (noise_filtered * gain_factor)
+        else:
+            # Si la entrada es silencio digital
+            array_output = array_input_mismatched
+
+        # --- PLOTTING ---
         if show_plots:
-            plt.specgram(array_input[0,:], Fs=fs, cmap='viridis')
-            plt.title('Espectrograma')
+            plt.figure(figsize=(10, 5))
+            
+            # Subplot 1: Señal temporal
+            plt.subplot(2, 1, 1)
+            plt.plot(array_output[0, :], label='Mic 0 Output')
+            plt.title('Señal Temporal (Mic 0)')
+            plt.grid(True)
+            plt.legend()
+
+            # Subplot 2: Espectrograma
+            plt.subplot(2, 1, 2)
+            plt.specgram(array_output[0,:], Fs=self.fs, cmap='viridis', NFFT=1024, noverlap=512)
+            plt.title(f'Espectrograma (SNR Target: {self.snr_dB} dB en banda)')
             plt.ylabel('Frecuencia [Hz]')
             plt.xlabel('Tiempo [seg]')
             plt.colorbar(label='Intensidad [dB]')
+            
+            plt.tight_layout()
             plt.show()
 
-        return array_input
-
+        return array_output
 if __name__ == "__main__":
 
     from propagation.simulate_acoustics import SimAcoustic
