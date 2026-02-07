@@ -51,16 +51,17 @@ class LowRankAdaptive:
         y = signal.lfilter(tabs, 1.0, x, axis = 1)
 
         return y
-
-    def block_process(self, input_signals, 
-                      target_pos, M1: int, M2: int, P=2,
-                      record_scene =True, mode="near_field", VAD=False,
-                      min_loading = 1e-4): #1e-4 
-        #Filter input 
+    
+    def block_process(self, 
+                  input_signals, 
+                  target_pos, M1: int, M2: int, P=2,
+                  record_scene=True, mode="near_field", VAD=False,
+                  min_loading=1e-6): # Bajamos el min_loading para permitir convergencia fina
+        
+        # Filter input 
         input_signals = self._band_pass_filter(input_signals)
 
-        # ... (Tu código de configuración inicial igual que antes) ...
-        if P==1 and mode == 'near_field':
+        if P == 1 and mode == 'near_field':
             print("Advertencia: El rango P = 1 es incompatible con campo cercano")
 
         peak = np.max(np.abs(input_signals))
@@ -74,7 +75,7 @@ class LowRankAdaptive:
         X = X.transpose(1, 2, 0) # (F, T, M)
         F_bins, T_frames, _ = X.shape
 
-        # Inicialización de grabación más segura
+        # Inicialización de grabación
         if record_scene:
             t_frame = n_overlap / self.fs
             estimated_records = int(T_frames / (self.fs/n_overlap / self.FPS_rec)) + 10
@@ -82,22 +83,29 @@ class LowRankAdaptive:
         record_idx = 0
 
         Y_stft = np.zeros((F_bins, T_frames), dtype=complex) 
-        sv = steering_vector(f, target_pos, self.fs, self.mic_array, 1, squeeze=True)
-
+        sv = steering_vector(f, target_pos, self.fs, self.mic_array, 1, squeeze=True, mode="far_field")
         sv = np.nan_to_num(sv) 
 
+        # --- INICIALIZACIÓN DE ESTADO ---
         if self.R_cov is None:
-             # Tu inicialización original...
              self.R_cov = np.zeros((F_bins, M, M), dtype=complex)
              self.R_cov[:] = np.eye(M)[None, :, :] * 1e-5
-             # ... inicialización h1, h2 ...
-             self.h1 = np.random.randn(F_bins, M1, P) + 1j*np.random.randn(F_bins, M1, P) # Placeholder
-             self.h2 = np.random.randn(F_bins, M2, P) + 1j*np.random.randn(F_bins, M2, P) # Placeholder
+             self.h1 = np.random.randn(F_bins, M1, P) + 1j*np.random.randn(F_bins, M1, P)
+             self.h2 = np.random.randn(F_bins, M2, P) + 1j*np.random.randn(F_bins, M2, P)
+             
+             # [NUEVO] Inicializamos el factor de carga adaptativo
+             # Empezamos con un valor conservador (0.1) para evitar soplido al inicio
+             self.current_delta = np.ones((F_bins, 1, 1)) * 0.1
 
         I_M = np.eye(M)[None, :, :] 
-        diag_load_factor = 1e-4 # Un poco más alto para estabilidad inicial
 
-        print(f"   -> Procesando {T_frames} tramas con VAD...")
+        # --- PARÁMETROS DEL LAZO DE CONTROL (WNG) ---
+        target_wng_dB = -8.0                # Objetivo de robustez (industria estándar)
+        target_wng_lin = 10**(target_wng_dB/10)
+        step_up = 1.05                      # Subir 5% si estamos en peligro
+        step_down = 0.98                    # Bajar 2% si estamos sobrados
+
+        print(f"   -> Procesando {T_frames} tramas con Robustez Adaptativa...")
 
         with np.errstate(all='ignore'):
 
@@ -105,35 +113,32 @@ class LowRankAdaptive:
 
                 x_t = X[:, t_idx, :, None] # (F, M, 1)
 
-                # --- 1. VAD CHECK (Banda Ancha) ---
-                # Calculamos energía promedio de todos los mics en este instante
-                # Sumamos la energía de todas las frecuencias y mics
-                current_energy = np.mean(np.abs(x_t)**2)
-                
-
-
-                # --- 2. ACTUALIZACIÓN CONDICIONAL DE R ---
-                # SOLO actualizamos si es RUIDO (is_speech es False)
-                
+                # --- 1. VAD / ACTUALIZACIÓN R ---
+                # Nota: Mantengo tu lógica actual. Idealmente aquí iría el "if not is_speech"
                 update_term = np.matmul(x_t, x_t.conj().transpose(0, 2, 1))
                 self.R_cov = self.alpha * self.R_cov + (1 - self.alpha) * update_term
                 
-                # --- 3. ROBUST DIAGONAL LOADING (Siempre se aplica para invertir) ---
+                # --- 2. APLICAR LOADING ADAPTATIVO (Pre-Cálculo) ---
+                # Usamos self.current_delta que viene de la iteración anterior (o init)
                 tr_R = np.real(np.trace(self.R_cov, axis1=1, axis2=2))
                 
-                adaptive_loading = diag_load_factor * tr_R / M
-                loading = np.maximum(adaptive_loading, min_loading)[:, None, None]
+                # Normalizamos por la traza (potencia media) para que delta sea relativo
+                # Shape broadcast: (F, 1, 1) * (F, 1, 1)
+                adaptive_loading = self.current_delta * (tr_R[:, None, None] / M)
+                
+                # Aseguramos un piso mínimo numérico
+                loading = np.maximum(adaptive_loading, min_loading)
                 
                 R_loaded = self.R_cov + I_M * loading
 
-                # --- 4. OPTIMIZACIÓN ALS (Igual que tu código) ---
+                # --- 3. OPTIMIZACIÓN ALS ---
                 h1_curr, h2_curr = self.h1, self.h2
                 
                 for _ in range(self.ALS_iterations):
                     # Paso h1
                     H2 = np.einsum('ab, fcp -> facbp', np.eye(M1), h2_curr).reshape(F_bins, M, M1 * P)
                     Phi_y2 = H2.conj().transpose(0, 2, 1) @ R_loaded @ H2
-                    d_2 = H2.conj().transpose(0, 2, 1) @ sv[:, :, None] # Asumiendo sv disponible
+                    d_2 = H2.conj().transpose(0, 2, 1) @ sv[:, :, None]
                     
                     h1_flat = np.linalg.pinv(Phi_y2, rcond=1e-5) @ d_2
                     den = d_2.conj().transpose(0, 2, 1) @ h1_flat
@@ -156,64 +161,29 @@ class LowRankAdaptive:
                 # Construcción del filtro final
                 h_total = np.einsum('fap, fbp -> fab', self.h1, self.h2).reshape(F_bins, M)
 
-                # Grabación segura
-                rec_stride = int(self.fs / n_overlap / self.FPS_rec)
-                if record_scene and (t_idx % rec_stride == 0):
-                    if record_idx < self.h_record.shape[2]:
+                # --- 4. FEEDBACK LOOP (NUEVO) ---
+                # Calculamos el WNG real obtenido con estos pesos
+                # WNG = 1 / ||w||^2 (asumiendo ganancia unitaria en look direction)
+                w_norm2 = np.sum(np.abs(h_total)**2, axis=1)[:, None, None] # (F, 1, 1)
+                current_wng = 1.0 / (w_norm2 + 1e-12)
+                
+                # Lógica de Control:
+                # Si WNG < target -> Peligro -> Subir Loading (STEP_UP)
+                # Si WNG > target -> Seguro  -> Bajar Loading (STEP_DOWN)
+                factor = np.where(current_wng < target_wng_lin, step_up, step_down)
+                
+                # Actualizamos y limitamos para seguridad
+                self.current_delta *= factor
+                self.current_delta = np.clip(self.current_delta, 1e-6, 1.0)
+
+                # --- 5. Grabación y Filtrado ---
+                if record_scene:
+                    rec_stride = int(self.fs / n_overlap / self.FPS_rec)
+                    if (t_idx % rec_stride == 0) and (record_idx < self.h_record.shape[2]):
                         self.h_record[:, :, record_idx] = h_total
                         record_idx += 1
 
-                # Filtrado
                 Y_stft[:, t_idx] = (h_total.conj()[:, None, :] @ x_t)[:, 0, 0]
 
         _, y_out = signal.istft(Y_stft, fs=self.fs, window='hann', nperseg=n_window, noverlap=n_overlap)
         return y_out
-
-def load_audio_track(path, target_fs):
-    """Carga, normaliza y remuestrea un archivo de audio."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No se encontró el archivo: {path}")
-        
-    fs_file, data = wavfile.read(path)
-    
-    # Conversión a float [-1, 1]
-    if data.dtype == np.int16:
-        data = data / 32768.0
-    elif data.dtype == np.int32:
-        data = data / 2147483648.0
-    else:
-        data = data.astype(float)
-        data = data / np.max(np.abs(data)) if np.max(np.abs(data)) > 0 else data
-
-    # Conversión a Mono
-    if data.ndim > 1:
-        data = np.mean(data, axis=1)
-        
-    # Resample si es necesario
-    if fs_file != target_fs: 
-        num_samples = int(len(data) * target_fs / fs_file)
-        data = signal.resample(data, num_samples)
-        
-    return data
-
-
-def space_delay(src_signal, fs, pos_src, mic_array, c=343.0):
-    n_mics = mic_array.shape[0]
-    n_samples = len(src_signal)
-    
-    diff = mic_array - np.array(pos_src)
-    dists = np.linalg.norm(diff, axis=1)
-    dists = np.maximum(dists, 0.05) # Distancia mínima 5cm
-    
-    delays = dists / c
-    output = np.zeros((n_mics, n_samples))
-    
-    N = len(src_signal)
-    X = np.fft.rfft(src_signal)
-    freqs = np.fft.rfftfreq(N, d=1/fs)
-    
-    for m in range(n_mics):
-        phase_shift = np.exp(-1j * 2 * np.pi * freqs * delays[m])
-        output[m, :] = np.fft.irfft(X * phase_shift, n=N)
-        
-    return output, dists

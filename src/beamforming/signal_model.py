@@ -37,6 +37,9 @@ def steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound, mode = "near_fi
     
     if mode == "near_field":
         steering_vector = phase_term / mic_distances[np.newaxis, :, :, np.newaxis]
+    else:#far field case
+        steering_vector = phase_term
+
     
     # --- Reshape Final (sin cambios) ---
     final_sv = steering_vector.reshape(F, P, M * K)
