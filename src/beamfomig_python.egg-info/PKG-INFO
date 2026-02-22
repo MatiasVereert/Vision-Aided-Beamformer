@@ -8,5 +8,6 @@ Description-Content-Type: text/markdown
 Requires-Dist: numpy
 Requires-Dist: scipy
 Requires-Dist: matplotlib
+Requires-Dist: pyroomacoustics
 
 # Vision-Aided-Beamformer

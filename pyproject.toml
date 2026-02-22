@@ -17,6 +17,7 @@ dependencies = [
     "numpy",
     "scipy",
     "matplotlib", # Si usas plot_utils
+    "pyroomacoustics"
 ]
 
 [tool.setuptools.packages]

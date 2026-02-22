@@ -5,13 +5,46 @@ src/beamfomig_python.egg-info/SOURCES.txt
 src/beamfomig_python.egg-info/dependency_links.txt
 src/beamfomig_python.egg-info/requires.txt
 src/beamfomig_python.egg-info/top_level.txt
-src/beamforming/LCMV.py
 src/beamforming/__init__.py
-src/beamforming/beamformer_core.py
-src/beamforming/draft.py
+src/beamforming/processors.py
+src/beamforming/signal_model.py
+src/beamforming/array/mic_array.py
+src/beamforming/array/microphone.py
+src/beamforming/dereverberation/__init__.py
+src/beamforming/dereverberation/gwpe.py
+src/beamforming/dereverberation/wpe.py
+src/beamforming/evaluation/__init__.py
+src/beamforming/evaluation/array_sensitivity_gain.py
+src/beamforming/evaluation/gain.py
+src/beamforming/gsc/__init__.py
+src/beamforming/gsc/adaptive.py
+src/beamforming/gsc/constrains.py
+src/beamforming/gsc/region_constriant.py
+src/beamforming/gsc/system.py
+src/beamforming/gsc/weights.py
+src/beamforming/kmvdr/__init__.py
+src/beamforming/kmvdr/system copy 2.py
+src/beamforming/kmvdr/system copy.py
+src/beamforming/kmvdr/system.py
+src/beamforming/kmvdr/dev_tests/MVDR.py
+src/beamforming/kmvdr/dev_tests/adaptive_far_field.py
+src/beamforming/kmvdr/dev_tests/adaptive_near_field.py
+src/beamforming/kmvdr/dev_tests/adaptive_nearfield_voice.py
+src/beamforming/kmvdr/dev_tests/narrow_adaptive.py
+src/beamforming/kmvdr/dev_tests/narrow_adaptive_v1.py
+src/beamforming/kmvdr/dev_tests/narrow_fix.py
 src/propagation/__init__.py
 src/propagation/free_field.py
 src/propagation/image_source.py
+src/propagation/room_convolution.py
+src/propagation/simulate_acoustics.py
 src/utils/__init__.py
+src/utils/audio.py
+src/utils/data_loader.py
 src/utils/geometry.py
+src/utils/plot.py
 src/utils/polar_plot.py
+tests/test_integration.py
+tests/test_room wpe copy.py
+tests/test_room wpe.py
+tests/test_room.py

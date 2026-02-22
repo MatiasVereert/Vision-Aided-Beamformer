@@ -6,50 +6,45 @@ from beamforming.kmvdr.system import LowRankAdaptive
 from propagation.simulate_acoustics import SimAcoustic
 from beamforming.array.microphone import Microphone
 from utils.audio import save_wav
-import matplotlib.pyplot as plt # Import local para no ensuciar el header si no se usa siempre
+from beamforming.dereverberation.wpe import apply_wpe 
+import matplotlib.pyplot as plt 
+
+from beamforming.dereverberation.gwpe import batch_dereverb
 
 def plot_scene_3d(room_dims, mics, target, interferences_list, save_path):
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
 
     # 1. Dibujar Micrófonos
-    # Asumimos que mics es (M, 3)
     ax.scatter(mics[:,0], mics[:,1], mics[:,2], c='blue', marker='.', s=50, label='Mic Array', depthshade=False)
 
     # 2. Dibujar Target
     target = target.flatten()
     ax.scatter(target[0], target[1], target[2], c='green', marker='*', s=200, label='Target Source', edgecolors='black')
-    # Línea guía desde el suelo al target para referencia visual
     ax.plot([target[0], target[0]], [target[1], target[1]], [0, target[2]], 'g--', alpha=0.3)
 
     # 3. Dibujar Interferencias
     for i, interf in enumerate(interferences_list):
         interf = interf.flatten()
         ax.scatter(interf[0], interf[1], interf[2], c='red', marker='X', s=100, label=f'Interference {i+1}')
-        # Línea guía
         ax.plot([interf[0], interf[0]], [interf[1], interf[1]], [0, interf[2]], 'r--', alpha=0.3)
 
-    # 4. Configurar la Sala (Límites)
+    # 4. Configurar la Sala
     ax.set_xlim([0, room_dims[0]])
     ax.set_ylim([0, room_dims[1]])
     ax.set_zlim([0, room_dims[2]])
 
-    # Etiquetas y Título
     ax.set_xlabel('X [m] (Ancho)')
     ax.set_ylabel('Y [m] (Largo)')
     ax.set_zlabel('Z [m] (Alto)')
     ax.set_title(f'Geometría de Simulación\nRoom: {room_dims}m | RT60: {RT}s')
-    
-    # Leyenda
     ax.legend(loc='upper left', bbox_to_anchor=(0, 1))
 
-    # Ajustar relación de aspecto para que la sala no se vea deformada
     try:
         ax.set_box_aspect((room_dims[0], room_dims[1], room_dims[2]))
     except AttributeError:
-        pass # Matplotlib muy viejo, ignorar
+        pass 
 
-    # Guardar
     filename = os.path.join(save_path, "scene_setup_3d.png")
     plt.tight_layout()
     plt.savefig(filename, dpi=150)
@@ -62,17 +57,16 @@ ALPHA = 0.99
 MIN_LOADING = 1e-9    
 RANK_P = 1           
 M1, M2 = 3, 4         
-RT = 0.2               
+RT = .6          
 
-# [NUEVO] Posición de la fuente RELATIVA al centro del array (x, y, z)
-# Antes era fijo en [0.9, 0.0, 0.1]
+# Parámetros GWPE
+K_GWPE = 20
+
+# Posición de la fuente RELATIVA al centro del array
 SRC_REL_POS = [.4, .1, 0.1] 
 
 def ensure_folder(base_path, p, m1, m2, alpha, RT, loading, src_pos):
-    """Crea una subcarpeta incluyendo la posición de la fuente en el nombre."""
-    # Formateamos la posición para que sea amigable con el sistema de archivos (ej: 0.9_0.0_0.1)
     pos_str = f"{src_pos[0]}_{src_pos[1]}_{src_pos[2]}"
-    
     folder_name = f"P={p}_M={m1}x{m2}_RT={RT}_Src={pos_str}_Alpha={alpha}"
     full_path = os.path.join(base_path, folder_name)
     if not os.path.exists(full_path):
@@ -85,8 +79,6 @@ if __name__ == "__main__":
     
     # 1. SETUP DE CARPETAS
     base_data_path = "tests/data"
-    
-    # [MODIFICADO] Pasamos SRC_REL_POS a la función de carpeta
     output_folder = ensure_folder(base_data_path, RANK_P, M1, M2, ALPHA, RT, MIN_LOADING, SRC_REL_POS)
     print(f"[IO] Los resultados se guardarán en: {output_folder}")
     
@@ -97,12 +89,12 @@ if __name__ == "__main__":
 
     # 2. GEOMETRÍA DEL ARRAY
     mic_spacing = 0.03
-    Mx, My, Mz = M1, M2, 1  
+    Mx, My, Mz = M1, M2, 1                                                                          
     M = Mx * My * Mz 
     
     x = np.linspace(0, (Mx-1)*mic_spacing, Mx)
     y = np.linspace(0, (My-1)*mic_spacing, My)
-    z = np.array([0.0])
+    z = np.array([0.0]) 
     xv, yv, zv = np.meshgrid(x, y, z, indexing='xy') 
     mic_coords = np.column_stack([xv.flatten(), yv.flatten(), zv.flatten()])
 
@@ -111,12 +103,9 @@ if __name__ == "__main__":
     mic_coords = mic_coords - np.mean(mic_coords, axis=0) + array_center
     
     # 3. POSICIONES DE FUENTES
-    # [MODIFICADO] Usamos el parámetro configurado arriba
     source_pos = array_center + np.array(SRC_REL_POS)
-    
     interf_pos1 = array_center + np.array([0.0, 1.2, 0.0])
     interf_pos2 = array_center + np.array([-0.6, 0.6, 0.0])
-    
     target_pos_flat = source_pos.flatten()
 
     # 4. CONFIGURACIÓN DE ESCENA ACÚSTICA
@@ -139,46 +128,33 @@ if __name__ == "__main__":
     # =========================================================================
     print("\n--- [A] PROCESAMIENTO CAMPO REVERBERANTE ---")
     
-    # --- [NUEVO LOGICA DE CACHÉ INTELIGENTE] ---
     current_sim_params = {
-        "M1": M1,
-        "M2": M2,
-        "RT": RT,
-        "FS": FS,
-        "mic_spacing": mic_spacing,
-        "source_rel_pos": SRC_REL_POS  # [MODIFICADO] Agregado al JSON de control
+        "M1": M1, "M2": M2, "RT": RT, "FS": FS,
+        "mic_spacing": mic_spacing, "source_rel_pos": SRC_REL_POS
     }
 
     use_cache = False
-    
     if os.path.exists(cache_file_data) and os.path.exists(cache_file_meta):
         try:
             with open(cache_file_meta, 'r') as f:
                 cached_params = json.load(f)
-            
-            # Comparación exacta de listas y números
             if cached_params == current_sim_params:
-                print(f"[Cache] HIT: Parámetros coinciden (Inc. Posición Fuente). Cargando...")
+                print(f"[Cache] HIT: Parámetros coinciden. Cargando...")
                 use_cache = True
             else:
                 print(f"[Cache] MISS: Cambio detectado en parámetros.")
-                print(f"   Cache:  {cached_params.get('source_rel_pos', 'N/A')}")
-                print(f"   Actual: {SRC_REL_POS}")
         except Exception as e:
-            print(f"[Cache] Error leyendo metadatos ({e}). Recalculando...")
+            print(f"[Cache] Error leyendo metadatos. Recalculando...")
             use_cache = False
     else:
         print("[Cache] MISS: No existe caché previo.")
 
-    # A.1 Obtención o Cálculo
     if use_cache:
         room_input_ideal = np.load(cache_file_data)
     else:
-        print("  -> Calculando simulación de sala (esto puede tardar)...")
+        print("  -> Calculando simulación de sala...")
         room_input_ideal = acoustic_scene.compute_room_ISB(room_dimensions, desire_RT=RT, iSIR_dB=0)    
-        
         np.save(cache_file_data, room_input_ideal)
-        
         with open(cache_file_meta, 'w') as f:
             json.dump(current_sim_params, f)
         print("  -> Simulación guardada en caché.")
@@ -218,7 +194,7 @@ if __name__ == "__main__":
     # =========================================================================
     print("\n--- [B] PROCESAMIENTO CAMPO LIBRE ---")
     
-    # B.1 Generar Señal Base (Ideal)
+    # B.1 Generar Señal Base
     ff_input_ideal = acoustic_scene.free_field(iSIR_dB=0, normalize=True, mode="real")
     save_wav("4_input_freefield_IDEAL.wav", FS, ff_input_ideal[0], output_folder)
 
@@ -247,82 +223,85 @@ if __name__ == "__main__":
     )
     save_wav("6_output_freefield_MIC.wav", FS, out_ff_mic, output_folder)
 
-    # Ejecutar visualización
+    # =========================================================================
+    # PARTE C: DEREVERBERACIÓN (WPE) + BEAMFORMING
+    # =========================================================================
+    print("\n--- [C] PROCESAMIENTO CON DEREVERBERACIÓN (WPE) ---")
+
+    # --- C.1 Caso Micrófonos Reales (WPE + Beamformer) ---
+    print("  -> [MIC] Aplicando WPE a 'room_input_mic'...")
+    room_input_wpe_mic = apply_wpe(room_input_mic, FS, taps=10, delay=3, iterations=3)
+    save_wav("7a_input_room_WPE_MIC.wav", FS, room_input_wpe_mic[0], output_folder)
+
+    print("  -> [MIC] Procesando señal WPE con Beamformer...")
+    bf_wpe_mic = LowRankAdaptive(mic_coords, FS, alpha=ALPHA)
+    out_room_wpe_mic = bf_wpe_mic.block_process(
+        input_signals=room_input_wpe_mic,
+        target_pos=target_pos_flat,
+        M1=M1, M2=M2, P=RANK_P,
+        mode="near_field",
+        min_loading=MIN_LOADING
+    )
+    save_wav("8a_output_room_WPE_MIC.wav", FS, out_room_wpe_mic, output_folder)
+
+    # --- C.2 Caso Micrófonos Ideales (WPE + Beamformer) ---
+    print("  -> [IDEAL] Aplicando WPE a 'room_input_ideal'...")
+    room_input_wpe_ideal = apply_wpe(room_input_ideal, FS, taps=10, delay=3, iterations=3)
+    save_wav("7b_input_room_WPE_IDEAL.wav", FS, room_input_wpe_ideal[0], output_folder)
+
+    print("  -> [IDEAL] Procesando señal WPE con Beamformer...")
+    bf_wpe_ideal = LowRankAdaptive(mic_coords, FS, alpha=ALPHA)
+    out_room_wpe_ideal = bf_wpe_ideal.block_process(
+        input_signals=room_input_wpe_ideal,
+        target_pos=target_pos_flat,
+        M1=M1, M2=M2, P=RANK_P,
+        mode="near_field",
+        min_loading=MIN_LOADING
+    )
+    save_wav("8b_output_room_WPE_IDEAL.wav", FS, out_room_wpe_ideal, output_folder)
+
+    # =========================================================================
+    # PARTE D: DEREVERBERACIÓN (GWPE) + BEAMFORMING
+    # =========================================================================
+    print("\n--- [D] PROCESAMIENTO CON DEREVERBERACIÓN (GWPE) ---")
+
+    # --- D.1 Caso Micrófonos Reales (GWPE + Beamformer) ---
+    print("  -> [MIC] Aplicando GWPE a 'room_input_mic'...")
+    room_input_gwpe_mic = batch_dereverb(room_input_mic, FS, K=K_GWPE)
+    save_wav("9a_input_room_GWPE_MIC.wav", FS, room_input_gwpe_mic[0], output_folder)
+
+    print("  -> [MIC] Procesando señal GWPE con Beamformer...")
+    bf_gwpe_mic = LowRankAdaptive(mic_coords, FS, alpha=ALPHA)
+    out_room_gwpe_mic = bf_gwpe_mic.block_process(
+        input_signals=room_input_gwpe_mic,
+        target_pos=target_pos_flat,
+        M1=M1, M2=M2, P=RANK_P,
+        mode="near_field",
+        min_loading=MIN_LOADING
+    )
+    save_wav("10a_output_room_GWPE_MIC.wav", FS, out_room_gwpe_mic, output_folder)
+
+    # --- D.2 Caso Micrófonos Ideales (GWPE + Beamformer) ---
+    print("  -> [IDEAL] Aplicando GWPE a 'room_input_ideal'...")
+    room_input_gwpe_ideal = batch_dereverb(room_input_ideal, FS, K=K_GWPE)
+    save_wav("9b_input_room_GWPE_IDEAL.wav", FS, room_input_gwpe_ideal[0], output_folder)
+
+    print("  -> [IDEAL] Procesando señal GWPE con Beamformer...")
+    bf_gwpe_ideal = LowRankAdaptive(mic_coords, FS, alpha=ALPHA)
+    out_room_gwpe_ideal = bf_gwpe_ideal.block_process(
+        input_signals=room_input_gwpe_ideal,
+        target_pos=target_pos_flat,
+        M1=M1, M2=M2, P=RANK_P,
+        mode="near_field",
+        min_loading=MIN_LOADING
+    )
+    save_wav("10b_output_room_GWPE_IDEAL.wav", FS, out_room_gwpe_ideal, output_folder)
+
+    # =========================================================================
+    # VISUALIZACIÓN Y CIERRE
+    # =========================================================================
     interferences = [interf_pos1, interf_pos2]
     plot_scene_3d(room_dimensions, mic_coords, source_pos, interferences, output_folder)
 
-    # --- IMPORTACIÓN (Arriba en tu script) ---
-from beamforming.dereverberation.wpe import apply_wpe
-
-# ... (Tu código de generación de señales Room y FreeField) ...
-
-# ==============================================================================
-# 4. PROCESAMIENTO (PIPELINE)
-# ==============================================================================
-print("\n--- 4. Procesando Audio ---")
-
-# ------------------------------------------------------------------
-# RAMA 1: ROOM (Reverberante - Baseline)
-# ------------------------------------------------------------------
-print("  [RAMA 1] Procesando señal ROOM (Sin WPE)...")
-# Nota: 'mic_data_room' es tu señal simulada con reverb
-y_room_gsc, _ = gsc_adaptive_beamformer(
-    input_signal=mic_data_room, 
-    w_q=w_lcmv_rb, Ca=Ca_rb, K=K, mu=0.05
-)
-
-# ------------------------------------------------------------------
-# RAMA 2: FREE FIELD (Anecoica - Referencia ideal)
-# ------------------------------------------------------------------
-print("  [RAMA 2] Procesando señal FREE FIELD...")
-# Nota: 'mic_data_free' es tu señal simulada sin reverb
-y_free_gsc, _ = gsc_adaptive_beamformer(
-    input_signal=mic_data_free, 
-    w_q=w_lcmv_rb, Ca=Ca_rb, K=K, mu=0.05
-)
-
-# ------------------------------------------------------------------
-# RAMA 3: ROOM + WPE (Dereverberación + Beamforming) -> ¡LO NUEVO!
-# ------------------------------------------------------------------
-print("  [RAMA 3] Procesando señal ROOM + WPE...")
-
-# A. Pre-proceso: Dereverberación multicanal
-print("     -> Aplicando algoritmo WPE...")
-mic_data_wpe = apply_wpe(
-    mic_data_room, 
-    fs=fs, 
-    taps=10, 
-    delay=3, 
-    iterations=3
-)
-
-# B. Beamforming: Usamos la salida limpia de WPE como entrada al GSC
-print("     -> Aplicando GSC a la señal dereverberada...")
-y_wpe_gsc, w_log_wpe = gsc_adaptive_beamformer(
-    input_signal=mic_data_wpe, 
-    w_q=w_lcmv_rb, 
-    Ca=Ca_rb, 
-    K=K, 
-    mu=0.05
-)
-
-# ==============================================================================
-# 5. EXPORTACIÓN DE RESULTADOS
-# ==============================================================================
-print("\n--- 5. Exportando WAVs ---")
-out_folder = "resultados_pipeline_completo"
-
-# 1. Guardar Inputs (para comparar auditivamente el efecto de WPE solo)
-save_normalized_wav("1a_input_room_mic0.wav", fs, mic_data_room[0, :], out_folder)
-save_normalized_wav("1b_input_wpe_mic0.wav", fs, mic_data_wpe[0, :], out_folder) # Escuchar esto es clave
-
-# 2. Guardar Outputs del Beamformer
-save_normalized_wav("2a_out_room_gsc.wav", fs, y_room_gsc, out_folder)
-save_normalized_wav("2b_out_free_gsc.wav", fs, y_free_gsc, out_folder)
-save_normalized_wav("2c_out_room_wpe_gsc.wav", fs, y_wpe_gsc, out_folder) # <--- EL RESULTADO FINAL
-
-print(f"Proceso finalizado. Archivos guardados en {out_folder}")
-
-
     print(f"\n=== PROCESO TERMINADO ===")
-    print(f"Archivos guardados en: {output_folder}")        
+    print(f"Archivos guardados en: {output_folder}")
