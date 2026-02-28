@@ -51,7 +51,7 @@ def steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound, mode = "near_fi
     
     return final_sv
 
-def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
+def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound, Normalize = False):
     """
     Calculathes the steering vector for a specific frecuency
     norlmaliced in the origin of coords. 
@@ -85,7 +85,10 @@ def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound):
     # Fase = 2*pi*f * (ref_delay + d_s/c - d_m/c - k/fs)
     phase_term = np.exp(1j * 2 * np.pi * f * (ref_delay + source_delay_origin - mic_delay - tap_delays))
     
-    steering_vector = phase_term / distances
+    steering_vector = phase_term 
+
+    if not Normalize:
+        steering_vector = steering_vector / distances
 
     #Colapsing the matriz into colums 
     steering_vector_flat = steering_vector.reshape(-1,1)

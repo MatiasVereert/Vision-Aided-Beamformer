@@ -1,9 +1,10 @@
 import numpy as np 
-import scipy as signal
-from matplotlib import pyplot as plt
+from scipy import signal
 from numpy.lib.stride_tricks import sliding_window_view
+from matplotlib import pyplot as plt 
 
-def create_tapped_delay_line( X, K, Delta_frames, axis  = 2):
+
+def create_tapped_delay_line(X, K, Delta_frames, axis=2):
     """
         Generates a tapped delay line using a sliding window view with causal padding.
 
@@ -38,185 +39,171 @@ def create_tapped_delay_line( X, K, Delta_frames, axis  = 2):
     pad_with = []
 
     for i in range(dim):
-        if i ==axis:
-            pad_with.append( (Delta_frames+ K - 1 , 0))
+        if i == axis:
+            pad_with.append((Delta_frames + K - 1, 0))
         else: 
-            pad_with.append((0,0))
+            pad_with.append((0, 0))
 
-    #Zero pads to obtain consistent lenght
-    Y = np.pad(X, pad_with , 'constant', constant_values=0)
+    # Zero pads to obtain consistent lenght
+    Y = np.pad(X, pad_with, 'constant', constant_values=0)
 
-    # delay K samples the input signal, add zeros to the begining 
-    Y_delays = sliding_window_view(Y, K , axis =axis ) 
+    # Delay K samples the input signal, add zeros to the begining 
+    Y_delays = sliding_window_view(Y, K, axis=axis) 
 
-    #Transpose
-    Y_delays_T = np.swapaxes(Y_delays, axis, -1  )
+    # Transpose
+    Y_delays_T = np.swapaxes(Y_delays, axis, -1)
 
-    #Mirror axes to order data: Y1 = Y[t-tao], Y2 = Y[t-tao-1] ...
-    Y_window_view = np.flip(Y_delays_T, axis= axis)
+    # Mirror axes to order data: Y1 = Y[t-tao], Y2 = Y[t-tao-1] ...
+    Y_window_view = np.flip(Y_delays_T, axis=axis)
 
-    #Trim to original lenght
+    # Trim to original lenght
     Y_window_view = Y_window_view[..., :T]
     
     return Y_window_view
 
-
-def get_reverb_tail(X_windowed, g ):
-    """
-        Compute de MIMO convolution using the g weights
-
-        X : np.array ()
-
-    """
-    y_tilde = np.einsum('fnmk,fmkt->fnt' , g.conj(), X_windowed)
-
-def compute_lambda_scaled_identity(x_tilde ):
-
-    #stability loading
-    delta = 1e-9
-
-    M = x_tilde.shape[1]
-    T = x_tilde.shape[2]
-
-    lamda = np.mean( np.abs(x_tilde) **2 ,axis=1) + delta
-
-    indentity = np.eye(M)
-
-    Lambda_tilde = np.einsum( "ft,jk ->fjkt ", lamda, indentity) 
-
-    
-    
-    lamda_inv = 1/ lamda
-    Lamda_tilde_inv = np.einsum( "ft,jk ->fjkt ", lamda_inv, indentity)
-
-                
-    return Lambda_tilde, Lamda_tilde_inv
-
-
-def ensamble_Psi(Y, K  ):
-    F =Y.shape[0]
-    M = Y.shape[1]
-    T = Y.shape[2]
-
-    # -1 Obtain a Y tensor with K taps
-    # Pad zeros to maintain length
-    Y_padded = np.pad( Y, ((0,0), (0,0), (K-1,0)), 'constant', constant_values= 0)
-
-    # Window Slides
-    Y_windows = sliding_window_view(Y_padded, K)
-    Y_windows_T = Y_windows.transpose(0, 1, 3, 2)
-
-    # Flip Taps axis to obtain incremental indexation
-    Y_taps = np.flip(Y_windows_T , axis=2)
-
-    #2 Ensamble Psi Matrix
-    identitiy = np.eye(M)
-    Psi_tensor = np.einsum("ij, fmkt -> fkimjt", identitiy, Y_taps )
-    Psi = Psi_tensor.reshape(F, K*M*M, M, T)
-
-    return Psi
-
-def get_R_and_r( Lambda_tilde_inv, Psi, y, Delta_frames):
-    #Delay Psi Delta_frames samples 
-    #Zero pad
-    pad_limits = [(0,0), (0,0), (0,0), (Delta_frames, 0)]    
-    Psi_pad = np.pad( Psi, 
-                           pad_limits, 
-                           'constant',
-                            constant_values=0
-                            )
-    
-    #Chop to mantain original lenght
-    Psi_delayed = Psi_pad[:,:,:,:-Delta_frames]
-
-    #Construct R
-    R_hat = np.einsum( 'fant, fnmt, fjmt -> faj', Psi_delayed.conj(), Lambda_tilde_inv, Psi_delayed.conj() )
-    
-    #Construct r
-    r_hat = np.einsum( 'fant, fnmt, fmt -> fa', Psi_delayed.conj(), Lambda_tilde_inv, y )
-
-    return R_hat, r_hat
-
-def batch_dereverb( Y, fs, K):
+def batch_dereverb(Y, fs, K):
     # Constants
-    n_window, n_overlap = 256, 192
-    d_loading = 1e-6
-    iterations = 7
-    Delta_frames = 2
-    K = 30
+    n_window = 1024
+    n_overlap = 768
+    d_loading = 1e-2
+    iterations = 4
+    Delta_frames = 5  # OBLIGATORIO: Retardo de 1280 muestras (> ventana de 1024)
+    K = 12
 
     # Tranform to frecuency domain
-    f, t, Y = signal.stft(Y=Y, 
+    f, t, Y = signal.stft(Y, 
                           fs=fs, 
-                          nperseg= n_window, 
-                        noverlap=n_overlap, 
-                        window='hann', 
-                        axis=1)
+                          nperseg=n_window, 
+                          noverlap=n_overlap, 
+                          window='hann', 
+                          axis=1)
     
-    Y = Y.transpose(1,0,2)
+    Y = Y.transpose(1, 0, 2)
     F = Y.shape[0]
     M = Y.shape[1]
 
     # 1) -- Inicialice filter G = 0
-    g_hat = np.zeros( (F, K, M, M), dtype=complex)
+    g_hat = np.zeros((F, M, K, M), dtype=complex)
 
     # Obtaing K tapped and delayed signals
-    Y_windowed = create_tapped_delay_line(Y, K = K, Delta_frames = Delta_frames, axis= 2)
-
-    #Ensamble Psi
-    Psi = ensamble_Psi(Y, K)
+    Y_windowed = create_tapped_delay_line(Y, K=K, Delta_frames=Delta_frames, axis=2)
 
     # Start Iterations
     for i in range(iterations):
+        print(f"Comenzando iteracion {i}")
 
-        # 2) -- Compute De - Reverberation Y(t) = yl(t) - sum( G* yl ) --
-        Y_tilde =  np.einsum('fknm, fmkt -> fnt' , g_hat.conj(), Y_windowed)
+        # 2) -- Compute De-Reverberation Y(t) = yl(t) - sum( G* yl ) --
+        Y_tilde = np.einsum('fmkn, fmkt -> fnt', g_hat, Y_windowed)
 
         # Obtain dereverbated output
         X_hat = Y - Y_tilde
 
         # 3) -- Obtain Spatial Correlation Matrix Lamda_hat
-        # Compute landa using scaled identity aproximation under the assumtion same energy on each sensor
-        Lamda_hat,  Lamda_hat_inv = compute_lambda_scaled_identity(X_hat)
-
+        power = np.mean(np.abs(X_hat)**2, axis=1)
         
+        # Calculamos un piso de ruido dinámico: -40 dB (1e-4) por debajo del pico de energía de esa frecuencia
+        power_floor = np.amax(power, axis=1, keepdims=True) * 1e-4
+        
+        # Enmascaramos las tramas de silencio forzando el piso
+        lamda = np.maximum(power, power_floor)
+        lamda_inv = 1 / lamda
 
-        # 4) -- Obtain Spatial Correlation Matrix Lamda_hat
-        R_hat, r_hat = get_R_and_r( Lamda_hat_inv, Psi, Y, Delta_frames)
+        # 4) -- Obtain R and r tensors
+        # R_tensor: (F, M, K, M, K) -> Contraemos el tiempo con lamda_inv
+        R_tensor = np.einsum('fmkt, ft, fplt -> fmkpl', Y_windowed.conj(), lamda_inv, Y_windowed, optimize=True)
+
+        # r_tensor: (F, M, K, M_out) -> Correlación cruzada con la señal objetivo
+        r_tensor = np.einsum('fmkt, ft, fnt -> fmkn', Y_windowed.conj(), lamda_inv, Y, optimize=True)
+
+        # R_matrix: (F, M*K, M*K)
+        R_matrix = R_tensor.reshape(F, M*K, M*K)
+        
+        # 1. Calcular la traza de R por cada frecuencia (F,)
+        trace_R = np.trace(R_matrix, axis1=1, axis2=2)
+        
+        # 2. Generar una matriz de carga proporcional a la energía promedio de la diagonal
+        # El escalar d_loading (ej. 1e-6) actúa ahora como un ratio relativo, no absoluto.
+        relative_loading = (d_loading * trace_R / (M * K))[:, np.newaxis, np.newaxis]
+        
+        # 3. Sumar la regularización dinámica
+        R_matrix += relative_loading * np.eye(M*K)
+        r_matrix = r_tensor.reshape(F, M*K, M)
 
         # 5) -- Obtain Optimized weights
-        # Diagonal Loading to avoid Non-invertion.
-        
-        R_hat = R_hat + d_loading * np.eye( K* M *M ).reshape(1,  K* M *M ,  K* M *M )
-
         # Solve Linear System 
-        g_hat = np.linalg.solve(R_hat, r_hat )
-        g_hat = g_hat.reshape(F,  K, M, M)
+        g_matrix = np.linalg.solve(R_matrix, r_matrix)
+
+        # Restauración topológica coherente con el aplanamiento previo
+        g_hat = g_matrix.reshape(F, M, K, M) 
         
     # Compute last output
-    Y_tilde =  np.einsum('fknm, fmkt -> fnt' , g_hat.conj(), Y_windowed)
+    Y_tilde = np.einsum('fmkn, fmkt -> fnt', g_hat, Y_windowed, optimize=True)
     X_hat = Y - Y_tilde
-    X_hat = X_hat.transpose(1,0,2)
+    X_hat = X_hat.transpose(1, 0, 2)
 
     # Inverse Transform
-    _, x_out = signal.istft(X_hat, fs= fs, window='hann', nperseg=n_window, noverlap=n_overlap)
+    _, x_out = signal.istft(X_hat, fs=fs, window='hann', nperseg=n_window, noverlap=n_overlap)
 
-    return  x_out #shape (N, T)
+    return x_out #shape (N, T)
 
 
-    
 if __name__ == "__main__":
-
-    matrix = np.random.normal( size = (3,5)).astype(int)
-
-    print(matrix)
+    print("--- Iniciando Test del Pipeline GWPE ---")
     
-    K = 5
-    tau = 4
-
-    matrix_windowed = create_tapped_delay_line(matrix, K, tau, 1)
-
-    print(matrix_windowed)
+    # 1. Configuración de parámetros de prueba
+    fs = 16000
+    duration_sec = 1.0
+    n_samples = int(fs * duration_sec)
+    n_mics = 4
+    K_test = 10 # Orden del filtro
     
+    # 2. Generar señal de prueba (Ruido Blanco multicanal)
+    # Shape esperado por batch_dereverb: (Mics, Samples)
+    rng = np.random.default_rng(seed=42)
+    source_signal = rng.standard_normal(n_samples)
+    
+    # Simulamos que llega a los 4 micrófonos con un pequeño delay y atenuación
+    # (Esto simula una reverberación extremadamente simple para testear dimensiones)
+    room_input_mic = np.zeros((n_mics, n_samples))
+    for m in range(n_mics):
+        delay = m * 5  # cada mic recibe la señal un poco después
+        room_input_mic[m, delay:] = source_signal[:n_samples-delay] * (1.0 - m*0.1)
 
-  
+    print(f"Forma de la señal de entrada: {room_input_mic.shape}") # (4, 16000)
+
+    # 3. Ejecutar el pipeline
+    try:
+        print("Ejecutando batch_dereverb...")
+        # Llamamos a tu función con los parámetros
+        dereverb_signal = batch_dereverb(room_input_mic, fs, K=K_test)
+
+        print("\n¡Éxito! El pipeline terminó sin errores.")
+        print(f"Forma de la señal de salida: {dereverb_signal.shape}")
+        
+        # 4. Verificación rápida de valores
+        if np.isnan(dereverb_signal).any():
+            print("AVISO: La salida contiene valores NaN. Revisa la estabilidad de la matriz R.")
+        else:
+            print("La salida no contiene NaNs. El sistema lineal se resolvió correctamente.")
+
+    except Exception as e:
+        print(f"\nERROR en el pipeline: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+    # 5. Visualización básica
+    plt.figure(figsize=(10, 6))
+    plt.subplot(2, 1, 1)
+    plt.plot(room_input_mic[0, :500], label="Entrada (Mic 0)")
+    plt.title("Señal de Entrada Original")
+    plt.legend()
+    
+    plt.subplot(2, 1, 2)
+    plt.plot(dereverb_signal[0, :500], label="Salida (Procesada)", color='orange')
+    plt.title("Señal de Salida (WPE)")
+    plt.legend()
+    
+    plt.tight_layout()
+    print("Mostrando gráfico de comparación (primeras 500 muestras)...")
+    plt.show()

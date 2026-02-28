@@ -12,6 +12,7 @@ src/beamforming/array/mic_array.py
 src/beamforming/array/microphone.py
 src/beamforming/dereverberation/__init__.py
 src/beamforming/dereverberation/gwpe.py
+src/beamforming/dereverberation/kwpe.py
 src/beamforming/dereverberation/wpe.py
 src/beamforming/evaluation/__init__.py
 src/beamforming/evaluation/array_sensitivity_gain.py
@@ -22,6 +23,8 @@ src/beamforming/gsc/constrains.py
 src/beamforming/gsc/region_constriant.py
 src/beamforming/gsc/system.py
 src/beamforming/gsc/weights.py
+src/beamforming/joint_source_extraction/__init__.py
+src/beamforming/joint_source_extraction/wpe_srive.py
 src/beamforming/kmvdr/__init__.py
 src/beamforming/kmvdr/system copy 2.py
 src/beamforming/kmvdr/system copy.py
@@ -44,7 +47,9 @@ src/utils/data_loader.py
 src/utils/geometry.py
 src/utils/plot.py
 src/utils/polar_plot.py
+tests/Test_gwpe_kwpe_wpe.py
 tests/test_integration.py
 tests/test_room wpe copy.py
 tests/test_room wpe.py
 tests/test_room.py
+tests/test_wpe_sriv.py

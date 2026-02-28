@@ -69,7 +69,8 @@ class SimAcoustic():
     def __init__(self, 
                  array_geometry, 
                  array_mismatch = 1e-3, 
-                 duration= 4 ):
+                 duration= 4, 
+                 fs = 48000 ):
         
         #define the scene atributes 
         self.ideal_array = array_geometry
@@ -87,7 +88,7 @@ class SimAcoustic():
         self.audio_interferences = []
         self.audio_sources = []
 
-        self.fs = 48000
+        self.fs = fs
 
         #Contador auxiliar para que no se defina mas de una fuente
         self.S_count = 0
@@ -129,7 +130,7 @@ class SimAcoustic():
         if mode == "real":
             array_geometry = self.real_array
         else:
-            array_geomtery = self.ideal_array
+            array_geometry = self.ideal_array
 
         samples_lenght = self.duration * self.fs
         

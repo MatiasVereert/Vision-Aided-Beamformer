@@ -62,7 +62,6 @@ def create_tapped_delay_line(X, K, Delta_frames, axis=2):
     return Y_window_view
 
 def batch_dereverb(Y, fs, K):
-    
     # Constants
     n_window = 1024
     n_overlap = 768
@@ -177,7 +176,7 @@ if __name__ == "__main__":
         print("Ejecutando batch_dereverb...")
         # Llamamos a tu función con los parámetros
         dereverb_signal = batch_dereverb(room_input_mic, fs, K=K_test)
-        
+
         print("\n¡Éxito! El pipeline terminó sin errores.")
         print(f"Forma de la señal de salida: {dereverb_signal.shape}")
         
@@ -191,6 +190,7 @@ if __name__ == "__main__":
         print(f"\nERROR en el pipeline: {e}")
         import traceback
         traceback.print_exc()
+
 
     # 5. Visualización básica
     plt.figure(figsize=(10, 6))
