@@ -6,7 +6,6 @@ from scipy.io import wavfile
 
 # --- IMPORTACIONES ---
 from beamforming.signal_model import steering_vector
-from beamforming.gsc.region_constriant import build_region_constraints
 from beamforming.processors import gsc_adaptive_beamformer
 
 def space_delay(signal_in, fs, source_pos, mic_array):
