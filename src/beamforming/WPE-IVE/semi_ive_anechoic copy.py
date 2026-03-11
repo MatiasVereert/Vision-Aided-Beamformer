@@ -69,7 +69,7 @@ def update_W_IP2_K1(W, V_1, V_z, n_power_iter=3):
     return W
 
 @njit 
-def ive(x_stft, a_1_init=None):
+def ive(x_stft, a_1_init=None , mode= "IVE-IP2"):
     # Parameters 
     beta = 0.1
     N_iter = 5
@@ -89,7 +89,13 @@ def ive(x_stft, a_1_init=None):
             W[f, :, 0] = a_1_init[f, :]
 
     V_z = calculate_V_z(x_stft)
-    W = update_W_z_K1(W, V_z)
+    if mode == "IVE-IP2":
+        W = update_W_z_K1(W, V_z)
+
+    if mode == "Semi-IVE":
+        
+
+        
     
     s_1 = np.zeros((F, T), dtype=np.complex128)
     r_1 = np.zeros(T, dtype=np.float64)
@@ -163,7 +169,6 @@ def ive(x_stft, a_1_init=None):
     return x_1_out, W, s_1
 
 
-
 import os
 import numpy as np
 import scipy.signal as sig
@@ -171,100 +176,108 @@ import scipy.signal as sig
 # Adjust imports based on your exact file structure
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav
-# from ive import ive
+# from wpexsrive import WPExSRIVE, process_frame  # Import your algorithm here
 
 if __name__ == "__main__":
-    FS = 48000
-    M1, M2 = 12, 1          
-    M = M1 * M2
+    # 1. GENERAL SETTINGS
+    FS = 16000  # 16 kHz is standard for speech processing and matches the paper
+    M = 4       # Number of microphones
     speed_of_sound = 343.0 
     
-    print("=== INTEGRATION TEST: BATCH IVE-IP2 ===")
+    print("=== INTEGRATION TEST: ONLINE WPExSRIVE ===")
     
-    output_folder = "tests/data/ive_output"
+    output_folder = "tests/data/wpexsrive_output"
     os.makedirs(output_folder, exist_ok=True)
     
-    # 1. IDEAL GEOMETRY DEFINITION
-    mic_spacing = 0.021 
-    x = np.linspace(0, (M1-1)*mic_spacing, M1)
+    # 2. ARRAY GEOMETRY DEFINITION (LINEAR ARRAY)
+    mic_spacing = 0.021  # 2.1 cm spacing (car environment spacing from paper)
+    x = np.linspace(0, (M-1)*mic_spacing, M)
     mic_coords_ideal = np.column_stack([x, np.zeros(M), np.zeros(M)])
     
-    array_center = np.array([1.25, 2.0, 1.25])
+    array_center = np.array([2.0, 2.0, 1.25])
     mic_coords_ideal = mic_coords_ideal - np.mean(mic_coords_ideal, axis=0) + array_center
     
+    # Define angles (Target: 130 deg, Interference: 50 deg)
     r = 1.0 
     ang_target = np.deg2rad(130)
     ang_interf = np.deg2rad(50)
     
     source_pos = array_center + np.array([r * np.cos(ang_target), r * np.sin(ang_target), 0.0])
-    interf_pos1 = array_center + np.array([r * np.cos(ang_interf), r * np.sin(ang_interf), 0.0])
+    interf_pos = array_center + np.array([r * np.cos(ang_interf), r * np.sin(ang_interf), 0.0])
 
-    # 2. ACOUSTIC SCENE WITH PHASE MISMATCH
-    print(" -> Initializing acoustic scene with physical mismatch...")
-    # We introduce a 5 mm random position error to simulate phase mismatch
-    acoustic_scene = SimAcoustic(mic_coords_ideal, array_mismatch=0.005, duration=10, fs=FS)
+    # 3. ACOUSTIC SCENE SIMULATION (REVERBERANT ROOM)
+    print(" -> Initializing reverberant acoustic scene...")
+    # Add a small mismatch to make it realistic
+    acoustic_scene = SimAcoustic(mic_coords_ideal, array_mismatch=0.002, duration=5, fs=FS)
 
     source_path = "tools/data/signals/FA01_09.wav"
-    int_path1 = "tools/data/signals/MC15_03.wav"
+    int_path = "tools/data/signals/MC15_03.wav"
 
-    acoustic_scene.set_source(source_path, gain=1, position=source_pos.reshape(1,3))
-    acoustic_scene.set_interference(int_path1, gain=1, position=interf_pos1.reshape(1,3))
+    acoustic_scene.set_source(source_path, gain=1.0, position=source_pos.reshape(1,3))
+    acoustic_scene.set_interference(int_path, gain=1.0, position=interf_pos.reshape(1,3))
 
-    print(" -> Computing free field simulation (mode='real')...")
-    # Using mode="real" forces the simulator to use the perturbed microphone positions
-    room_input_real = acoustic_scene.free_field(iSIR_dB=0, normalize=True, mode="real")
+    print(" -> Computing Room Impulse Responses (ISB)...")
+    room_dimensions = np.array([4.0, 5.0, 2.5])
+    # T60 = 0.3s for a moderate office/room reverberation
+    room_input_mix = acoustic_scene.compute_room_ISB(
+        room_dimensions, 
+        desire_RT=0.3, 
+        iSIR_dB=0, 
+        mode="real"
+    )
     
-    # 3. APPLY GAIN MISMATCH
-    print(" -> Applying Gain Mismatch to microphones...")
-    np.random.seed(42) # For reproducibility in testing
-    # Generate random gain variations between 0.9 and 1.1 (+/- 10%)
-    gain_mismatch = np.random.uniform(0.9, 1.1, (M, 1))
+    save_wav("1_wpex_input_mix_mic0.wav", FS, room_input_mix[0], output_folder)
     
-    # Apply the gain mismatch to the propagated signals
-    room_input_mismatched = room_input_real * gain_mismatch
-    
-    save_wav("1_input_mix_mic0_mismatched.wav", FS, room_input_mismatched[0], output_folder)
-    
-    # 4. SHORT-TIME FOURIER TRANSFORM
-    nperseg = int(FS * 0.032)
-    noverlap = nperseg - int(FS * 0.016)
+    # 4. SHORT-TIME FOURIER TRANSFORM (LOW LATENCY SETUP)
+    # 8 ms window, 4 ms overlap
+    nperseg = int(FS * 0.008)  
+    noverlap = nperseg - int(FS * 0.004) 
     nfft = nperseg
     
-    print(" -> Applying STFT...")
+    print(f" -> Applying STFT (Window: {nperseg} samples, Overlap: {noverlap} samples)...")
     freqs, times, X_stft = sig.stft(
-        room_input_mismatched, fs=FS, window='hann', 
+        room_input_mix, fs=FS, window='hann', 
         nperseg=nperseg, noverlap=noverlap, nfft=nfft
     )
     
     F_bins = X_stft.shape[1]
     
-    # 5. IDEAL STEERING VECTOR (IGNORING MISMATCH)
-    print(" -> Building Ideal Steering Vector (algorithm assumes perfect array)...")
+    # 5. IDEAL STEERING VECTORS FOR SPATIAL REGULARIZATION
+    print(" -> Building Ideal Steering Vectors (Target & Interference)...")
     a_1 = np.zeros((F_bins, M), dtype=np.complex128)
+    a_2 = np.zeros((F_bins, M), dtype=np.complex128)
+    
     for f_idx, freq in enumerate(freqs):
         if freq == 0: 
             a_1[f_idx, :] = 1.0 / np.sqrt(M)
+            a_2[f_idx, :] = 1.0 / np.sqrt(M)
         else:
-            # We strictly use the ideal spacing here, testing algorithm robustness
-            tau = - np.arange(M) * mic_spacing * np.cos(ang_target) / speed_of_sound
-            a_1[f_idx, :] = np.exp(1j * 2 * np.pi * freq * tau) / np.sqrt(M)
+            # Calculate time delays based on linear array geometry
+            tau_1 = - np.arange(M) * mic_spacing * np.cos(ang_target) / speed_of_sound
+            tau_2 = - np.arange(M) * mic_spacing * np.cos(ang_interf) / speed_of_sound
+            
+            a_1[f_idx, :] = np.exp(1j * 2 * np.pi * freq * tau_1) / np.sqrt(M)
+            a_2[f_idx, :] = np.exp(1j * 2 * np.pi * freq * tau_2) / np.sqrt(M)
 
-    # Transpose to (F, T, M) and make contiguous for Numba
+    # Transpose to (F, T, M) and ensure contiguous memory layout for Numba
     X_stft_ive = np.transpose(X_stft, (1, 2, 0))
     X_stft_ive = np.ascontiguousarray(X_stft_ive, dtype=np.complex128)
 
-    # 6. IVE OPTIMIZATION
-    print(" -> Executing Batch IVE-IP2 (K=1) on mismatched signals...")
-    x_1_out, W_final, s_1_raw = ive(X_stft_ive, a_1_init=a_1)
+    # 6. WPExSRIVE OPTIMIZATION
+    print(" -> Executing WPExSRIVE online processing...")
+    # NOTE: Ensure your WPExSRIVE signature matches this call, 
+    # or inject a_1 and a_2 inside the algorithm initialization.
+    # L=12, D=4 are common WPE parameters for T60 ~ 300ms
+    s_hat_stft = WPExSRIVE(X_stft_ive, L=12, D=4) 
     
     # 7. RECONSTRUCTION
-    print(" -> Reconstructing time-domain signal...")
-    X_out_istft = np.transpose(x_1_out, (2, 0, 1))
-    
+    print(" -> Reconstructing time-domain signal (ISTFT)...")
+    # No need to transpose if WPExSRIVE returns (F, T) directly
+    # If it returns multiple sources (F, T, N), adjust accordingly
     _, y_time = sig.istft(
-        X_out_istft, fs=FS, window='hann', 
+        s_hat_stft, fs=FS, window='hann', 
         nperseg=nperseg, noverlap=noverlap, nfft=nfft
     )
     
-    save_wav("2_output_IVE_mic0.wav", FS, y_time[0], output_folder)
-    print(" -> Pipeline completed.")
+    save_wav("2_wpex_output_target.wav", FS, y_time, output_folder)
+    print(" -> Pipeline completed successfully.")
