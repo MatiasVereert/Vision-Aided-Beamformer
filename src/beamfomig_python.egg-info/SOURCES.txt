@@ -8,6 +8,23 @@ src/beamfomig_python.egg-info/top_level.txt
 src/beamforming/__init__.py
 src/beamforming/processors.py
 src/beamforming/signal_model.py
+src/beamforming/MPDRxWPE/MPDRxWPE copy 2.py
+src/beamforming/MPDRxWPE/MPDRxWPE copy 3.py
+src/beamforming/MPDRxWPE/MPDRxWPE.py
+src/beamforming/MPDRxWPE/MPDRxWPE_1.py
+src/beamforming/MPDRxWPE/WPE-MPDRxWPE copy.py
+src/beamforming/MPDRxWPE/WPE-MPDRxWPE.py
+src/beamforming/MPDRxWPE/WPE-MPDRxWPE_vs_MWF.py
+src/beamforming/MPDRxWPE/__init__.py
+src/beamforming/MPDRxWPE/signal_model.py
+src/beamforming/WPE-IVE/WPExSRIVE copy 2.py
+src/beamforming/WPE-IVE/WPExSRIVE copy.py
+src/beamforming/WPE-IVE/WPExSRIVE.py
+src/beamforming/WPE-IVE/__init__.py
+src/beamforming/WPE-IVE/ive_anechoic.py
+src/beamforming/WPE-IVE/ive_pipeline.py
+src/beamforming/WPE-IVE/semi_ive_anechoic copy.py
+src/beamforming/WPE-IVE/semi_ive_anechoic.py
 src/beamforming/array/mic_array.py
 src/beamforming/array/microphone.py
 src/beamforming/dereverberation/__init__.py
@@ -17,14 +34,6 @@ src/beamforming/dereverberation/wpe.py
 src/beamforming/evaluation/__init__.py
 src/beamforming/evaluation/array_sensitivity_gain.py
 src/beamforming/evaluation/gain.py
-src/beamforming/gsc/__init__.py
-src/beamforming/gsc/adaptive.py
-src/beamforming/gsc/constrains.py
-src/beamforming/gsc/region_constriant.py
-src/beamforming/gsc/system.py
-src/beamforming/gsc/weights.py
-src/beamforming/joint_source_extraction/__init__.py
-src/beamforming/joint_source_extraction/wpe_srive.py
 src/beamforming/kmvdr/__init__.py
 src/beamforming/kmvdr/system copy 2.py
 src/beamforming/kmvdr/system copy.py
@@ -36,9 +45,11 @@ src/beamforming/kmvdr/dev_tests/adaptive_nearfield_voice.py
 src/beamforming/kmvdr/dev_tests/narrow_adaptive.py
 src/beamforming/kmvdr/dev_tests/narrow_adaptive_v1.py
 src/beamforming/kmvdr/dev_tests/narrow_fix.py
+src/evaluation/__init__.py
+src/evaluation/evalualuate.py
+src/evaluation/metrics.py
 src/propagation/__init__.py
 src/propagation/free_field.py
-src/propagation/image_source.py
 src/propagation/room_convolution.py
 src/propagation/simulate_acoustics.py
 src/utils/__init__.py

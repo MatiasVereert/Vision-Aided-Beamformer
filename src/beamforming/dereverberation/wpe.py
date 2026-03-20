@@ -3,6 +3,7 @@ from scipy import signal
 # Asegurate de tener instalado: pip install nara_wpe
 from nara_wpe.wpe import wpe
 
+
 def apply_wpe(
     audio_multichannel: np.ndarray, 
     fs: int, 

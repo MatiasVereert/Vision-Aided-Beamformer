@@ -1,7 +1,7 @@
 import numpy as np 
 from numba import njit
 
-@njit 
+@njit
 def calculate_V_z(x_stft):
     F, T, M = x_stft.shape
     V_z = np.zeros((F, M, M), dtype=np.complex128)

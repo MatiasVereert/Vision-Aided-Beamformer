@@ -14,7 +14,7 @@ class LowRankAdaptive:
         self.mic_array = mic_array
         self.fs = fs
         self.alpha = alpha
-        self.ALS_iterations = 2
+        self.ALS_iterations = 3
         
         # Estado del Beamformer
         self.R_cov = None 
@@ -100,7 +100,7 @@ class LowRankAdaptive:
         I_M = np.eye(M)[None, :, :] 
 
         # --- PARÁMETROS DEL LAZO DE CONTROL (WNG) ---
-        target_wng_dB = -4.0                # Objetivo de robustez (industria estándar)
+        target_wng_dB = -6.0                # Objetivo de robustez (industria estándar)
         target_wng_lin = 10**(target_wng_dB/10)
         step_up = 1.05                      # Subir 5% si estamos en peligro
         step_down = 0.98                    # Bajar 2% si estamos sobrados

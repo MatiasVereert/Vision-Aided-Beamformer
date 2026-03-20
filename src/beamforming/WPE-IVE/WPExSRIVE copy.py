@@ -229,7 +229,6 @@ def WPExSRIVE(x_stft, a_1, a_2, L=12, D=4):
         s_hat_frame = process_frame(
                     x_frame, x_bar, W, W_inv_H, G_1, G_2, 
                     Sigma_1, Sigma_2, R_inv_1, R_inv_2, 
-                    Pi_inv_1_f,  # <-- Added missing argument here
                     a_1, a_2, alpha, beta, lambda_unit, lambda_null, lambda_scale, N_Iter=5, frame_idx=t
                 )
         

@@ -1,0 +1,36 @@
+1. Evitar el object mode
+El error más común es permitir que Numba compile en "modo objeto". Esto sucede cuando el decorador @jit encuentra algo que no sabe cómo optimizar y decide ejecutarlo usando el intérprete de Python.
+
+Qué evitar: Usar @jit a secas.
+
+La solución: Usa siempre @njit o @jit(nopython=True). Si el código tiene algo incompatible, Numba lanzará un error en lugar de fallar silenciosamente hacia un modo lento.
+
+2. No usar estructuras de datos de Python puro
+Numba brilla con NumPy, pero odia las estructuras nativas de Python dentro de los bucles críticos.
+
+Evita: Diccionarios (dict), listas de Python que cambian de tamaño, y strings complejos.
+
+Por qué: Estas estructuras requieren que Numba interactúe con el gestor de memoria de Python, lo cual es lento.
+
+La solución: Pasa arrays de NumPy a tus funciones. Si necesitas listas, usa numba.typed.List.
+
+3. Olvidar la "especialización" de tipos
+Numba compila una versión de la función para cada tipo de dato que recibe. Si cambias constantemente el tipo de los inputs, perderás tiempo en compilaciones repetidas.
+
+Evita: Mezclar tipos (ej. pasar float32 a veces y float64 otras) en llamadas frecuentes.
+
+La solución: Mantén la consistencia en tus tipos de datos de NumPy.
+
+4. El uso de Funciones Globales o Externas
+Numba solo puede optimizar lo que puede ver y entender.
+
+Evita: Llamar a funciones de librerías de terceros (que no sean NumPy o la propia Numba) dentro de una función @njit.
+
+La solución: Asegúrate de que todas las funciones llamadas internamente también estén decoradas con @njit.
+
+5. Ignorar el "Coste de Transferencia"
+A veces el código corre rápido, pero la función es lenta porque le pasas datos pequeños demasiadas veces.
+
+Evita: Llamar a una función Numba millones de veces con datos minúsculos desde Python puro.
+
+La solución: Intenta mover el bucle principal dentro de la función decorada para que toda la iteración ocurra en código compilado.

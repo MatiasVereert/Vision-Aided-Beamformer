@@ -8,6 +8,9 @@ from beamforming.array.microphone import Microphone
 from utils.audio import save_wav
 from beamforming.dereverberation.wpe import apply_wpe 
 import matplotlib.pyplot as plt 
+from beamforming.joint_source_extraction import OnlineWPExSRIVE_N1_Vectorized 
+
+from beamforming.dereverberation.gwpe import batch_dereverb
 
 def plot_scene_3d(room_dims, mics, target, interferences_list, save_path):
     fig = plt.figure(figsize=(10, 8))
@@ -104,7 +107,7 @@ if __name__ == "__main__":
     target_pos_flat = source_pos.flatten()
 
     # 4. CONFIGURACIÓN DE ESCENA ACÚSTICA
-    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=4)
+    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=4, fs = FS)
     room_dimensions = np.array([2.5, 4, 2.5])
 
     source_path = "tools/data/signals/FA01_09.wav"

@@ -8,6 +8,31 @@ from scipy.spatial.distance import pdist
 import numpy as np
 
 
+def split_rir_early_late(rir_vector, fs, t_early=0.050):
+    """
+    Splits a Room Impulse Response (RIR) into early and late components 
+    relative to the direct path arrival.
+    """
+    # Find the index of the direct path (maximum absolute value)
+    peak_idx = np.argmax(np.abs(rir_vector))
+    
+    # Calculate how many samples correspond to the early time window
+    split_offset = int(t_early * fs)
+    split_idx = peak_idx + split_offset
+    
+    # Prevent index out of bounds if the RIR is shorter than the window
+    split_idx = min(split_idx, len(rir_vector))
+    
+    # Initialize zero arrays to maintain the original temporal alignment
+    h_early = np.zeros_like(rir_vector)
+    h_late = np.zeros_like(rir_vector)
+    
+    # Populate the early and late sections
+    h_early[:split_idx] = rir_vector[:split_idx]
+    h_late[split_idx:] = rir_vector[split_idx:]
+    
+    return h_early, h_late
+
 def get_hybrid_sim_params(room_dims, mic_spacing, t_mix=0.08):
     """
     Calcula parámetros óptimos para simulación híbrida (ISM + Ray Tracing)
@@ -146,7 +171,6 @@ class SimAcoustic():
 
             #Propagates delay and cut to speicided time
             audio_propagated = space_delay(audio, self.fs, position, array_geometry)
-            audio_propagated = audio_propagated[:samples_lenght]
             #Normalize
             if normalize:
                 rms = np.sqrt(np.mean(audio_propagated[0,:]**2))
@@ -246,10 +270,6 @@ class SimAcoustic():
         room.compute_rir( )
         conv_source_signals = []
 
-        #Plot RIRs
-        room.plot_rir()
-        plt.show()
-
         #inicialice vectors to save results
         source_signals = np.zeros((self.M,N_samples ))
 
@@ -294,7 +314,134 @@ class SimAcoustic():
         array_input = source_signals_norm  +  interference_signals_norm *(1/iSIR)
         return array_input
     
+    def _split_rir(self, rir_vector, t_early=0.050):
+        # Find the index of the direct path arrival
+        peak_idx = np.argmax(np.abs(rir_vector))
+        
+        # Calculate the sample index for the 50ms threshold
+        split_offset = int(t_early * self.fs)
+        split_idx = min(peak_idx + split_offset, len(rir_vector))
+        
+        # Initialize arrays with zeros to maintain temporal alignment
+        h_early = np.zeros_like(rir_vector)
+        h_late = np.zeros_like(rir_vector)
+        
+        # Separate the early reflections and late reverberation
+        h_early[:split_idx] = rir_vector[:split_idx]
+        h_late[split_idx:] = rir_vector[split_idx:]
+        
+        return h_early, h_late
 
+    def get_eval_scene(self, room_dimensions, desire_RT, iSIR_dB=0, mode="real", inter_normalization=True, ray_tracing=True):
+        # Define output length in samples
+        N_samples = self.duration * self.fs
+
+        # Estimate absorption and maximum order of sources
+        alpha, max_order = pra.inverse_sabine(desire_RT, room_dimensions)
+        
+        if ray_tracing:
+            distances = pdist(self.real_array)
+            min_spacing = np.min(distances[distances > 0])
+            params_dic = get_hybrid_sim_params(room_dimensions, min_spacing, t_mix=0.06)
+            max_order = params_dic["max_order"]
+
+            material = pra.Material(alpha, scattering=0.2)        
+            room = pra.ShoeBox(
+                room_dimensions, 
+                self.fs, 
+                materials=material,
+                max_order=max_order,
+                ray_tracing=True,
+            )
+            room.set_ray_tracing(**params_dic["ray_tracing"])
+        else:
+            material = pra.Material(alpha)        
+            room = pra.ShoeBox(room_dimensions, self.fs, materials=material, max_order=max_order)
+
+        # Set source and interferences
+        source_pos = self.audio_sources[0]["position"].T
+        source_sig = self.audio_sources[0]["audio"].T
+        room.add_source(source_pos)
+        
+        for interference in self.audio_interferences:
+            room.add_source(interference["position"].T)
+
+        # Set mic array
+        mic_array = self.real_array.T if mode == "real" else self.ideal_array.T 
+        room.add_microphone_array(mic_array)
+
+        # Compute RIRs
+        room.compute_rir()
+
+        # Initialize storage arrays
+        target_early = np.zeros((self.M, N_samples))
+        target_late = np.zeros((self.M, N_samples))
+        interf_early_sum = np.zeros((self.M, N_samples))
+        interf_late_sum = np.zeros((self.M, N_samples))
+
+        # Convolve Source signal (Target)
+        for i in range(self.M):
+            h_early, h_late = self._split_rir(room.rir[i][0])
+            
+            sig_early = sc.signal.fftconvolve(h_early, source_sig)
+            sig_late = sc.signal.fftconvolve(h_late, source_sig)
+            
+            target_early[i, :] = sig_early[:N_samples]
+            target_late[i, :] = sig_late[:N_samples]
+
+        # Convolve interference signals
+        for i, interference in enumerate(self.audio_interferences):
+            audio = interference["audio"]
+            
+            # Temporary arrays for current interference across all mics
+            curr_interf_early = np.zeros((self.M, N_samples))
+            curr_interf_late = np.zeros((self.M, N_samples))
+            
+            for j in range(self.M):
+                h_early, h_late = self._split_rir(room.rir[j][i+1])
+                
+                sig_early = sc.signal.fftconvolve(h_early, audio)
+                sig_late = sc.signal.fftconvolve(h_late, audio)
+                
+                curr_interf_early[j, :] = sig_early[:N_samples]
+                curr_interf_late[j, :] = sig_late[:N_samples]
+            
+            # Accumulate interferences
+            interf_early_sum += curr_interf_early
+            interf_late_sum += curr_interf_late
+
+        # Normalization and Mixing
+        if inter_normalization:
+            # Calculate RMS of the total target signal at mic 0 for reference
+            target_total_mic0 = target_early[0, :] + target_late[0, :]
+            target_rms = np.sqrt(np.mean(target_total_mic0**2)) + 1e-10
+            
+            target_early /= target_rms
+            target_late /= target_rms
+
+            # Calculate RMS of the total interference sum at mic 0
+            interf_total_mic0 = interf_early_sum[0, :] + interf_late_sum[0, :]
+            interf_rms = np.sqrt(np.mean(interf_total_mic0**2)) + 1e-10
+            
+            # Apply interference normalization and iSIR
+            iSIR_linear = 10**(iSIR_dB / 20)
+            scaling_factor = (1 / interf_rms) * (1 / iSIR_linear)
+            
+            interf_early_sum *= scaling_factor
+            interf_late_sum *= scaling_factor
+
+        # Construct the final mixture
+        array_input = target_early + target_late + interf_early_sum + interf_late_sum
+
+        # Return a structured dictionary with all evaluation components
+        return {
+            "mic_signals": array_input,               # The actual input for your MPDR-WPE
+            "target_early": target_early,             # Pristine reference for PESQ/STOI/Numerator SINR
+            "target_late": target_late,               # Target reverberation (WPE target)
+            "interference_early": interf_early_sum,   # Directional interference (MPDR target)
+            "interference_late": interf_late_sum      # Diffuse background noise
+        }
+    
 if __name__ == "__main__":
 
     fs = 48000
@@ -302,7 +449,7 @@ if __name__ == "__main__":
     M1, M2 = 3, 3  
     M = M1 * M2
     
-    # Geometría
+    # Array geometry definition
     x = np.linspace(0, (M2-1)*mic_spacing, M2)
     y = np.linspace(0, (M1-1)*mic_spacing, M1)
     xv, yv = np.meshgrid(x, y, indexing='xy') 
@@ -311,24 +458,23 @@ if __name__ == "__main__":
     array_position = np.array([1, 1, 1]).reshape(1,3)
     mic_coords = array_position + mic_coords
 
-    #Sim settings
+    # Simulation settings
     mic_array_mismatch = 1e-3
     source_postion_mismatch = .1
     sim_duration = 4
 
-    #Room caracteristics
+    # Room characteristics
     room_dimensions = np.array([2.5, 4, 2.5])
     desire_RT = 1
 
-
     acoustic_scene = SimAcoustic(mic_coords, mic_array_mismatch , duration = sim_duration)
 
-    #Signals
+    # Signals paths
     source_path =       "tools/data/signals/FA01_09.wav"
     interference_path = "tools/data/signals/MC15_03.wav"
     interference_path1 = "tools/data/signals/MF31_03.wav"
 
-    #Signals Position
+    # Signals positions
     source_pos = np.array([1,1,.1]).reshape(1,3)
     interf_pos = np.array([2,1.3,.4]).reshape(1,3)
     interf_pos1 = np.array([1.4,2,1]).reshape(1,3)
@@ -337,25 +483,34 @@ if __name__ == "__main__":
     acoustic_scene.set_interference(interference_path, gain = 1,position =  interf_pos )
     acoustic_scene.set_interference(interference_path1, gain = 1,position =  interf_pos1 )
 
+    folder_path = "tests/data"
+
     # FREE FIELD
     array_input = acoustic_scene.free_field( iSIR_dB = 0)
-    folder_path = "tests/data"
     save_wav("Array_input.wav", fs, array_input[0], folder_path)
 
+    # ROOM ACOUSTIC SIMULATION FOR EVALUATION
+    # Execute the evaluation scene method to get the split signals dictionary
+    scene_data = acoustic_scene.get_eval_scene(room_dimensions, desire_RT = .5, iSIR_dB=0)
 
-    # ROOM ACOUSTIC SIMULATION 
-    isb_input = acoustic_scene.compute_room_ISB(room_dimensions, desire_RT = .5)
+    # ROOM ACOUSTIC SIMULATION FOR EVALUATION
+    # Execute the evaluation scene method to get the split signals dictionary
+    scene_data = acoustic_scene.get_eval_scene(room_dimensions, desire_RT=0.5, iSIR_dB=0)
 
-    save_wav("isb.wav", fs, isb_input[0], folder_path)
-
+    # Save all the evaluation components using the reference microphone (mic 0)
+    # 1. The dirty mixture that feeds the beamformer
+    save_wav("eval_mic_signals.wav", fs, scene_data["mic_signals"][0], folder_path)
     
-
-
-
+    # 2. Target with early reflections (Recommended PESQ/STOI reference)
+    save_wav("eval_target_early.wav", fs, scene_data["target_early"][0], folder_path)
     
+    # 3. Target late reverberation (What the WPE tries to cancel)
+    save_wav("eval_target_late.wav", fs, scene_data["target_late"][0], folder_path)
+    
+    # 4. Directional early interference (What the MPDR tries to cancel)
+    save_wav("eval_interference_early.wav", fs, scene_data["interference_early"][0], folder_path)
+    
+    # 5. Diffuse late interference (Background noise)
+    save_wav("eval_interference_late.wav", fs, scene_data["interference_late"][0], folder_path)
 
-        
-        
-        
-    
-    
+    print("All evaluation signals have been successfully saved.")

@@ -3,15 +3,15 @@ import numpy as np
 import scipy.signal as sig
 from numba import njit, prange
 
+# Import nara_wpe for the offline MIMO WPE pre-processing
+from nara_wpe.wpe import wpe_v6
+
 # Adjust imports based on your exact file structure
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav
 
 def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="near_field", squeeze=True):
-    """
-    Computes the Relative Transfer Function (RTF) steering vector in the frequency domain.
-    Aligns with the formulation d(l,k) = H_m(l,k) / H_ref(l,k) from the paper.
-    """
+    # Computes the Relative Transfer Function (RTF) steering vector in the frequency domain.
     f = np.atleast_1d(f)
     Rs = np.atleast_2d(Rs)
     
@@ -20,15 +20,12 @@ def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="
     M = mic_array.shape[0]
     
     # Calculate Euclidean distance from each source point to each microphone
-    # Shape: (P, M)
     mic_dist = np.linalg.norm(Rs[:, np.newaxis, :] - mic_array[np.newaxis, :, :], axis=2)
     
     # Extract the distance from each source to the designated fixed reference microphone
-    # Shape: (P, 1)
     ref_dist = mic_dist[:, ref_mic_idx, np.newaxis]
     
     # Calculate the path difference relative to the reference microphone
-    # Shape: (P, M)
     delta_dist = mic_dist - ref_dist
     
     # Reshape arrays for correct NumPy broadcasting across frequencies (F), sources (P), and mics (M)
@@ -36,12 +33,10 @@ def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="
     delta_dist_bcast = delta_dist[np.newaxis, :, :]
     
     # Compute the relative phase delay
-    # phase = exp(-j * 2 * pi * f * (d_m - d_ref) / c)
     phase_term = np.exp(-1j * 2 * np.pi * f_bcast * delta_dist_bcast / c)
     
     if mode == "near_field":
         # In near-field, amplitude decays with 1/r. 
-        # The relative amplitude ratio is (1/d_m) / (1/d_ref) = d_ref / d_m
         amp_ratio = ref_dist[np.newaxis, :, :] / mic_dist[np.newaxis, :, :]
         rtf_vector = amp_ratio * phase_term
     else:
@@ -53,35 +48,10 @@ def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="
 
     return rtf_vector
 
-def compute_roi_steering_vector(f, array_center, r, target_azimuth, roi_width_deg=36.0, num_points=21, mic_array=None, ref_mic_idx=0, c=343.0, mode="near_field"):
-    """
-    Computes the averaged steering vector b(Omega) over a specific angular sector (ROI).
-    """
-    # Convert ROI width to radians and generate uniform angular points
-    roi_width_rad = np.deg2rad(roi_width_deg)
-    azimuths = np.linspace(target_azimuth - roi_width_rad/2, target_azimuth + roi_width_rad/2, num_points)
-    
-    # Create the coordinates for all points in the defined ROI sector
-    Rs_roi = np.zeros((num_points, 3))
-    Rs_roi[:, 0] = array_center[0] + r * np.cos(azimuths)
-    Rs_roi[:, 1] = array_center[1] + r * np.sin(azimuths)
-    Rs_roi[:, 2] = array_center[2] # Assuming a 2D azimuth slice for the sector
-    
-    # Compute the standard RTF for all points simultaneously (squeeze=False to preserve the P dimension)
-    rtf_all = compute_rtf_steering_vector(f, Rs_roi, mic_array, ref_mic_idx, c, mode, squeeze=False)
-    
-    # Average across the spatial points dimension (axis=1) to obtain the ROI steering vector
-    b_omega = np.mean(rtf_all, axis=1)
-    
-    return np.squeeze(b_omega)
-
 @njit(parallel=True, fastmath=True)
-def MPDRxWPE_numba(y_stft, sv, alpha=0.994, L=12, Delta=2, epsilon=1e-12):
-    """
-    Optimized MPDR-WPE bilinear framework using Numba.
-    The frequency loop is parallelized, and memory allocation 
-    is kept thread-local for cache efficiency.
-    """
+def MPDRxWPE_numba(y_stft, sv, alpha=0.994, L=20, Delta=6, epsilon=1e-12):
+    # Optimized MPDR-WPE bilinear framework using Numba.
+    # Note default parameters updated for the second stage WPE.
     K, T, M = y_stft.shape
     epsilon_inv = 1.0 / epsilon
     
@@ -173,15 +143,13 @@ def MPDRxWPE_numba(y_stft, sv, alpha=0.994, L=12, Delta=2, epsilon=1e-12):
             
     return X_hat_out
 
+
 if __name__ == "__main__":
-    # The paper uses a sampling rate of 16 kHz 
     FS = 16000
-    # The SPEAR challenge array uses 6 microphones 
-    M1 = 12 
-    M = 12
-    speed_of_sound = 343.0 
+    M1, M2 = 12, 1          
+    M = M1 * M2
     
-    print("=== INTEGRATION TEST: MPDR-WPE BILINEAR FRAMEWORK ===")
+    print("=== INTEGRATION TEST: MIMO-WPE + MPDR-WPE BILINEAR FRAMEWORK ===")
     
     output_folder = "tests/data/mpdr_wpe_output"
     os.makedirs(output_folder, exist_ok=True)
@@ -203,7 +171,6 @@ if __name__ == "__main__":
 
     # 2. ACOUSTIC SCENE WITH PHASE MISMATCH
     print(" -> Initializing acoustic scene with physical mismatch...")
-    # We introduce a 5 mm random position error to simulate phase mismatch
     acoustic_scene = SimAcoustic(mic_coords_ideal, array_mismatch=0.005, duration=10, fs=FS)
 
     source_path = "tools/data/signals/FA01_09.wav"
@@ -216,23 +183,19 @@ if __name__ == "__main__":
     room_dimensions = np.array([4.0, 5.0, 2.5])
     
     room_input_real = acoustic_scene.compute_room_ISB(iSIR_dB=0, 
-                                                      desire_RT=0.5,
-                                                      room_dimensions=room_dimensions, 
-                                                      mode="ideal")
-    
+                                                    desire_RT=0.5,
+                                                    room_dimensions=room_dimensions, 
+                                                    mode="ideal")
+
     # 3. APPLY GAIN MISMATCH
     print(" -> Applying Gain Mismatch to microphones...")
-    np.random.seed(42) # For reproducibility in testing
-    # Generate random gain variations between 0.9 and 1.1 (+/- 10%)
+    np.random.seed(42) 
     gain_mismatch = np.random.uniform(0.9, 1.1, (M, 1))
-    
-    # Apply the gain mismatch to the propagated signals
     room_input_mismatched = room_input_real * gain_mismatch
     
     save_wav("1_input_mix_mic0_mismatched.wav", FS, room_input_mismatched[0], output_folder)
     
     # 4. SHORT-TIME FOURIER TRANSFORM
-    # The paper uses 1024 samples with 75% overlap and a Hamming window 
     nperseg = 1024
     noverlap = int(1024 * 0.75)
     nfft = 1024
@@ -240,48 +203,47 @@ if __name__ == "__main__":
     print(" -> Applying STFT...")
     freqs, times, X_stft = sig.stft(
         room_input_mismatched, fs=FS, window='hamming', 
+        nperseg=nperseg, noverlap=noverlap, nfft=nfft 
+    )
+    
+    # 4.1 OFFLINE MIMO WPE (NARA-WPE)
+    print(" -> Executing Offline MIMO WPE (First Stage)...")
+    # nara_wpe expects input shape (F, M, T)
+    Y_wpe_in = np.transpose(X_stft, (1, 0, 2))
+    
+    taps_in = 4
+    delay_in = 2
+    
+    # Apply standard variance-normalized delayed linear prediction 
+    Z_wpe_out = wpe_v6(Y_wpe_in, taps=taps_in, delay=delay_in, iterations=3)
+    
+    # Transpose back to (K, T, M) and make contiguous for Numba
+    X_stft_mpdr = np.transpose(Z_wpe_out, (0, 2, 1))
+    X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
+
+    # 5. MPDR-WPE OPTIMIZATION
+    print(" -> Executing MPDR-WPE on WPE-preprocessed signals...")
+    Rs_matrix = source_pos.reshape(1, 3)
+    
+    sv = compute_rtf_steering_vector(freqs, 
+                                     Rs_matrix, 
+                                     mic_coords_ideal, 
+                                     ref_mic_idx=0, 
+                                     mode="near_field", 
+                                     squeeze=True)
+
+    # Cascaded delay parameters: Output delay skips the input WPE window
+    delta_out = delay_in + taps_in
+    taps_out = 20
+
+    X_hat_stft = MPDRxWPE_numba(X_stft_mpdr, sv, L=taps_out, Delta = delta_out)
+    
+    # 6. RECONSTRUCTION
+    print(" -> Reconstructing time-domain signal...")
+    _, y_time = sig.istft(
+        X_hat_stft, fs=FS, window='hamming', 
         nperseg=nperseg, noverlap=noverlap, nfft=nfft
     )
     
-    # Transpose to (K, T, M) and make contiguous for Numba
-    X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
-    X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
-
-    # 5. POINT-SOURCE MPDR-WPE (BASELINE)
-    print(" -> Computing Point-Source Steering Vector...")
-    sv_point = compute_rtf_steering_vector(freqs, 
-                                           source_pos.reshape(1, 3), 
-                                           mic_coords_ideal, 
-                                           ref_mic_idx=0, 
-                                           mode="near_field", 
-                                           squeeze=True)
-                                           
-    print(" -> Executing Baseline MPDR-WPE...")
-    X_hat_point = MPDRxWPE_numba(X_stft_mpdr, sv_point)
-    
-    print(" -> Reconstructing Baseline time-domain signal...")
-    _, y_time_point = sig.istft(X_hat_point, fs=FS, window='hamming', nperseg=nperseg, noverlap=noverlap, nfft=nfft)
-    save_wav("2_output_MPDR_WPE_Baseline.wav", FS, y_time_point, output_folder)
-
-    # 6. ROI-BASED MPDR-WPE
-    print(" -> Computing ROI Steering Vector (36-degree sector)...")
-    # Using a 36-degree sector (+/- 18 degrees) as evaluated in the Sensors paper
-    sv_roi = compute_roi_steering_vector(freqs, 
-                                         array_center, 
-                                         r, 
-                                         target_azimuth=ang_target, 
-                                         roi_width_deg=10, 
-                                         num_points=21, 
-                                         mic_array=mic_coords_ideal, 
-                                         ref_mic_idx=0, 
-                                         mode="near_field")
-
-    print(" -> Executing ROI-based MPDR-WPE...")
-    # We pass the averaged b_omega vector exactly as if it were a point-source vector
-    X_hat_roi = MPDRxWPE_numba(X_stft_mpdr, sv_roi)
-
-    print(" -> Reconstructing ROI time-domain signal...")
-    _, y_time_roi = sig.istft(X_hat_roi, fs=FS, window='hamming', nperseg=nperseg, noverlap=noverlap, nfft=nfft)
-    save_wav("3_output_MPDR_WPE_ROI.wav", FS, y_time_roi, output_folder)
-    
+    save_wav("2_output_MIMOWPE_MPDR_WPE.wav", FS, y_time, output_folder)
     print(" -> Pipeline completed.")

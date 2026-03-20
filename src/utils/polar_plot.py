@@ -41,7 +41,7 @@ def plot_polar_pattern(gains_list: List[np.ndarray], angles_deg: np.ndarray, lab
         [0, 90, 180, 270], 
         labels=['X (0°)', 'Y (90°)', '-X (180°)', '-Y (270°)']
     )
-
+    
     # 2. Ajustar el eje radial (Etiqueta de Ganancia)
     ax.set_rlim(-50, 5) # Límite radial
     ax.set_rticks(np.arange(-40, 1, 10)) # Marcas radiales

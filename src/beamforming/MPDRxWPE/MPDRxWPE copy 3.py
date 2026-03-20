@@ -1,6 +1,11 @@
 import numpy as np
 import scipy.signal as signal
+import os
+import scipy.signal as sig
+from propagation.simulate_acoustics import SimAcoustic
+from utils.audio import save_wav
 
+from numba import njit
 def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="near_field", squeeze=True):
     """
     Computes the Relative Transfer Function (RTF) steering vector in the frequency domain.
@@ -47,14 +52,10 @@ def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="
 
     return rtf_vector
 
-import numpy as np
-from numba import njit
-from numba import njit
-import numpy as np
 
 @njit(cache=True)
 def MVDRxWPE(y_stft, sv):
-    # Dimensions extracted directly from the STFT matrix
+    # Extract dimensions from the STFT matrix
     K, T, M = y_stft.shape
 
     # Length of the temporal filter and prediction delay
@@ -66,7 +67,7 @@ def MVDRxWPE(y_stft, sv):
     alpha = 0.994 
     epsilon_inv = 1.0 / epsilon
     
-    # Initialize Filters
+    # Initialize temporal (g) and spatial (h) filters
     h = np.zeros((K, M), dtype=np.complex128)
     g = np.zeros((K, L), dtype=np.complex128)
 
@@ -77,7 +78,8 @@ def MVDRxWPE(y_stft, sv):
     
     # R_h_inv for the temporal filter (WPE)
     R_h_inv = np.zeros((K, L, L), dtype=np.complex128)
-    # Phi_vv_inv replaces R_g_inv for the spatial filter (MVDR Noise Covariance)
+    
+    # Phi_vv_inv for the spatial filter (MVDR Noise Covariance)
     Phi_vv_inv = np.zeros((K, M, M), dtype=np.complex128)
     
     for k in range(K):
@@ -101,59 +103,85 @@ def MVDRxWPE(y_stft, sv):
     y_bar_g = np.zeros(M, dtype=np.complex128)
     y_bar_h = np.zeros(L, dtype=np.complex128)
 
-    # Simple Soft VAD State Variables
-    p_energy = np.zeros(K)
-    p_min = np.ones(K) * 1e-4
-
     # Temporal loop (T frames)
     for l_idx in range(T):
         
         # Frequency loop (K bins)
         for k in range(K):
             
-            # 1. Update buffer and extract y_bar
+            # 1. Update observation buffer
             for i in range(buffer_len - 1, M - 1, -1):
                 y_buffer[k, i] = y_buffer[k, i - M]
             
             for m in range(M):
                 y_buffer[k, m] = y_stft[k, l_idx, m]
 
-                for i in range(L * M):
-                    y_bar[k, i] = y_buffer[k, i + (Delta * M)]
+            for i in range(L * M):
+                y_bar[k, i] = y_buffer[k, i + (Delta * M)]
                 
-            # 2. Compute y_bar_g
+            # 2. Compute filtered observation vector y_bar_g (removes late reverb)
             for m in range(M):
                 summ = 0.0 + 0.0j
                 for l in range(L):
                     summ += np.conj(g[k, l]) * y_bar[k, l * M + m]
                 y_bar_g[m] = y_stft[k, l_idx, m] - summ
                 
-            # 3. Compute y_bar_h
+            # 3. Compute filtered observation vector y_bar_h
             for l in range(L):
                 summ = 0.0 + 0.0j 
                 for m in range(M):
                     summ += np.conj(h[k, m]) * y_bar[k, l * M + m]
                 y_bar_h[l] = summ
 
+            # --- SPATIAL VAD CALCULATION ---
+            # Calculate total energy across microphones for this frequency bin
+            energy_total = 0.0
+            for m in range(M):
+                energy_total += np.abs(y_bar_g[m])**2
+            
+            # Calculate energy projected purely in the target direction
+            target_projection = 0.0 + 0.0j
+            for m in range(M):
+                target_projection += np.conj(sv[k, m]) * y_bar_g[m]
+            
+            energy_target = (np.abs(target_projection)**2) / M
+            
+            # Calculate the spatial correlation ratio
+            if energy_total > 1e-10:
+                spatial_ratio = energy_target / energy_total
+            else:
+                spatial_ratio = 0.0
+                
+            # Soft VAD decision based on spatial ratio mapping
+            # Ratios below 0.2 indicate interference dominance (vad = 0.0)
+            # Ratios above 0.6 indicate target dominance (vad = 1.0)
+            vad_soft = min(1.0, max(0.0, (spatial_ratio - 0.2) * 2.5))
+            # -------------------------------
+
             # 4. Compute A Priori Estimate
             X_hat = 0.0 + 0.0j
             for m in range(M):
                 X_hat += np.conj(h[k, m]) * y_bar_g[m]
             
-            lambda_l = np.abs(X_hat)**2
+            lambda_l = np.abs(X_hat)**2 + 1e-12
             X_hat_out[k, l_idx] = X_hat
 
-            # 5. Compute Kalman gain for spatial filter (MPDR Continuous Update)
-            # Removed the VAD completely. We use continuous RLS update as per MPDR framework.
-            num_g = Phi_vv_inv[k] @ y_bar_g
-            den_g = alpha + np.vdot(y_bar_g, num_g) 
-            k_g = num_g / den_g
+            # 5. Compute Kalman gain for spatial filter (MVDR Noise Update)
+            w_eff = 1.0 - vad_soft
+            alpha_eff = vad_soft + (1.0 - vad_soft) * alpha
             
-            # 6. Update Spatial Covariance Matrix using Woodbury
-            update_g = np.outer(k_g, np.conj(y_bar_g)) @ Phi_vv_inv[k]
-            Phi_vv_inv[k] = (Phi_vv_inv[k] - update_g) / alpha
+            # Only update the noise covariance matrix if interference is dominant
+            if w_eff > 1e-3: 
+                num_g = Phi_vv_inv[k] @ y_bar_g
+                den_g = (alpha_eff / w_eff) + np.vdot(y_bar_g, num_g) 
+                k_g = num_g / den_g
+                
+                # 7. Update Noise Covariance Matrix using Woodbury
+                update_g = np.outer(k_g, np.conj(y_bar_g)) @ Phi_vv_inv[k]
+                Phi_vv_inv[k] = (Phi_vv_inv[k] - update_g) / alpha_eff
             
-            # 7. Compute Kalman gain for temporal filter (WPE)
+            # 6. Compute Kalman gain for temporal filter (WPE)
+            # WPE continuously updates to track the room impulse response
             num_h = R_h_inv[k] @ y_bar_h
             den_h = alpha * lambda_l + np.vdot(y_bar_h, num_h)
             k_h = num_h / den_h
@@ -165,12 +193,11 @@ def MVDRxWPE(y_stft, sv):
             # 9. Update Temporal Filter g
             g[k] = g[k] + k_h * np.conj(X_hat)
             
-            # 10. Update Regularized Covariance R_sigma_inv using Woodbury
-            # Using the matrix inversion lemma exactly as described in the paper Eq 32
+            # 10. Update Regularized Covariance R_sigma_inv
             inner_inv = np.linalg.inv((epsilon_inv * I_M) + Phi_vv_inv[k])
             R_sigma_inv = Phi_vv_inv[k] - (Phi_vv_inv[k] @ inner_inv @ Phi_vv_inv[k])
             
-            # 11. Update Spatial Filter h
+            # 11. Update Spatial Filter h with MVDR constraint
             d = sv[k]
             num_h_update = R_sigma_inv @ d
             den_h_update = np.vdot(d, num_h_update)
@@ -178,12 +205,7 @@ def MVDRxWPE(y_stft, sv):
 
     return X_hat_out
 
-import os
-import scipy.signal as sig
 
-# Adjust imports based on your exact file structure
-from propagation.simulate_acoustics import SimAcoustic
-from utils.audio import save_wav
 
 # Import the new algorithm and the steering vector function
 # from beamforming.MPDRxWPE import MPDRxWPE, compute_rtf_steering_vector 
@@ -204,7 +226,7 @@ if __name__ == "__main__":
     M = 8
 
     # Define the radius of the circular array in meters (e.g., 5 cm)
-    radius = 0.05
+    radius = 0.1
 
     # Calculate the angle for each microphone to distribute them evenly in a circle
     angles = np.linspace(0, 2 * np.pi, M, endpoint=False)
@@ -251,14 +273,14 @@ if __name__ == "__main__":
     
     # T60 = 0.2s for a moderate room reverberation
 
-    """
+    
     room_input_real = acoustic_scene.compute_room_ISB(iSIR_dB=0, 
                                                     desire_RT=0.5,
-                                                    room_dimensions=room_dimensions, 
+                                                    room_dimensions= room_dimensions, 
                                                     mode="ideal")
-    """
+    
 
-    room_input_real = acoustic_scene.free_field(iSIR_dB=0, normalize=True, mode="ideal")
+    #room_input_real = acoustic_scene.free_field(iSIR_dB=0, normalize=True, mode="real")
     
     # 3. APPLY GAIN MISMATCH
     print(" -> Applying Gain Mismatch to microphones...")
