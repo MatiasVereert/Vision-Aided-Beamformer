@@ -82,6 +82,8 @@ def online_mwf_numba(y_stft, sv, alpha=0.95, diag_load=1e-3):
     # Online Multichannel Wiener Filter (MWF) with Robust MVDR and Dynamic Noise Tracking
     K, T, M = y_stft.shape
     X_hat_out = np.zeros((K, T), dtype=np.complex128)
+    # Output tensor to store the effective spatial weights for the visualization dashboard
+    weights_out = np.zeros((K, T, M), dtype=np.complex128)
     
     for k in range(K):
         # Initialize thread-local Spatial Covariance Matrix (SCM)
@@ -121,7 +123,6 @@ def online_mwf_numba(y_stft, sv, alpha=0.95, diag_load=1e-3):
             out_pow = np.abs(y_out)**2
             
             # 6. Track noise power using an asymmetric leaky integrator
-            # Fast attack when power drops (noise floor), slow release when power rises (speech)
             if out_pow < noise_pow:
                 noise_pow = 0.8 * noise_pow + 0.2 * out_pow
             else:
@@ -131,7 +132,9 @@ def online_mwf_numba(y_stft, sv, alpha=0.95, diag_load=1e-3):
             snr_prio = max(1e-6, (out_pow - noise_pow) / noise_pow)
             g_wiener = snr_prio / (snr_prio + 1.0)
             
-            # 8. Apply MWF final gain
+            # 8. Apply MWF final gain and save effective weights for visualization
+            w_effective = w_mvdr
+            weights_out[k, t, :] = w_effective
             X_hat_out[k, t] = g_wiener * y_out
             
-    return X_hat_out
+    return X_hat_out, weights_out

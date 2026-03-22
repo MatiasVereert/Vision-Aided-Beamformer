@@ -178,8 +178,16 @@ def precompute_quantized_spatial_response(weights, freqs, mic_pos, source_radius
     """
     points = get_sphere_of_points(source_radius, N_azimuth)
     
+    # --- FIX: Translate the evaluation grid to the physical location of the array ---
+    # The 'points' are generated around the origin [0, 0, 0]. 
+    # We must shift them to the array's acoustic center before calculating the RTF,
+    # otherwise the steering vectors will evaluate completely skewed incoming angles.
+    array_center = np.mean(mic_pos, axis=0)
+    eval_points = points + array_center
+    
     # Guarantee a 3D tensor output for the JIT compiler, regardless of single frequencies
-    steering_vectors = compute_rtf_steering_vector(freqs, points, mic_pos, mode="near_field", squeeze=False)
+    # Pass 'eval_points' to calculate accurate phase delays
+    steering_vectors = compute_rtf_steering_vector(freqs, eval_points, mic_pos, mode="near_field", squeeze=False)
     
     # Execute heavily parallelized complex dot product and dB conversion
     db_gain = _compute_spatial_response_core(steering_vectors, weights)
@@ -197,7 +205,7 @@ def precompute_quantized_spatial_response(weights, freqs, mic_pos, source_radius
     normalized = (clipped_db - min_dB) / (max_db_per_frame - min_dB + 1e-12)
     quantized_gain = (np.clip(normalized, 0, 1) * 255.0).astype(np.uint8)
     
-    # Return the array of max_dB values (squeezed to remove the singleton dimension)
+    # Return the origin-centered 'points' so the Plotly mesh generation in dashboard.py stays intact
     return quantized_gain, points, np.squeeze(max_db_per_frame, axis=1)
 
 if __name__ == "__main__":

@@ -4,86 +4,148 @@ import time
 import numpy as np
 import pandas as pd
 import scipy.signal as sig
+import hashlib
+import pickle
 
 # Import the Numba function and steering vector helper from your module
-from beamforming.MPDRxWPE.MPDRxWPE import MPDRxWPE_numba
+from beamforming.MPDRxWPE.MPDRxWPE import MPDRxWPE_numba, MPDRxWPE_numba_warm, MPDRxWPE_numba_warm_v1, MPDRxWPE_numba_block_warmup
 from beamforming.signal_model import compute_rtf_steering_vector
 from evaluation.metrics import evaluate_full_pipeline
 from propagation.simulate_acoustics import SimAcoustic
 
 from evaluation.polar_plots import precompute_quantized_spatial_response, subsample_weights
+from beamforming.MWF.onlineMWF import online_mwf_numba
 
 
-class DS_Processor:
+
+class MWF_Processor:
     """
-    Modified Delay-and-Sum beamformer for DASHBOARD TESTING.
-    Produces a dynamic spatial filter with a strictly forced rotating null
-    to visually verify that the dashboard renders time-varying changes.
+    Object-oriented wrapper for the Online Multichannel Wiener Filter (MWF).
     """
-    def __init__(self, nperseg=1024, noverlap=768):
+    def __init__(self, alpha=0.95, diag_load = 1e-3, nperseg=1024, noverlap=768):
+        self.alpha = alpha
+        self.diag_load = diag_load
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> np.ndarray:
+        # 1. Extract simulation context
         fs = scene_config['fs']
         source_pos = scene_config['source_pos'].reshape(1, 3)
         mic_coords = scene_config['mic_coords']
-        M_mics = mic_coords.shape[0]
         
-        # 1. STFT Conversion
+        # 2. Time to Frequency domain (STFT)
         freqs, times, X_stft = sig.stft(
             mic_signals, fs=fs, window='hamming', 
             nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
         )
         
-        X_stft_ds = np.transpose(X_stft, (1, 2, 0))
-        K, T, M = X_stft_ds.shape
+        # 3. Transpose to match Numba function expectations (K, T, M)
+        X_stft_mwf = np.transpose(X_stft, (1, 2, 0))
+        X_stft_mwf = np.ascontiguousarray(X_stft_mwf, dtype=np.complex128)
         
-        # 2. Compute exact steering vector for the static target
-        sv_target = compute_rtf_steering_vector(
+        # 4. Compute Steering Vector for the target source
+        sv = compute_rtf_steering_vector(
             freqs, source_pos, mic_coords, 
             ref_mic_idx=0, mode="near_field", squeeze=True
-        ) 
+        )
         
-        # 3. Generate rotating null positions spanning a full circle over T frames
-        array_center = np.mean(mic_coords, axis=0)
-        angles = np.linspace(0, 2 * np.pi, T)
-        r_null = 1.5 
+        # 5. Execute core MWF algorithm
+        X_hat_stft, weights = online_mwf_numba(
+            X_stft_mwf, sv, alpha=self.alpha, 
+        )
         
-        null_positions = np.zeros((T, 3))
-        null_positions[:, 0] = array_center[0] + r_null * np.cos(angles)
-        null_positions[:, 1] = array_center[1] + r_null * np.sin(angles)
-        null_positions[:, 2] = array_center[2] 
+        # 6. Frequency to Time domain (ISTFT)
+        _, y_time = sig.istft(
+            X_hat_stft, fs=fs, window='hamming', 
+            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+        )
         
-        # 4. Compute steering vectors for the rotating null in a single batch
-        # This returns a tensor of shape (K, T, M)
-        sv_null = compute_rtf_steering_vector(
-            freqs, null_positions, mic_coords,
+        return y_time, weights
+    
+class MPDR_WPE_Warmup_Processor:
+    """
+    Object-oriented wrapper for the MPDR-WPE bilinear framework.
+    Includes Diffuse Field Initialization and Exponential Forgetting Factor (Warm-up).
+    """
+    def __init__(self, L=20, Delta=4, alpha_steady=0.994, alpha_init=0.500, tau=20.0, nperseg=1024, noverlap=768, diag_load=1e-2):
+        self.L = L
+        self.Delta = Delta
+        self.alpha_steady = alpha_steady
+        self.alpha_init = alpha_init
+        self.tau = tau
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.diag_loading = diag_load
+
+    def compute_diffuse_coherence(self, freqs, mic_coords, c=343.0):
+        """
+        Computes the theoretical diffuse field coherence matrix for the given microphone geometry.
+        Formula: Gamma_ij(k) = sinc(2 * pi * f_k * d_ij / c)
+        """
+        K = len(freqs)
+        M = len(mic_coords)
+        Gamma_diffuse = np.zeros((K, M, M), dtype=np.complex128)
+        
+        for i in range(M):
+            for j in range(M):
+                if i == j:
+                    # Auto-coherence is always 1
+                    Gamma_diffuse[:, i, j] = 1.0 + 0.0j
+                else:
+                    # Calculate Euclidean distance between mic i and mic j
+                    d_ij = np.linalg.norm(mic_coords[i] - mic_coords[j])
+                    
+                    # np.sinc(x) computes sin(pi * x) / (pi * x)
+                    # We need sin(2 * pi * f * d / c) / (2 * pi * f * d / c)
+                    # Therefore, we pass x = 2 * f * d / c
+                    arg = 2.0 * freqs * d_ij / c
+                    Gamma_diffuse[:, i, j] = np.sinc(arg) + 0.0j
+                    
+        return Gamma_diffuse
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> np.ndarray:
+        # 1. Extract simulation context
+        fs = scene_config['fs']
+        source_pos = scene_config['source_pos'].reshape(1, 3)
+        mic_coords = scene_config['mic_coords']
+        
+        # 2. Time to Frequency domain (STFT)
+        freqs, times, X_stft = sig.stft(
+            mic_signals, fs=fs, window='hamming', 
+            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+        )
+        
+        # 3. Transpose to match Numba function expectations (K, T, M)
+        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
+        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
+        
+        # 4. Compute Steering Vector for the target source
+        sv = compute_rtf_steering_vector(
+            freqs, source_pos, mic_coords, 
             ref_mic_idx=0, mode="near_field", squeeze=True
-        ) 
+        )
         
-        weights = np.zeros((K, T, M), dtype=np.complex128)
-        X_hat_stft = np.zeros((K, T), dtype=np.complex128)
+        # 5. Precompute Diffuse Field Coherence Matrix
+        Gamma_diffuse = self.compute_diffuse_coherence(freqs, mic_coords)
         
-        # 5. Apply orthogonal projection to force the rotating null
-        for k in range(K):
-            v_targ = sv_target[k] 
-            for t in range(T):
-                v_n = sv_null[k, t] 
-                
-                # Gram-Schmidt orthogonalization to enforce a strict null
-                # w = v_target - v_null * (<v_null, v_target> / <v_null, v_null>)
-                overlap = np.vdot(v_n, v_targ) / np.vdot(v_n, v_n)
-                w_t = v_targ - (v_n * overlap)
-                
-                # Scale down by M to maintain overall magnitude similar to standard DS
-                w_t = w_t / M_mics
-                
-                weights[k, t, :] = w_t
-                X_hat_stft[k, t] = np.vdot(w_t, X_stft_ds[k, t, :])
-                
-        # 6. ISTFT Reconstruction
+        # 6. Execute core beamforming algorithm with warm-up parameters
+        X_hat_stft, weights = MPDRxWPE_numba_warm_v1(
+            X_stft_mpdr, 
+            sv, 
+            Gamma_diffuse,
+            alpha_steady=self.alpha_steady,
+            alpha_init=self.alpha_init,
+            tau=self.tau,
+            L=self.L, 
+            Delta=self.Delta, 
+            epsilon=self.diag_loading,
+            save_weights=True
+        )
+        
+        # 7. Frequency to Time domain (ISTFT)
         _, y_time = sig.istft(
             X_hat_stft, fs=fs, window='hamming', 
             nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
@@ -91,13 +153,67 @@ class DS_Processor:
         
         return y_time, weights
 
+class MPDR_WPE_BlockWarmup_Processor:
+    """
+    Object-oriented wrapper for the MPDR-WPE bilinear framework.
+    Implements Data-Driven Block Initialization (Warm-up).
+    """
+    def __init__(self, T_warmup=62, L=20, Delta=4, alpha=0.994, nperseg=1024, noverlap=768, diag_load=1e-2):
+        self.T_warmup = T_warmup
+        self.L = L
+        self.Delta = Delta
+        self.alpha = alpha
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.diag_loading = diag_load
 
-"""
+    def process(self, mic_signals: np.ndarray, scene_config: dict):
+        # Extract simulation context
+        fs = scene_config['fs']
+        source_pos = scene_config['source_pos'].reshape(1, 3)
+        mic_coords = scene_config['mic_coords']
+        
+        # Time to Frequency domain (STFT)
+        freqs, times, X_stft = sig.stft(
+            mic_signals, fs=fs, window='hamming', 
+            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+        )
+        
+        # Transpose to match Numba function expectations (K, T, M) and force contiguous memory
+        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
+        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
+        
+        # Compute Steering Vector for the target source
+        sv = compute_rtf_steering_vector(
+            freqs, source_pos, mic_coords, 
+            ref_mic_idx=0, mode="near_field", squeeze=True
+        )
+        
+        # Execute core beamforming algorithm with block warm-up
+        X_hat_stft, weights = MPDRxWPE_numba_block_warmup(
+            X_stft_mpdr, 
+            sv, 
+            T_warmup=self.T_warmup,
+            alpha=self.alpha,
+            L=self.L, 
+            Delta=self.Delta, 
+            epsilon=self.diag_loading,
+            save_weights=True
+        )
+        
+        # Frequency to Time domain (ISTFT)
+        _, y_time = sig.istft(
+            X_hat_stft, fs=fs, window='hamming', 
+            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+        )
+        
+        return y_time, weights
 class DS_Processor:
-
+    """
     Standard Delay-and-Sum beamformer for baseline comparison.
     Produces a completely static spatial filter.
-    
+    """
     def __init__(self, nperseg=1024, noverlap=768):
         self.nperseg = nperseg
         self.noverlap = noverlap
@@ -143,19 +259,77 @@ class DS_Processor:
         )
         
         return y_time, weights
+
+class MPDR_WPE_BlockWarmup_Processor:
     """
-class MPDR_WPE_Processor:
+    Object-oriented wrapper for the MPDR-WPE bilinear framework.
+    Implements Data-Driven Block Initialization (Warm-up).
     """
-    Object-oriented wrapper to interface the time-domain benchmark 
-    with the frequency-domain Numba MPDR-WPE implementation.
-    """
-    def __init__(self, L=12, Delta=2, alpha=0.994, nperseg=1024, noverlap=768):
+    def __init__(self, T_warmup=62, L=20, Delta=4, alpha=0.994, nperseg=1024, noverlap=768, diag_load=1e-2):
+        self.T_warmup = T_warmup
         self.L = L
         self.Delta = Delta
         self.alpha = alpha
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
+        self.diag_loading = diag_load
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict):
+        # Extract simulation context
+        fs = scene_config['fs']
+        source_pos = scene_config['source_pos'].reshape(1, 3)
+        mic_coords = scene_config['mic_coords']
+        
+        # Time to Frequency domain (STFT)
+        freqs, times, X_stft = sig.stft(
+            mic_signals, fs=fs, window='hamming', 
+            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+        )
+        
+        # Transpose to match Numba function expectations (K, T, M) and force contiguous memory
+        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
+        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
+        
+        # Compute Steering Vector for the target source
+        sv = compute_rtf_steering_vector(
+            freqs, source_pos, mic_coords, 
+            ref_mic_idx=0, mode="near_field", squeeze=True
+        )
+        
+        # Execute core beamforming algorithm with block warm-up
+        X_hat_stft, weights = MPDRxWPE_numba_block_warmup(
+            X_stft_mpdr, 
+            sv, 
+            T_warmup=self.T_warmup,
+            alpha=self.alpha,
+            L=self.L, 
+            Delta=self.Delta, 
+            epsilon=self.diag_loading,
+            save_weights=True
+        )
+        
+        # Frequency to Time domain (ISTFT)
+        _, y_time = sig.istft(
+            X_hat_stft, fs=fs, window='hamming', 
+            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+        )
+        
+        return y_time, weights
+class MPDR_WPE_Processor:
+    """
+    Object-oriented wrapper to interface the time-domain benchmark 
+    with the frequency-domain Numba MPDR-WPE implementation.
+    """
+    def __init__(self, L=12, Delta=2, alpha=0.994, nperseg=1024, noverlap=768, diag_load=1e-6):
+        self.L = L
+        self.Delta = Delta
+        self.alpha = alpha
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.diag_loading = diag_load
+
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> np.ndarray:
         # 1. Extract simulation context
@@ -181,7 +355,7 @@ class MPDR_WPE_Processor:
         
         # 5. Execute core beamforming algorithm
         X_hat_stft, weights = MPDRxWPE_numba(
-            X_stft_mpdr, sv, alpha=self.alpha, L=self.L, Delta=self.Delta, save_weights = True
+            X_stft_mpdr, sv, alpha=self.alpha, L=self.L, Delta=self.Delta, save_weights = True, epsilon= self.diag_loading
         )
         
         # 6. Frequency to Time domain (ISTFT)
@@ -195,7 +369,6 @@ class MPDR_WPE_Processor:
 
 # Make sure to import the optimized functions at the top of your evaluate.py
 # from polar_plots import subsample_weights, precompute_quantized_spatial_response
-
 def run_benchmark_scenario(scenario_id: str, 
                            scene_config: dict, 
                            processors: dict, 
@@ -211,31 +384,52 @@ def run_benchmark_scenario(scenario_id: str,
     print(f"--- Starting Benchmark: {scenario_id} ---")
     
     # ==========================================
-    # 1. SIMULATION STAGE
+    # 1. SIMULATION STAGE (WITH CACHING)
     # ==========================================
-    print(" -> Simulating acoustic scene...")
-    acoustic_scene = SimAcoustic(
-        array_geometry=scene_config['mic_coords'], 
-        array_mismatch=scene_config.get('mismatch', 1e-12), 
-        duration=scene_config['duration'], 
-        fs=fs
-    )
-
-    acoustic_scene.set_source(scene_config['source_path'], gain=1.0, position=scene_config['source_pos'].reshape(1,3))
+    # Create a stable hash of the configuration to use as a fingerprint
+    config_bytes = pickle.dumps(scene_config)
+    config_hash = hashlib.md5(config_bytes).hexdigest()
     
-    for interf in scene_config['interferences']:
-        acoustic_scene.set_interference(interf['path'], gain=1.0, position=interf['pos'].reshape(1,3))
+    # Define cache directory and specific file for this configuration
+    cache_dir = os.path.join(output_dir, ".sim_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"scene_{config_hash}.pkl")
 
-    scene_data = acoustic_scene.get_eval_scene(
-        room_dimensions=scene_config['room_dims'], 
-        desire_RT=scene_config['rt60'], 
-        iSIR_dB=scene_config['sir_db'],
-        mode="real" 
-    )
+    if os.path.exists(cache_file):
+        print(f" -> Loading CACHED acoustic scene (Hash: {config_hash[:8]})...")
+        with open(cache_file, 'rb') as f:
+            scene_data = pickle.load(f)
+    else:
+        print(" -> Simulating NEW acoustic scene...")
+        acoustic_scene = SimAcoustic(
+            array_geometry=scene_config['mic_coords'], 
+            array_mismatch=scene_config.get('mismatch', 1e-3), 
+            duration=scene_config['duration'], 
+            fs=fs
+        )
 
+        acoustic_scene.set_source(scene_config['source_path'], gain=1.0, position=scene_config['source_pos'].reshape(1,3))
+        
+        for interf in scene_config['interferences']:
+            acoustic_scene.set_interference(interf['path'], gain=1.0, position=interf['pos'].reshape(1,3))
+
+        scene_data = acoustic_scene.get_eval_scene(
+            room_dimensions=scene_config['room_dims'], 
+            desire_RT=scene_config['rt60'], 
+            iSIR_dB=scene_config['sir_db'],
+            mode="real" 
+        )
+        
+        # Save the simulated data to cache for future runs
+        print(" -> Saving acoustic scene to cache...")
+        with open(cache_file, 'wb') as f:
+            pickle.dump(scene_data, f)
+
+    # Extract signals from the data dictionary (whether cached or freshly generated)
     mic_signals = scene_data["mic_signals"]
     target_early = scene_data["target_early"][0] 
     interf_early = scene_data["interference_early"][0]
+    
     
     print(" -> Evaluating baseline metrics...")
     baseline_metrics = evaluate_full_pipeline(
@@ -385,17 +579,33 @@ def run_benchmark_scenario(scenario_id: str,
 if __name__ == "__main__":
     print("=== INITIALIZING PIPELINE TEST ===")
     
-    mic_spacing = 0.04 
-    M1, M2 = 3, 3  
-    M = M1 * M2
-    
-    x = np.linspace(0, (M2-1)*mic_spacing, M2)
-    y = np.linspace(0, (M1-1)*mic_spacing, M1)
-    xv, yv = np.meshgrid(x, y, indexing='xy') 
-    
+    # Broadband Concentric Circular Array (12 microphones)
+    # Designed to balance high-frequency spatial aliasing (up to 8 kHz) 
+    # and low-frequency array aperture (down to 100 Hz)
+    M = 12
     array_center = np.array([1.25, 2.0, 1.25])
-    mic_coords = np.column_stack([xv.flatten(), yv.flatten(), np.zeros(M)])
-    mic_coords = mic_coords - np.mean(mic_coords, axis=0) + array_center
+    
+    # Ring configuration: [Center, Inner, Middle, Outer]
+    # Inner radius (2.1 cm) respects the spatial Nyquist limit for 8 kHz (d <= lambda/2)
+    # Outer radius (15 cm) maximizes aperture for low-frequency directivity
+    radii = [0.0, 0.021, 0.06, 0.15] 
+    mics_per_ring = [1, 3, 4, 4]
+    
+    coords = []
+    for r, n_mics in zip(radii, mics_per_ring):
+        if r == 0.0:
+            coords.append([0.0, 0.0, 0.0])
+        else:
+            # Stagger angles between rings to optimize 2D spatial sampling
+            angle_offset = np.pi / n_mics if r > 0.021 else 0.0
+            angles = np.linspace(0, 2 * np.pi, n_mics, endpoint=False) + angle_offset
+            for angle in angles:
+                coords.append([r * np.cos(angle), r * np.sin(angle), 0.0])
+                
+    mic_coords = np.array(coords)
+    
+    # Shift the generated geometry to the requested room position
+    mic_coords = mic_coords + array_center
 
     scene_config = {
         'fs': 16000,
@@ -406,7 +616,7 @@ if __name__ == "__main__":
         'mismatch': 1e-12,
         'mic_coords': mic_coords,
         'source_path': "tools/data/signals/FA01_09.wav",
-        'source_pos': array_center + np.array([1.0, 1.0, 0.0]),
+        'source_pos': array_center + np.array([1.0, 0, 0.0]),
         'interferences': [
             {
                 'path': "tools/data/signals/MC15_03.wav",
@@ -420,10 +630,38 @@ if __name__ == "__main__":
     }
 
     # Use the Object-Oriented wrapper instead of the raw function
-# Run both the adaptive and the static baseline processors
+    # Run both the adaptive and the static baseline processors
+
     processors_dict = {
         "Delay_and_Sum": DS_Processor(nperseg=1024, noverlap=768),
-        "MPDR_WPE_Test": MPDR_WPE_Processor(L=25, Delta=2, nperseg=1024, noverlap=768)
+        "MPDR_WPE_Test": MPDR_WPE_Processor(
+            L=20, 
+            Delta=4, 
+            alpha=0.994, 
+            nperseg=1024, 
+            noverlap=768,
+            diag_load=1e-2
+        ),
+        "MPDR_WPE_Warmup": MPDR_WPE_Warmup_Processor(
+            L=20, 
+            Delta=4, 
+            alpha_steady=0.994, 
+            alpha_init=0.500, 
+            tau=20.0, 
+            nperseg=1024, 
+            noverlap=768,
+            diag_load=1e-2
+        ),
+        "MPDR_WPE_BlockWarmup": MPDR_WPE_BlockWarmup_Processor(
+            T_warmup=62, # Approx 1 second for 16kHz, 1024 window, 256 hop
+            L=20, 
+            Delta=4, 
+            alpha=0.994, 
+            nperseg=1024, 
+            noverlap=768,
+            diag_load=1e-2
+        ),
+        "MWF_Test": MWF_Processor(alpha=0.95, diag_load=1e-3, nperseg=1024, noverlap=768)
     }
 
     output_directory = "tests/data/benchmark_results"
