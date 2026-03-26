@@ -333,145 +333,132 @@ class SimAcoustic():
         return h_early, h_late
 
     def get_eval_scene(self, room_dimensions, desire_RT, iSIR_dB=0, mode="real", inter_normalization=True, ray_tracing=True):
-            # Define output length in samples
-            N_samples = self.duration * self.fs
+        # Define output length in samples
+        N_samples = self.duration * self.fs
 
-            # Estimate absorption and maximum order of sources
-            alpha, max_order = pra.inverse_sabine(desire_RT, room_dimensions)
-            
-            if ray_tracing:
-                distances = pdist(self.real_array)
-                min_spacing = np.min(distances[distances > 0])
-                params_dic = get_hybrid_sim_params(room_dimensions, min_spacing, t_mix=0.06)
-                max_order = params_dic["max_order"]
+        # Estimate absorption and maximum order of sources
+        alpha, max_order = pra.inverse_sabine(desire_RT, room_dimensions)
+        
+        if ray_tracing:
+            distances = pdist(self.real_array)
+            min_spacing = np.min(distances[distances > 0])
+            params_dic = get_hybrid_sim_params(room_dimensions, min_spacing, t_mix=0.06)
+            max_order = params_dic["max_order"]
 
-                material = pra.Material(alpha, scattering=0.2)        
-                room = pra.ShoeBox(
-                    room_dimensions, 
-                    self.fs, 
-                    materials=material,
-                    max_order=max_order,
-                    ray_tracing=True,
-                )
-                room.set_ray_tracing(**params_dic["ray_tracing"])
-            else:
-                material = pra.Material(alpha)        
-                room = pra.ShoeBox(room_dimensions, self.fs, materials=material, max_order=max_order)
-
-            # Set source and interferences
-            source_pos = self.audio_sources[0]["position"] # Shape: (1, 3)
-            source_sig = self.audio_sources[0]["audio"]
-            room.add_source(source_pos.T)
-            
-            for interference in self.audio_interferences:
-                room.add_source(interference["position"].T)
-
-            # Set mic array
-            mic_array = self.real_array if mode == "real" else self.ideal_array
-            room.add_microphone_array(mic_array.T)
-
-            # Compute RIRs
-            room.compute_rir()
-
-            # Initialize storage arrays
-            target_early = np.zeros((self.M, N_samples))
-            target_late = np.zeros((self.M, N_samples))
-            interf_early_sum = np.zeros((self.M, N_samples))
-            interf_late_sum = np.zeros((self.M, N_samples))
-
-            # Convolve Source signal (Target)
-            for i in range(self.M):
-                h_early, h_late = self._split_rir(room.rir[i][0])
-                
-                sig_early = sc.signal.fftconvolve(h_early, source_sig.flatten())
-                sig_late = sc.signal.fftconvolve(h_late, source_sig.flatten())
-                
-                target_early[i, :] = sig_early[:N_samples]
-                target_late[i, :] = sig_late[:N_samples]
-
-            # Convolve interference signals
-            for i, interference in enumerate(self.audio_interferences):
-                audio = interference["audio"].flatten()
-                
-                # Temporary arrays for current interference across all mics
-                curr_interf_early = np.zeros((self.M, N_samples))
-                curr_interf_late = np.zeros((self.M, N_samples))
-                
-                for j in range(self.M):
-                    h_early, h_late = self._split_rir(room.rir[j][i+1])
-                    
-                    sig_early = sc.signal.fftconvolve(h_early, audio)
-                    sig_late = sc.signal.fftconvolve(h_late, audio)
-                    
-                    curr_interf_early[j, :] = sig_early[:N_samples]
-                    curr_interf_late[j, :] = sig_late[:N_samples]
-                
-                # Accumulate interferences
-                interf_early_sum += curr_interf_early
-                interf_late_sum += curr_interf_late
-
-            # Compute pure anechoic target using free field propagation
-            target_anechoic = space_delay(
-                signal_in=source_sig.flatten(),
-                fs=self.fs,
-                source_pos=source_pos,
-                mic_array=mic_array
+            material = pra.Material(alpha, scattering=0.2)        
+            room = pra.ShoeBox(
+                room_dimensions, 
+                self.fs, 
+                materials=material,
+                max_order=max_order,
+                ray_tracing=True,
             )
+            room.set_ray_tracing(**params_dic["ray_tracing"])
+        else:
+            material = pra.Material(alpha)        
+            room = pra.ShoeBox(room_dimensions, self.fs, materials=material, max_order=max_order)
+
+        # Set source and interferences
+        source_pos = self.audio_sources[0]["position"].T
+        source_sig = self.audio_sources[0]["audio"].T
+        room.add_source(source_pos)
+        
+        for interference in self.audio_interferences:
+            room.add_source(interference["position"].T)
+
+        # Set mic array
+        mic_array = self.real_array.T if mode == "real" else self.ideal_array.T 
+        room.add_microphone_array(mic_array)
+
+        # Compute RIRs
+        room.compute_rir()
+
+        # Initialize storage arrays
+        target_early = np.zeros((self.M, N_samples))
+        target_late = np.zeros((self.M, N_samples))
+        interf_early_sum = np.zeros((self.M, N_samples))
+        interf_late_sum = np.zeros((self.M, N_samples))
+
+        # Convolve Source signal (Target)
+        for i in range(self.M):
+            h_early, h_late = self._split_rir(room.rir[i][0])
             
-            # Ensure length matches N_samples (pad with zeros if shorter, crop if longer)
-            if target_anechoic.shape[1] < N_samples:
-                target_anechoic = np.pad(target_anechoic, ((0, 0), (0, N_samples - target_anechoic.shape[1])))
-            else:
-                target_anechoic = target_anechoic[:, :N_samples]
+            sig_early = sc.signal.fftconvolve(h_early, source_sig)
+            sig_late = sc.signal.fftconvolve(h_late, source_sig)
+            
+            target_early[i, :] = sig_early[:N_samples]
+            target_late[i, :] = sig_late[:N_samples]
 
+        # Convolve interference signals
+        for i, interference in enumerate(self.audio_interferences):
+            audio = interference["audio"]
+            
+            # Temporary arrays for current interference across all mics
+            curr_interf_early = np.zeros((self.M, N_samples))
+            curr_interf_late = np.zeros((self.M, N_samples))
+            
+            for j in range(self.M):
+                h_early, h_late = self._split_rir(room.rir[j][i+1])
+                
+                sig_early = sc.signal.fftconvolve(h_early, audio)
+                sig_late = sc.signal.fftconvolve(h_late, audio)
+                
+                curr_interf_early[j, :] = sig_early[:N_samples]
+                curr_interf_late[j, :] = sig_late[:N_samples]
+            
+            # Accumulate interferences
+            interf_early_sum += curr_interf_early
+            interf_late_sum += curr_interf_late
+
+        # Normalization and Mixing
+        
             # Normalization and Mixing
-            if inter_normalization:
-                # Calculate RMS of the total target signal at mic 0 for reference
-                target_total_mic0 = target_early[0, :] + target_late[0, :]
-                target_rms = np.sqrt(np.mean(target_total_mic0**2)) + 1e-10
-                
-                # Calculate RMS of the total interference sum at mic 0
-                interf_total_mic0 = interf_early_sum[0, :] + interf_late_sum[0, :]
-                interf_rms = np.sqrt(np.mean(interf_total_mic0**2)) + 1e-10
-                
-                # Apply interference scaling to achieve the desired iSIR
-                iSIR_linear = 10**(iSIR_dB / 20)
-                sir_scaling_factor = (target_rms / interf_rms) * (1 / iSIR_linear)
-                
-                interf_early_sum *= sir_scaling_factor
-                interf_late_sum *= sir_scaling_factor
+        
+        # Calculate RMS of the total target signal at mic 0
+        target_total_mic0 = target_early[0, :] + target_late[0, :]
+        target_rms = np.sqrt(np.mean(target_total_mic0**2)) + 1e-10
+        
+        # Calculate RMS of the total interference sum at mic 0
+        interf_total_mic0 = interf_early_sum[0, :] + interf_late_sum[0, :]
+        interf_rms = np.sqrt(np.mean(interf_total_mic0**2)) + 1e-10
+        
+        # Apply interference scaling to achieve the desired iSIR
+        iSIR_linear = 10**(iSIR_dB / 20)
+        # Scale interference relative to target RMS to hit the target ratio
+        sir_scaling_factor = (target_rms / interf_rms) * (1 / iSIR_linear)
+        
+        interf_early_sum *= sir_scaling_factor
+        interf_late_sum *= sir_scaling_factor
+        
+        # Construct the final unscaled mixture
+        array_input = target_early + target_late + interf_early_sum + interf_late_sum
+        
+        # Determine the global peak across all microphones in the mixture
+        global_max = np.max(np.abs(array_input))
+        
+        # Calculate global scaling factor to prevent clipping (leaving 1% headroom)
+        global_scale = 0.99 / (global_max + 1e-10)
+        
+        # Apply the exact same global scaling to ALL components to preserve iSIR
+        array_input *= global_scale
+        target_early *= global_scale
+        target_late *= global_scale
+        interf_early_sum *= global_scale
+        interf_late_sum *= global_scale
 
-                # Construct the final unscaled mixture
-                array_input = target_early + target_late + interf_early_sum + interf_late_sum
+        # Construct the final mixture
+        array_input = target_early + target_late + interf_early_sum + interf_late_sum
 
-                # Determine the global peak across all microphones in the mixture
-                global_max = np.max(np.abs(array_input))
-                
-                # Calculate global scaling factor to prevent clipping (leaving 1% headroom)
-                global_scale = 0.99 / (global_max + 1e-10)
-                
-                # Apply the exact same global scaling to ALL components to preserve iSIR
-                array_input *= global_scale
-                target_early *= global_scale
-                target_late *= global_scale
-                interf_early_sum *= global_scale
-                interf_late_sum *= global_scale
-                
-                # Apply exact same scale to the anechoic reference
-                target_anechoic *= global_scale
-            else:
-                array_input = target_early + target_late + interf_early_sum + interf_late_sum
-
-            # Return a structured dictionary with all evaluation components
-            return {
-                "mic_signals": array_input,               # The actual input for your MPDR-WPE
-                "target_anechoic": target_anechoic,       # Pure direct path (Anechoic) for PESQ
-                "target_early": target_early,             # Target early reflections
-                "target_late": target_late,               # Target reverberation (WPE target)
-                "interference_early": interf_early_sum,   # Directional interference (MPDR target)
-                "interference_late": interf_late_sum      # Diffuse background noise
-            }
-                                                
+        # Return a structured dictionary with all evaluation components
+        return {
+            
+            "mic_signals": array_input,               # The actual input for your MPDR-WPE
+            "target_early": target_early,             # Pristine reference for PESQ/STOI/Numerator SINR
+            "target_late": target_late,               # Target reverberation (WPE target)
+            "interference_early": interf_early_sum,   # Directional interference (MPDR target)
+            "interference_late": interf_late_sum      # Diffuse background noise
+        }
+    
 if __name__ == "__main__":
 
     fs = 48000

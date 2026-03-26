@@ -179,8 +179,8 @@ def MPDRxWPE_numba(y_stft, sv, alpha=0.994, L=20, Delta=6, epsilon=1e-3, save_we
         g = np.zeros(L, dtype=np.complex128)
         
         # Thread-local covariance matrices
-        R_h_inv = np.eye(L, dtype=np.complex128) * 1e-1
-        R_g_inv = np.eye(M, dtype=np.complex128) * 1e-0
+        R_h_inv = np.eye(L, dtype=np.complex128) * 1e-4
+        R_g_inv = np.eye(M, dtype=np.complex128) * 1e-2
         I_M = np.eye(M, dtype=np.complex128)
         
         # Thread-local buffers
@@ -259,7 +259,373 @@ def MPDRxWPE_numba(y_stft, sv, alpha=0.994, L=20, Delta=6, epsilon=1e-3, save_we
 
 
 @njit(parallel=True, fastmath=True)
+def MPDRxWPE_numba_scaled_exp(y_stft, sv, T_init, alpha=0.994, L=20, Delta=6, beta=1e-2, p_min=1e-10, save_weights=False):
+    # Optimized MPDR-WPE bilinear framework using Numba.
+    # Features dynamic initialization and scaled diagonal loading.
+    
+    K, T, M = y_stft.shape
+    
+    # Pre-allocate the output array
+    X_hat_out = np.zeros((K, T), dtype=np.complex128)
+    
+    buffer_len = (L + Delta) * M
+    h_register = np.zeros((K, T, M), dtype=np.complex128) if save_weights else np.zeros((1, 1, 1), dtype=np.complex128)
+    
+    # Outer loop parallelized over frequency bins
+    for k in prange(K):
+        
+        # Calculate initial energy power over the first T_init frames for bin k
+        p_k = 0.0
+        for t in range(T_init):
+            for m in range(M):
+                p_k += np.abs(y_stft[k, t, m])**2
+        
+        # Average power per frame and microphone
+        p_k = p_k / (T_init * M)
+        # Floor value to prevent numerical explosion in silent bins
+        p_k = max(p_k, p_min) 
+        
+        # Thread-local filter initialization
+        h = sv[k] / M
+        g = np.zeros(L, dtype=np.complex128)
+        
+        # Thread-local covariance matrices inversely proportional to initial energy
+        R_h_inv = np.eye(L, dtype=np.complex128) / p_k
+        R_g_inv = np.eye(M, dtype=np.complex128) / p_k
+        I_M = np.eye(M, dtype=np.complex128)
+        
+        # Track the trace of R_g directly. 
+        # Since R_g(0) = p_k * I_M, the initial trace is M * p_k
+        tr_R_g = M * p_k
+        
+        # Thread-local buffers
+        y_buffer = np.zeros(buffer_len, dtype=np.complex128)
+        y_bar = np.zeros(L * M, dtype=np.complex128)
+        y_bar_g = np.zeros(M, dtype=np.complex128)
+        y_bar_h = np.zeros(L, dtype=np.complex128)
+        
+        # Temporal loop (sequential per frequency bin)
+        for l_idx in range(T):
+            y_frame = y_stft[k, l_idx, :]
+
+            if save_weights:
+                h_register[k, l_idx, :] = h
+            
+            # 1. Update buffer
+            for i in range(buffer_len - 1, M - 1, -1):
+                y_buffer[i] = y_buffer[i - M]
+            
+            for m in range(M):
+                y_buffer[m] = y_frame[m]
+                
+            for i in range(L * M):
+                y_bar[i] = y_buffer[i + (Delta * M)]
+                
+            # 2. Compute y_bar_g
+            y_bar_g_sq_norm = 0.0
+            for m in range(M):
+                summ = 0.0 + 0.0j
+                for l in range(L):
+                    summ += np.conj(g[l]) * y_bar[l * M + m]
+                y_bar_g[m] = y_frame[m] - summ
+                # Accumulate squared norm for trace tracking
+                y_bar_g_sq_norm += np.abs(y_bar_g[m])**2
+                
+            # 3. Compute y_bar_h
+            for l in range(L):
+                summ = 0.0 + 0.0j
+                for m in range(M):
+                    summ += np.conj(h[m]) * y_bar[l * M + m]
+                y_bar_h[l] = summ
+                
+            # 4. Compute A Priori Estimate
+            X_hat = np.vdot(h, y_bar_g)
+            lambda_l = np.abs(X_hat)**2
+            X_hat_out[k, l_idx] = X_hat
+            
+            # 5. Compute Kalman gain for g
+            num_g = np.dot(R_g_inv, y_bar_g)
+            den_g = alpha + np.vdot(y_bar_g, num_g)
+            k_g = num_g / den_g
+            
+            # 6. Compute Kalman gain for h
+            num_h = np.dot(R_h_inv, y_bar_h)
+            den_h = alpha * lambda_l + np.vdot(y_bar_h, num_h)
+            k_h = num_h / den_h
+            
+            # 7 & 8. Update Covariances
+            update_g = np.dot(np.outer(k_g, np.conj(y_bar_g)), R_g_inv)
+            R_g_inv = (R_g_inv - update_g) / alpha
+            
+            update_h = np.dot(np.outer(k_h, np.conj(y_bar_h)), R_h_inv)
+            R_h_inv = (R_h_inv - update_h) / alpha
+            
+            # Dynamic Trace Update
+            tr_R_g = alpha * tr_R_g + y_bar_g_sq_norm
+            
+            # 9. Update temporal filter g
+            g = g + k_h * np.conj(X_hat)
+            
+            # 10. Update regularized covariance with Scaled Diagonal Loading
+            # epsilon is now a function of the matrix energy trace
+            epsilon = beta * (tr_R_g / M)
+            epsilon = max(epsilon, 1e-12) # Safeguard against total silence
+            epsilon_inv = 1.0 / epsilon
+            
+            inner_inv = np.linalg.inv((epsilon_inv * I_M) + R_g_inv)
+            R_sigma_inv = R_g_inv - np.dot(R_g_inv, np.dot(inner_inv, R_g_inv))
+            
+            # 11. Update spatial filter h
+            d = sv[k]
+            num_h_update = np.dot(R_sigma_inv, d)
+            den_h_update = np.vdot(d, num_h_update)
+            h = num_h_update / den_h_update
+            
+    return X_hat_out, h_register
+
+import numpy as np
+from numba import njit, prange
+
+@njit(parallel=True, fastmath=True)
+def MPDRxWPE_numba_scaled(y_stft, sv, T_init, alpha_steady=0.994, alpha_init=0.90, tau=20.0, L=20, Delta=6, beta=1e-2, p_min=1e-10, save_weights=False):
+    # Optimized MPDR-WPE bilinear framework using Numba.
+    # Features dynamic initialization, scaled diagonal loading, and exponential forgetting factor.
+    
+    K, T, M = y_stft.shape
+    
+    # Pre-allocate the output array
+    X_hat_out = np.zeros((K, T), dtype=np.complex128)
+    
+    buffer_len = (L + Delta) * M
+    h_register = np.zeros((K, T, M), dtype=np.complex128) if save_weights else np.zeros((1, 1, 1), dtype=np.complex128)
+    
+    # Outer loop parallelized over frequency bins
+    for k in prange(K):
+        
+        # Calculate initial energy power over the first T_init frames for bin k
+        p_k = 0.0
+        for t in range(T_init):
+            for m in range(M):
+                p_k += np.abs(y_stft[k, t, m])**2
+        
+        # Average power per frame and microphone
+        p_k = p_k / (T_init * M)
+        # Floor value to prevent numerical explosion in silent bins
+        p_k = max(p_k, p_min) 
+        
+        # Thread-local filter initialization
+        h = sv[k] / M
+        g = np.zeros(L, dtype=np.complex128)
+        
+        # Thread-local covariance matrices inversely proportional to initial energy
+        R_h_inv = np.eye(L, dtype=np.complex128) / p_k
+        R_g_inv = np.eye(M, dtype=np.complex128) / p_k
+        I_M = np.eye(M, dtype=np.complex128)
+        
+        # Track the trace of R_g directly. 
+        # Since R_g(0) = p_k * I_M, the initial trace is M * p_k
+        tr_R_g = M * p_k
+        
+        # Thread-local buffers
+        y_buffer = np.zeros(buffer_len, dtype=np.complex128)
+        y_bar = np.zeros(L * M, dtype=np.complex128)
+        y_bar_g = np.zeros(M, dtype=np.complex128)
+        y_bar_h = np.zeros(L, dtype=np.complex128)
+        
+        # Temporal loop (sequential per frequency bin)
+        for l_idx in range(T):
+            # Calculate time-varying exponential forgetting factor
+            alpha = alpha_steady - (alpha_steady - alpha_init) * np.exp(-l_idx / tau)
+            
+            y_frame = y_stft[k, l_idx, :]
+
+            if save_weights:
+                h_register[k, l_idx, :] = h
+            
+            # 1. Update buffer
+            for i in range(buffer_len - 1, M - 1, -1):
+                y_buffer[i] = y_buffer[i - M]
+            
+            for m in range(M):
+                y_buffer[m] = y_frame[m]
+                
+            for i in range(L * M):
+                y_bar[i] = y_buffer[i + (Delta * M)]
+                
+            # 2. Compute y_bar_g
+            y_bar_g_sq_norm = 0.0
+            for m in range(M):
+                summ = 0.0 + 0.0j
+                for l in range(L):
+                    summ += np.conj(g[l]) * y_bar[l * M + m]
+                y_bar_g[m] = y_frame[m] - summ
+                # Accumulate squared norm for trace tracking
+                y_bar_g_sq_norm += np.abs(y_bar_g[m])**2
+                
+            # 3. Compute y_bar_h
+            for l in range(L):
+                summ = 0.0 + 0.0j
+                for m in range(M):
+                    summ += np.conj(h[m]) * y_bar[l * M + m]
+                y_bar_h[l] = summ
+                
+            # 4. Compute A Priori Estimate
+            X_hat = np.vdot(h, y_bar_g)
+            lambda_l = np.abs(X_hat)**2
+            X_hat_out[k, l_idx] = X_hat
+            
+            # 5. Compute Kalman gain for g
+            num_g = np.dot(R_g_inv, y_bar_g)
+            den_g = alpha + np.vdot(y_bar_g, num_g)
+            k_g = num_g / den_g
+            
+            # 6. Compute Kalman gain for h
+            num_h = np.dot(R_h_inv, y_bar_h)
+            den_h = alpha * lambda_l + np.vdot(y_bar_h, num_h)
+            k_h = num_h / den_h
+            
+            # 7 & 8. Update Covariances
+            update_g = np.dot(np.outer(k_g, np.conj(y_bar_g)), R_g_inv)
+            R_g_inv = (R_g_inv - update_g) / alpha
+            
+            update_h = np.dot(np.outer(k_h, np.conj(y_bar_h)), R_h_inv)
+            R_h_inv = (R_h_inv - update_h) / alpha
+            
+            # Dynamic Trace Update
+            tr_R_g = alpha * tr_R_g + y_bar_g_sq_norm
+            
+            # 9. Update temporal filter g
+            g = g + k_h * np.conj(X_hat)
+            
+            # 10. Update regularized covariance with Scaled Diagonal Loading
+            # epsilon is now a function of the matrix energy trace
+            epsilon = beta * (tr_R_g / M)
+            epsilon = max(epsilon, 1e-12) # Safeguard against total silence
+            epsilon_inv = 1.0 / epsilon
+            
+            inner_inv = np.linalg.inv((epsilon_inv * I_M) + R_g_inv)
+            R_sigma_inv = R_g_inv - np.dot(R_g_inv, np.dot(inner_inv, R_g_inv))
+            
+            # 11. Update spatial filter h
+            d = sv[k]
+            num_h_update = np.dot(R_sigma_inv, d)
+            den_h_update = np.vdot(d, num_h_update)
+            h = num_h_update / den_h_update
+            
+    return X_hat_out, h_register
+
+
+@njit(parallel=True, fastmath=True)
 def MPDRxWPE_numba_warm(y_stft, sv, Gamma_diffuse, alpha_steady=0.994, alpha_init=0.500, tau=20.0, L=20, Delta=6, epsilon=1e-3, save_weights=False):
+    # Optimized MPDR-WPE bilinear framework using Numba.
+    # Incorporates Diffuse Field Initialization and Dynamic Forgetting Factor (Warm-up).
+    K, T, M = y_stft.shape
+    epsilon_inv = 1.0 / epsilon
+    
+    # Pre-allocate the output array
+    X_hat_out = np.zeros((K, T), dtype=np.complex128)
+    
+    buffer_len = (L + Delta) * M
+
+    h_register = np.zeros((K, T, M), dtype=np.complex128) if save_weights else np.zeros((1, 1, 1), dtype=np.complex128)
+
+    # Outer loop parallelized over frequency bins
+    for k in prange(K):
+        
+        # Thread-local filter initialization
+        h = sv[k] / M
+        g = np.zeros(L, dtype=np.complex128)
+        
+        # Thread-local covariance matrices
+        R_h_inv = np.eye(L, dtype=np.complex128) * 1e-0
+        I_M = np.eye(M, dtype=np.complex128)
+        
+        # Diffuse Field Initialization for R_g
+        # R_g_init = sigma^2 * Gamma_diffuse + epsilon * I_M
+        R_g_init = 1e-2 * Gamma_diffuse[k] + epsilon * I_M
+        R_g_inv = np.linalg.inv(R_g_init)
+        
+        # Thread-local buffers
+        y_buffer = np.zeros(buffer_len, dtype=np.complex128)
+        y_bar = np.zeros(L * M, dtype=np.complex128)
+        y_bar_g = np.zeros(M, dtype=np.complex128)
+        y_bar_h = np.zeros(L, dtype=np.complex128)
+        
+        # Temporal loop (sequential per frequency bin)
+        for l_idx in range(T):
+            y_frame = y_stft[k, l_idx, :]
+
+            if save_weights:
+                h_register[k, l_idx, :] = h
+                
+            # Dynamic Forgetting Factor (Exponential Warm-up)
+            alpha_current = alpha_steady - (alpha_steady - alpha_init) * np.exp(-l_idx / tau)
+            
+            # 1. Update buffer
+            for i in range(buffer_len - 1, M - 1, -1):
+                y_buffer[i] = y_buffer[i - M]
+            
+            for m in range(M):
+                y_buffer[m] = y_frame[m]
+                
+            for i in range(L * M):
+                y_bar[i] = y_buffer[i + (Delta * M)]
+                
+            # 2. Compute y_bar_g
+            for m in range(M):
+                summ = 0.0 + 0.0j
+                for l in range(L):
+                    summ += np.conj(g[l]) * y_bar[l * M + m]
+                y_bar_g[m] = y_frame[m] - summ
+                
+            # 3. Compute y_bar_h
+            for l in range(L):
+                summ = 0.0 + 0.0j
+                for m in range(M):
+                    summ += np.conj(h[m]) * y_bar[l * M + m]
+                y_bar_h[l] = summ
+                
+            # 4. Compute A Priori Estimate
+            X_hat = np.vdot(h, y_bar_g)
+            lambda_l = np.abs(X_hat)**2
+            X_hat_out[k, l_idx] = X_hat
+            
+            # 5. Compute Kalman gain for g (using dynamic alpha)
+            num_g = np.dot(R_g_inv, y_bar_g)
+            den_g = alpha_current + np.vdot(y_bar_g, num_g)
+            k_g = num_g / den_g
+            
+            # 6. Compute Kalman gain for h (using dynamic alpha)
+            num_h = np.dot(R_h_inv, y_bar_h)
+            den_h = alpha_current * lambda_l + np.vdot(y_bar_h, num_h)
+            k_h = num_h / den_h
+            
+            # 7 & 8. Update Covariances (using dynamic alpha)
+            update_g = np.dot(np.outer(k_g, np.conj(y_bar_g)), R_g_inv)
+            R_g_inv = (R_g_inv - update_g) / alpha_current
+            
+            update_h = np.dot(np.outer(k_h, np.conj(y_bar_h)), R_h_inv)
+            R_h_inv = (R_h_inv - update_h) / alpha_current
+            
+            # 9. Update temporal filter g
+            g = g + k_h * np.conj(X_hat)
+            
+            # 10. Update regularized covariance
+            inner_inv = np.linalg.inv((epsilon_inv * I_M) + R_g_inv)
+            R_sigma_inv = R_g_inv - np.dot(R_g_inv, np.dot(inner_inv, R_g_inv))
+            
+            # 11. Update spatial filter h
+            d = sv[k]
+            num_h_update = np.dot(R_sigma_inv, d)
+            den_h_update = np.vdot(d, num_h_update)
+            h = num_h_update / den_h_update
+            
+    return X_hat_out, h_register
+
+
+
+@njit(parallel=True, fastmath=True)
+def MPDRxWPE_numba_warm_v2(y_stft, sv, Gamma_diffuse, alpha_steady=0.994, alpha_init=0.500, tau=20.0, L=20, Delta=6, epsilon=1e-3, save_weights=False):
     # Optimized MPDR-WPE bilinear framework using Numba.
     # Incorporates Diffuse Field Initialization and Dynamic Forgetting Factor (Warm-up).
     K, T, M = y_stft.shape
