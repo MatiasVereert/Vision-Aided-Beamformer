@@ -149,7 +149,7 @@ class SimAcoustic():
         self._load_audio_struct( audio_path, gain, position, type = "i")
 
 
-    def free_field(self, iSIR_dB , normalize = True, mode = "real"):
+    def free_field(self, iSIR_dB , normalize = True, mode = "real", VAD = False):
         
         #Selects geometry (real/ideal)
         if mode == "real":
@@ -196,11 +196,29 @@ class SimAcoustic():
         source_rms = np.sqrt(np.mean(source_delayed[0,:]**2))
         source_input_norm = source_delayed / source_rms #Sets the input signal to 0 RMSfs
 
+
+
         #Mix signal and interfernce with the desire iSIR
         iSIR = 10**(iSIR_dB / 20)
         array_input = source_input_norm  +  interference_input_norm *(1/iSIR)
 
-        return array_input
+        if VAD:
+            # Compute binary VAD ORACLE
+            # Compute Hilbert transform of the early isolated target signal
+            hilbert_target_early = sc.signal.hilbert(source_delayed[0,:] )
+            hilbert_target_early_energy = np.abs(hilbert_target_early) + 1e-12 
+            voice_peak = np.max(hilbert_target_early_energy)
+
+            # Define the VAD treshole
+            VAD_treshole_dB  = -30 #dB 
+            VAD_treshole = 10**(VAD_treshole_dB / 10) * voice_peak
+
+            # Compare
+            vad_oracle = (hilbert_target_early_energy > VAD_treshole).astype(bool)
+            
+            return array_input, vad_oracle
+        else:
+            return array_input
     
 
     def compute_room_ISB(  self, room_dimensions, desire_RT, iSIR_dB =0 , mode ="real" , inter_normalization = True , ray_tracing = True ):
@@ -462,6 +480,27 @@ class SimAcoustic():
             else:
                 array_input = target_early + target_late + interf_early_sum + interf_late_sum
 
+            # Compute binary VAD ORACLE
+            # Compute hilbert transform of the early isolated signal
+            hilbert_target_early = sc.signal.hilbert(target_early[0,:] )
+            hilbert_target_early_energy = np.abs(hilbert_target_early) + 1e-12 
+            voice_peak = np.max(hilbert_target_early_energy)
+        
+
+            # Define the VAD treshole
+            VAD_treshole_dB  = -30 #dB 
+            VAD_treshole = 10**(VAD_treshole_dB / 20) * voice_peak
+
+            # Compare
+            vad_oracle = (hilbert_target_early_energy > VAD_treshole).astype(bool)
+
+            
+
+
+
+
+
+
             # Return a structured dictionary with all evaluation components
             return {
                 "mic_signals": array_input,               # The actual input for your MPDR-WPE
@@ -469,7 +508,8 @@ class SimAcoustic():
                 "target_early": target_early,             # Target early reflections
                 "target_late": target_late,               # Target reverberation (WPE target)
                 "interference_early": interf_early_sum,   # Directional interference (MPDR target)
-                "interference_late": interf_late_sum      # Diffuse background noise
+                "interference_late": interf_late_sum,      # Diffuse background noise
+                "VAD": vad_oracle
             }
                                                 
 if __name__ == "__main__":

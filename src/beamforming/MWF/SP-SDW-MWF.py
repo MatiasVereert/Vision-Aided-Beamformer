@@ -238,7 +238,7 @@ if __name__ == "__main__":
 
     print(" -> Computing free field simulation...")
     # room_input_ideal shape is expected to be (M, N_samples)
-    room_input_ideal = acoustic_scene.free_field(iSIR_dB=0, normalize=True, mode="ideal")
+    room_input_ideal, vad_oracle = acoustic_scene.free_field(iSIR_dB=0, normalize=True, mode="ideal", VAD = True)
     save_wav("1_input_mix_mic0.wav", FS, room_input_ideal[0], output_folder)
     
     print(" -> Applying Fixed Branch (SDW-MWF Delay-and-Sum)...")
@@ -253,3 +253,11 @@ if __name__ == "__main__":
     save_wav("2_output_SDW_MWF_fixed.wav", FS, z_fixed, output_folder)
     save_wav("2_output_SDW_MWF_fixed_block_matrix.wav", FS, z_noise, output_folder)
     print(" -> Pipeline completed.")
+
+    from matplotlib import pyplot as plt
+    # VAD PLOT
+
+    time = np.linspace(0, len(vad_oracle)/FS, len(vad_oracle)) 
+    plt.figure()
+    plt.plot( time, vad_oracle , color = 'r')
+    plt.show()
