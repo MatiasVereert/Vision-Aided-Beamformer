@@ -185,3 +185,5 @@ def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="
         rtf_vector = np.squeeze(rtf_vector)
 
     return rtf_vector
+
+

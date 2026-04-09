@@ -50,111 +50,6 @@ def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="
 
     return rtf_vector
 
-"""
-
-@njit(parallel=True, fastmath=True)
-def MPDRxWPE_numba(y_stft, sv, alpha=0.994, L=20, Delta=6, epsilon=1e-3, save_weights=False):
-    # Optimized MPDR-WPE bilinear framework using Numba.
-    # Note default parameters updated for the second stage WPE.
-    K, T, M = y_stft.shape
-    epsilon_inv = 1.0 / epsilon
-    
-    # Pre-allocate the output array
-    X_hat_out = np.zeros((K, T), dtype=np.complex128)
-    
-    buffer_len = (L + Delta) * M
-
-    h_register = np.zeros((K, T, M), dtype=np.complex128) if save_weights else np.zeros((1, 1, 1), dtype=np.complex128)
-
-    
-    # Outer loop parallelized over frequency bins
-    for k in prange(K):
-        
-        # Thread-local filter initialization
-        h = sv[k] / M
-        g = np.zeros(L, dtype=np.complex128)
-        
-        # Thread-local covariance matrices
-        R_h_inv = np.eye(L, dtype=np.complex128) * 1e-4
-        R_g_inv = np.eye(M, dtype=np.complex128) * 1e-2
-        I_M = np.eye(M, dtype=np.complex128)
-        
-        # Thread-local buffers
-        y_buffer = np.zeros(buffer_len, dtype=np.complex128)
-        y_bar = np.zeros(L * M, dtype=np.complex128)
-        y_bar_g = np.zeros(M, dtype=np.complex128)
-        y_bar_h = np.zeros(L, dtype=np.complex128)
-        
-        # Temporal loop (sequential per frequency bin)
-        for l_idx in range(T):
-            y_frame = y_stft[k, l_idx, :]
-
-            if save_weights:
-                h_register[k, l_idx, :] = h
-            
-            # 1. Update buffer
-            for i in range(buffer_len - 1, M - 1, -1):
-                y_buffer[i] = y_buffer[i - M]
-            
-            for m in range(M):
-                y_buffer[m] = y_frame[m]
-                
-            for i in range(L * M):
-                y_bar[i] = y_buffer[i + (Delta * M)]
-                
-            # 2. Compute y_bar_g
-            for m in range(M):
-                summ = 0.0 + 0.0j
-                for l in range(L):
-                    summ += np.conj(g[l]) * y_bar[l * M + m]
-                y_bar_g[m] = y_frame[m] - summ
-                
-            # 3. Compute y_bar_h
-            for l in range(L):
-                summ = 0.0 + 0.0j
-                for m in range(M):
-                    summ += np.conj(h[m]) * y_bar[l * M + m]
-                y_bar_h[l] = summ
-                
-            # 4. Compute A Priori Estimate
-            X_hat = np.vdot(h, y_bar_g)
-            lambda_l = np.abs(X_hat)**2
-            X_hat_out[k, l_idx] = X_hat
-            
-            # 5. Compute Kalman gain for g
-            num_g = np.dot(R_g_inv, y_bar_g)
-            den_g = alpha + np.vdot(y_bar_g, num_g)
-            k_g = num_g / den_g
-            
-            # 6. Compute Kalman gain for h
-            num_h = np.dot(R_h_inv, y_bar_h)
-            den_h = alpha * lambda_l + np.vdot(y_bar_h, num_h)
-            k_h = num_h / den_h
-            
-            # 7 & 8. Update Covariances
-            update_g = np.dot(np.outer(k_g, np.conj(y_bar_g)), R_g_inv)
-            R_g_inv = (R_g_inv - update_g) / alpha
-            
-            update_h = np.dot(np.outer(k_h, np.conj(y_bar_h)), R_h_inv)
-            R_h_inv = (R_h_inv - update_h) / alpha
-            
-            # 9. Update temporal filter g
-            g = g + k_h * np.conj(X_hat)
-            
-            # 10. Update regularized covariance
-            inner_inv = np.linalg.inv((epsilon_inv * I_M) + R_g_inv)
-            R_sigma_inv = R_g_inv - np.dot(R_g_inv, np.dot(inner_inv, R_g_inv))
-            
-            # 11. Update spatial filter h
-            d = sv[k]
-            num_h_update = np.dot(R_sigma_inv, d)
-            den_h_update = np.vdot(d, num_h_update)
-            h = num_h_update / den_h_update
-            
-    return X_hat_out, h_register
-
-"""
-
     
 @njit(parallel=True, fastmath=True)
 def MPDRxWPE_numba(y_stft, sv, alpha=0.994, L=20, Delta=6, epsilon=1e-3, save_weights=False):
@@ -385,6 +280,7 @@ def MPDRxWPE_numba_scaled_exp(y_stft, sv, T_init, alpha=0.994, L=20, Delta=6, be
 
 import numpy as np
 from numba import njit, prange
+
 
 @njit(parallel=True, fastmath=True)
 def MPDRxWPE_numba_scaled(y_stft, sv, T_init, alpha_steady=0.994, alpha_init=0.90, tau=20.0, L=20, Delta=6, beta=1e-2, p_min=1e-10, save_weights=False):

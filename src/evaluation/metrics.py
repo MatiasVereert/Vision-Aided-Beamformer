@@ -9,7 +9,6 @@ import scipy.io.wavfile as wav
 from pb_bss.evaluation import pesq as pb_pesq
 from pb_bss.evaluation import stoi as pb_stoi
 
-
 def robust_envelope_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, 
                               max_shift_s: float = 0.5, inspect: bool = False, 
                               inspect_name: str = "alignment") -> tuple:
@@ -72,7 +71,6 @@ def robust_envelope_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
         plt.close()
 
     return aligned_ref, shift
-
 
 def evaluate_bss_metrics(ref_sig: np.ndarray, deg_sig: np.ndarray, interf_sig: np.ndarray = None) -> tuple:
     """
@@ -140,7 +138,6 @@ def precise_slice_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, m
     min_len = min(len(aligned_ref), len(aligned_deg))
     return aligned_ref[:min_len], aligned_deg[:min_len], shift
 
-
 def dump_for_pesq_inspection(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, name: str):
     """
     Exports the exact arrays passed to PESQ as WAV files for bit-accurate debugging.
@@ -193,6 +190,7 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                            compute_cd: bool = True,
                            eval_start_s: float = 5.0,
                            inspection_name: str = "eval") -> dict:
+    
     # Master evaluation function integrating precise slicing and visual alignment
     ref_sig = np.squeeze(ref_sig)
     deg_sig = np.squeeze(deg_sig)

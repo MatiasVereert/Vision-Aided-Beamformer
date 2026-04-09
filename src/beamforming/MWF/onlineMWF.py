@@ -1,5 +1,6 @@
 import numpy as np
 from numba import njit
+from numba import prange
 
 def get_gev_vector(sv, Phi_n):
     # Calculates the Generalized Eigenvalue Decomposition (GEVD) spatial filter weights.
