@@ -5,45 +5,38 @@
 
 import numpy as np
 from numba import njit
-from scipy.linalg import null_space
-
-
-
 # Local 
 from beamforming.signal_model import steering_vector, compute_rtf_steering_vector
 
-
-def get_fixed_weights( w_fixed_raw, L , frecs, fs):
-    # Make filter causal and strictly bounded to length L
-    # Apply a bulk delay (Delta = L/2) to shift advances into causal delays
-    bulk_delay_samples = L // 2
-    bulk_phase = np.exp(-1j * 2 * np.pi * frecs * (bulk_delay_samples / fs))
+def get_fixed_weights(w_fixed_raw, L, frecs, fs):
+    # Apply ONLY a small alignment delay if necessary to make the IR causal,
+    # NOT the algorithmic Delta = L/2. For near-field relative to mic 0, 
+    # phase shifts might already be well-behaved.
+    # If a centering shift is needed, keep it minimal (e.g., center of the L filter).
+    alignment_samples = L // 4  # # In te future this could be minimize by using the max lenght inter microphone
+    alignment_phase = np.exp(-1j * 2 * np.pi * frecs * (alignment_samples / fs))
     
     # Broadcast phase across all M microphones
-    w_fixed_delayed = w_fixed_raw * bulk_phase[:, None] 
+    w_fixed_aligned = w_fixed_raw * alignment_phase[:, None] 
     
-    # --- LA CURA DEL SISEO ---
-    # 1. El bin de continua (DC) no puede tener fase, tomamos solo su parte real
-    w_fixed_delayed[0, :] = w_fixed_delayed[0, :].real + 0.0j
+    # Force DC to real
+    w_fixed_aligned[0, :] = w_fixed_aligned[0, :].real + 0.0j
     
-    # 2. El bin de Nyquist (último) debe ser estrictamente real. 
-    # Lo más seguro es apagarlo a cero para matar cualquier artefacto de alta frecuencia.
-    w_fixed_delayed[-1, :] = 0.0 + 0.0j
-    # -------------------------
+    # Force Nyquist to real (or zero to prevent HF artifacts)
+    w_fixed_aligned[-1, :] = 0.0 + 0.0j
     
-    # Transform to time domain to truncate the infinite sinc response
-    w_time = np.fft.irfft(w_fixed_delayed, n=2 * L, axis=0) 
+    # Transform to time domain to truncate
+    w_time = np.fft.irfft(w_fixed_aligned, n=2 * L, axis=0) 
     
     # Truncate to length L and pad with L zeros (Strict Overlap-Save rule)
     w_time_padded = np.zeros_like(w_time)
-    
-    # Copy causal part
     w_time_padded[:L, :] = w_time[:L, :] 
     
-    # Transform back to frequency domain to use inside the processing loop
+    # Transform back to frequency domain
     w_fixed = np.fft.rfft(w_time_padded, axis=0)
 
     return w_fixed
+
 
 
 def get_blocking_matrix(w_fixed_freq, L):
@@ -74,54 +67,18 @@ def get_blocking_matrix(w_fixed_freq, L):
     Ca_constrained = np.fft.rfft(Ca_time_padded, n=2 * L, axis=0)
     
     return Ca_constrained
-"""
-def get_blocking_matrix(w_fixed_freq, L):
 
-    Calculates the SVD-based Blocking Matrix and applies the Overlap-Save 
-    time-domain constraint to prevent circular convolution wrap-around.
     
-    Args:
-        w_fixed_freq: Array of shape (F, M) with the fixed beamformer weights.
-        L: Frame size (the true time-domain constraint length).
-        
-    Returns:
-        Ca_constrained: Array of shape (F, M, M-1) ready for frequency multiplication.
-    
-    F, M = w_fixed_freq.shape
-    
-    # 1. Initialize the raw frequency-domain Blocking Matrix
-    Ca_raw = np.zeros((F, M, M - 1), dtype=complex)
-    
-    # 2. Calculate the Null Space (SVD) for each frequency bin independently
-    for f in range(F):
-        # Extract the fixed filter for this bin as a column vector (M, 1)
-        C_bin = w_fixed_freq[f, :].reshape(M, 1)
-        
-        # The null space of C^H guarantees that C^H * Ca = 0
-        Ca_raw[f, :, :] = null_space(C_bin.conj().T)
-        
-    # 3. Apply the Overlap-Save time constraint
-    # Transform back to the time domain (axis=0 is the frequency axis)
-    Ca_time = np.fft.irfft(Ca_raw, n=2 * L, axis=0)
-    
-    # Create a padded array of zeros
-    Ca_time_padded = np.zeros_like(Ca_time)
-    
-    # Keep only the first L taps (strict causal constraint without cheating)
-    Ca_time_padded[:L, :, :] = Ca_time[:L, :, :]
-    
-    # Transform back to the frequency domain for the main processing loop
-    Ca_constrained = np.fft.rfft(Ca_time_padded, n=2 * L, axis=0)
-    
-    return Ca_constrained
-"""
 
-def sdw_mwf(u, target_pos, source_pos, fs):
+
+def sdw_mwf(u, vad, target_pos, source_pos, fs):
     """
     Computes the fixed branch (speech reference) of the SP-SDW-MWF.
     u shape: (M, N_samples)
     """
+
     # Define constants
+    lamda = 1
     L = 128
     M = u.shape[0]
 
@@ -135,16 +92,11 @@ def sdw_mwf(u, target_pos, source_pos, fs):
     # Calculate total frames
     tot_frames = (u_padded.shape[1] - L) // L
 
-    # Initialize matrices (for future adaptive stages)
-    F_2L = np.zeros((2 * L, 2 * L), dtype=np.complex128)
-    Zero_L = np.zeros((L, L), dtype=np.complex128)
-    I_L = np.identity(L, dtype=np.complex128)
-
     # Initialize output array
     z = np.zeros(tot_frames * L, dtype=np.float64)
+    z_fixed_branch = np.zeros(tot_frames * L, dtype=np.float64)
     z_noise = np.zeros(tot_frames * L, dtype=np.float64)
 
-    # --- FIX: Use RTF steering vector to eliminate global coordinate shifts ---
     # This aligns the phases relative to mic 0, keeping delays strictly local
     sv = compute_rtf_steering_vector(frecs, source_pos, target_pos, ref_mic_idx=0, mode="near_field", squeeze=True)
     
@@ -154,9 +106,17 @@ def sdw_mwf(u, target_pos, source_pos, fs):
     w_fixed = get_fixed_weights(w_fixed_raw, L, frecs, fs)
     C_block = get_blocking_matrix(w_fixed, L    ) #Shape is (F, M, M-1)
 
+
+    # Inicalice adaptive variables
+    w_adaptive = np.zeros( (F, M ), dtype = np.complex128)
+
     print(np.shape(C_block))
 
+    history_buffer = np.zeros(L, dtype=np.float64)
+    delay = L // 2
+
     for m in range(tot_frames):
+        # --- PROCESS FRAMES ---
         # Extract frame of size 2L
         u_frame = u_padded[: , m * L : m * L + 2 * L]
 
@@ -164,33 +124,54 @@ def sdw_mwf(u, target_pos, source_pos, fs):
         U_fram_rfft = np.fft.rfft(u_frame, axis=1)
 
         # --- PROCESS FIXED BRANCH ---
-        # Apply the spatial fixed filter to obtain refrence Signal (D_0)
-        D_0 = np.einsum('fm, mf->f', w_fixed, U_fram_rfft)
+        # Apply the spatial fixed filter to obtain refrence Signal D, Sae (F)
+        D = np.einsum('fm, mf->f', w_fixed, U_fram_rfft)
+
+
+        # --- APPLY DELAY FIXED BRANCH ---
+        # Convert an extract data with out circular conv. overlap residue 
+        d_time_2L = np.fft.irfft(D, n=2 * L)
+        d_valid = d_time_2L[L:] 
+        d_combined = np.concatenate((history_buffer, d_valid))
+        
+        # Apply delay by sliding window
+        start_idx = L - delay
+        end_idx = 2 * L - delay
+        d_delayed_valid = d_combined[start_idx : end_idx]
+
+        # Save buffer for posterior frame
+        history_buffer = d_valid.copy()
+
+        # Save fixed output to debug
+        z_fixed_branch[m * L : m * L + L] = d_valid
+
+        # --- PROCCES ADAPTIVE BRANCH (with previus w) ---
 
         # Apply the spatial filter to noise reference signals (D_n)
+        # Ca (F, M, M-1) and data ( M, F) -> expect (F, M-1)  (Contracting M dimention)
+        D_y = np.einsum('fmn, mf->fn', C_block, U_fram_rfft )
 
-        # Ca (F, M, M-1) and data ( M, F) -> expect (F, M-1)  (calapse M)
-        D_n = np.einsum('fmn, mf->fn', C_block, U_fram_rfft )
-        
-        # Extract 1 signal noise reference to listen as reference and debub
-        D_1 = D_n[:,0]
+        # Concatenate reference D signal without delay
+        D_y = np.column_stack((D, D_y))
+
+        # Proccess spatial filter, convert to time delay, apply overlap save 
+        noise = np.einsum('fm,fm->f', D_y, w_adaptive)
+        noise_2L = np.fft.irfft(noise, n=2 * L )
+        noise = noise_2L[L:]
+
+        # Save to debug
+        z_noise[ m * L : m * L + L] = noise
+
+        # --- COMPUTE OUTPUT (in time domain) ---
+        e = d_valid - noise
+
+        #   Save ouput
+        z[m * L : m * L + L] = e
 
 
 
 
-
-
-
-
-        # Transform back to time domain
-        d_2L_0 = np.fft.irfft(D_0) 
-        d_2L_1 = np.fft.irfft(D_1) 
-        
-        # Overlap-Save: discard the first L samples and save the last L samples
-        z[m * L : m * L + L] = d_2L_0[L:]
-        z_noise[m * L : m * L + L] = d_2L_1[L:]
-
-    return z, z_noise
+    return z_fixed_branch, z_noise, z 
 
 
 import os
@@ -247,7 +228,11 @@ if __name__ == "__main__":
     
     # Execute the delay-and-sum fixed branch in frequency domain
     # Mapping: u = room_input_ideal, target_pos = mic_coords, source_pos = source_pos_2d
-    z_fixed, z_noise = sdw_mwf(room_input_ideal, mic_coords, source_pos_2d, FS)
+    z_fixed, z_noise, output = sdw_mwf(room_input_ideal,
+                               vad_oracle, 
+                               mic_coords, 
+                               source_pos_2d, 
+                               FS)
     
     print(" -> Saving reconstructed time-domain signal...")
     save_wav("2_output_SDW_MWF_fixed.wav", FS, z_fixed, output_folder)
@@ -255,9 +240,11 @@ if __name__ == "__main__":
     print(" -> Pipeline completed.")
 
     from matplotlib import pyplot as plt
-    # VAD PLOT
 
+    # VAD PLOT (NEEDS FURTHER ANALISIS)
+    """
     time = np.linspace(0, len(vad_oracle)/FS, len(vad_oracle)) 
     plt.figure()
     plt.plot( time, vad_oracle , color = 'r')
     plt.show()
+    """

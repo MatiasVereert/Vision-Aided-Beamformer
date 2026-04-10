@@ -210,7 +210,7 @@ class SimAcoustic():
             voice_peak = np.max(hilbert_target_early_energy)
 
             # Define the VAD treshole
-            VAD_treshole_dB  = -30 #dB 
+            VAD_treshole_dB  = -20 #dB 
             VAD_treshole = 10**(VAD_treshole_dB / 10) * voice_peak
 
             # Compare
@@ -488,7 +488,7 @@ class SimAcoustic():
         
 
             # Define the VAD treshole
-            VAD_treshole_dB  = -30 #dB 
+            VAD_treshole_dB  = -20#dB 
             VAD_treshole = 10**(VAD_treshole_dB / 20) * voice_peak
 
             # Compare
