@@ -7,13 +7,19 @@ import numpy as np
 from numba import njit
 # Local 
 from beamforming.signal_model import steering_vector, compute_rtf_steering_vector
+from scipy.spatial.distance import pdist
 
-def get_fixed_weights(w_fixed_raw, L, frecs, fs):
-    # Apply ONLY a small alignment delay if necessary to make the IR causal,
-    # NOT the algorithmic Delta = L/2. For near-field relative to mic 0, 
-    # phase shifts might already be well-behaved.
-    # If a centering shift is needed, keep it minimal (e.g., center of the L filter).
-    alignment_samples = L // 4  # # In te future this could be minimize by using the max lenght inter microphone
+def get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max):
+    # Calculate the physical maximum delay in seconds
+    max_delay_sec = d_max / 343.0
+    
+    # Convert to samples and add a small safety margin for the sinc tail
+    alignment_samples = int(np.ceil(max_delay_sec * fs)) + 5 
+    
+    # Prevent severe truncation if L is physically too small for the array
+    if alignment_samples >= L // 2:
+        print(f"WARNING: alignment_samples ({alignment_samples}) is too large for L={L}.")
+        
     alignment_phase = np.exp(-1j * 2 * np.pi * frecs * (alignment_samples / fs))
     
     # Broadcast phase across all M microphones
@@ -22,7 +28,7 @@ def get_fixed_weights(w_fixed_raw, L, frecs, fs):
     # Force DC to real
     w_fixed_aligned[0, :] = w_fixed_aligned[0, :].real + 0.0j
     
-    # Force Nyquist to real (or zero to prevent HF artifacts)
+    # Force Nyquist to real
     w_fixed_aligned[-1, :] = 0.0 + 0.0j
     
     # Transform to time domain to truncate
@@ -68,6 +74,36 @@ def get_blocking_matrix(w_fixed_freq, L):
     
     return Ca_constrained
 
+def regularize_covariance_matrix(Q_x):
+    """
+    Applies eigenvalue regularization to a batch of Hermitian covariance matrices.
+    Ensures that all matrices in the batch are positive semi-definite by 
+    subtracting any negative minimum eigenvalue from the diagonal.
+    
+    Args:
+        Q_x: Array of shape (F, M, M) containing F covariance matrices.
+        
+    Returns:
+        Q_x_reg: Array of shape (F, M, M) with regularized matrices.
+    """
+    F, M, _ = Q_x.shape
+    
+    # 1. Calculate real eigenvalues for all frequency bins simultaneously.
+    # np.linalg.eigvalsh is optimized for Hermitian/symmetric matrices.
+    eig_vals = np.linalg.eigvalsh(Q_x)
+    
+    # 2. Find the minimum eigenvalue for each frequency bin. Shape: (F,)
+    min_eig_vals = np.min(eig_vals, axis=1)
+    
+    # 3. Isolate the negative minimum eigenvalues. 
+    # If the minimum is positive, it becomes 0.0.
+    neg_min_eig_vals = np.minimum(min_eig_vals, 0.0)
+    
+    # 4. Subtract the negative minimum from the diagonal of Q_x.
+    # Reshape to (F, 1, 1) for broadcasting with the (M, M) identity matrix.
+    Q_x_reg = Q_x - (neg_min_eig_vals[:, np.newaxis, np.newaxis] * np.eye(M))
+    
+    return Q_x_reg
     
 
 
@@ -78,9 +114,18 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
     """
 
     # Define constants
-    lamda = 1
-    L = 128
+    Lambda = .9 # interval (0,1)
+    mu = .5
+    rho = 1
+    
+    diag_load = 1e-6
+
+    L = 1024
     M = u.shape[0]
+    mu_inv = 1 / mu
+
+    # Max geo distance 
+    max_dist = np.max(pdist(mic_coords))
 
     # Define frequency bins vector 
     F = L + 1
@@ -96,6 +141,7 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
     z = np.zeros(tot_frames * L, dtype=np.float64)
     z_fixed_branch = np.zeros(tot_frames * L, dtype=np.float64)
     z_noise = np.zeros(tot_frames * L, dtype=np.float64)
+    post_block = np.zeros(tot_frames * L, dtype=np.float64)
 
     # This aligns the phases relative to mic 0, keeping delays strictly local
     sv = compute_rtf_steering_vector(frecs, source_pos, target_pos, ref_mic_idx=0, mode="near_field", squeeze=True)
@@ -103,9 +149,8 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
     # Normalize by M to prevent amplitude clipping
     w_fixed_raw= sv.conj() / M
 
-    w_fixed = get_fixed_weights(w_fixed_raw, L, frecs, fs)
+    w_fixed = get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max = max_dist)
     C_block = get_blocking_matrix(w_fixed, L    ) #Shape is (F, M, M-1)
-
 
     # Inicalice adaptive variables
     w_adaptive = np.zeros( (F, M ), dtype = np.complex128)
@@ -113,8 +158,17 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
     print(np.shape(C_block))
 
     history_buffer = np.zeros(L, dtype=np.float64)
+    e_buffer = np.zeros(L,dtype=np.float64 )
     delay = L // 2
 
+    # Inicalizate Correlation Matirixes as Zero 
+    Q_instant = np.zeros((F, M, M), dtype=complex)
+
+    Q_y = np.zeros((F, M, M), dtype=complex)
+    Q_v = np.zeros((F, M, M), dtype=complex)
+    Q_x = np.zeros((F, M, M), dtype=complex)
+
+    
     for m in range(tot_frames):
         # --- PROCESS FRAMES ---
         # Extract frame of size 2L
@@ -123,10 +177,13 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
         # Apply rfft u->U from shape (M, 2L) -> (M, F)
         U_fram_rfft = np.fft.rfft(u_frame, axis=1)
 
+        # Definie VAD frame state
+        vad_frame = vad[m * L : m * L + L]
+        vad_status = np.mean(vad_frame) > 0.1
+
         # --- PROCESS FIXED BRANCH ---
         # Apply the spatial fixed filter to obtain refrence Signal D, Sae (F)
         D = np.einsum('fm, mf->f', w_fixed, U_fram_rfft)
-
 
         # --- APPLY DELAY FIXED BRANCH ---
         # Convert an extract data with out circular conv. overlap residue 
@@ -146,12 +203,16 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
         z_fixed_branch[m * L : m * L + L] = d_valid
 
         # --- PROCCES ADAPTIVE BRANCH (with previus w) ---
-
         # Apply the spatial filter to noise reference signals (D_n)
         # Ca (F, M, M-1) and data ( M, F) -> expect (F, M-1)  (Contracting M dimention)
         D_y = np.einsum('fmn, mf->fn', C_block, U_fram_rfft )
 
-        # Concatenate reference D signal without delay
+        # Extract post block signal for debuging
+        d_post_block_2L = np.fft.irfft(D_y[:, 0], n=2 * L)
+        d_post_block_2L_valid = d_post_block_2L[L:]
+        post_block[m * L : m * L + L] = d_post_block_2L_valid
+
+        # Concatenate reference D signal without delay (F, M-1) -> (F, M) 
         D_y = np.column_stack((D, D_y))
 
         # Proccess spatial filter, convert to time delay, apply overlap save 
@@ -163,15 +224,58 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
         z_noise[ m * L : m * L + L] = noise
 
         # --- COMPUTE OUTPUT (in time domain) ---
-        e = d_valid - noise
-
-        #   Save ouput
+        # 1. IMPORTANTE: Usar la señal retrasada como objetivo
+        e = d_delayed_valid - noise
+        
+        # Save output
         z[m * L : m * L + L] = e
 
 
+        # 2. IMPORTANTE: Zero-padding en lugar de overlap con el pasado
+        # Rellenamos con L ceros al principio y luego el error válido
+        e_2L = np.concatenate((np.zeros(L, dtype=np.float64), e))
+
+        # Convert output to DFT (Esto es tu \underline{e}_{v,2L}[m] del paper)
+        e_undeline = np.fft.rfft(e_2L)
+        
+        # (Ya no necesitas el e_buffer para el error)
+
+        # --- UPDATE CORRELATION MATRICES ---
+        # Compute instantaneous correlation matrix (Outer product per frequency bin)
+        Q_instant = np.einsum('fm,fn->fmn', D_y, D_y.conj())
+
+        # Update matrices based on VAD
+        if vad_status: 
+            Q_y = Lambda * Q_y + (1 - Lambda) * Q_instant / 2
+            # Weights remain constant during speech
+        else:
+            Q_v = Lambda * Q_v + (1 - Lambda) * Q_instant / 2
+            Q_x = Q_y - Q_v
+            Q_x = regularize_covariance_matrix(Q_x)
+
+            # --- UPDATE WEIGHTS ---
+            # Mix covariance matrices and add diagonal loading for numerical stability
+            Q_mix = Q_v + mu_inv * Q_x 
+            
+            # np.eye(M) broadcasts perfectly to (F, M, M)
+            Q_mix = Q_mix + np.eye(M) * diag_load
+
+            # Regularization term (Q_x is Hermitian, direct multiplication is safe)
+            # Q_x: (F, M, M), w_adaptive: (F, M) -> Result: (F, M)
+            r_2NL = mu_inv * np.einsum('fmn, fm -> fn', Q_x, w_adaptive) 
+
+            # Gradient calculation
+            # D_y.conj() is (F, M) and e_undeline is (F,). We scale each row by the scalar error.
+            gradient = np.einsum('fm, f -> fm', D_y.conj(), e_undeline) - r_2NL
+            
+            # Efficiently solve Q_mix * update = gradient across all frequency bins
+            gradient_update = np.linalg.solve(Q_mix, gradient)
+
+            # Apply update with the 0.5 unconstrained scalar factor (Table 2)
+            w_adaptive = w_adaptive + rho * (1 - Lambda) * 0.5 * gradient_update
 
 
-    return z_fixed_branch, z_noise, z 
+    return z_fixed_branch, post_block, z_noise, z 
 
 
 import os
@@ -228,23 +332,38 @@ if __name__ == "__main__":
     
     # Execute the delay-and-sum fixed branch in frequency domain
     # Mapping: u = room_input_ideal, target_pos = mic_coords, source_pos = source_pos_2d
-    z_fixed, z_noise, output = sdw_mwf(room_input_ideal,
+    z_fixed, post_block , z_noise, output = sdw_mwf(room_input_ideal,
                                vad_oracle, 
                                mic_coords, 
                                source_pos_2d, 
                                FS)
     
-    print(" -> Saving reconstructed time-domain signal...")
-    save_wav("2_output_SDW_MWF_fixed.wav", FS, z_fixed, output_folder)
-    save_wav("2_output_SDW_MWF_fixed_block_matrix.wav", FS, z_noise, output_folder)
+    print(" -> Normalizing and saving reconstructed time-domain signals...")
+
+    print(z_noise)
+    
+    # Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
+    def normalize_signal(sig):
+        max_abs = np.max(np.abs(sig))
+        if max_abs > 0:
+            return sig * (0.99 / max_abs)
+        return sig
+
+    z_fixed_norm = normalize_signal(z_fixed)
+    post_block_norm = normalize_signal(post_block)
+    z_noise_norm = normalize_signal(z_noise)
+    output_norm = normalize_signal(output)
+    
+
+    save_wav("2_output_SDW_MWF_fixed.wav", FS, z_fixed_norm, output_folder)
+    save_wav("2_output_SDW_MWF_post_block.wav", FS, post_block_norm, output_folder)
+    save_wav("2_output_SDW_MWF_fixed_block_matrix.wav", FS, z_noise_norm, output_folder)
+    save_wav("2_output_SDW_MWF_fixed_output.wav", FS, output_norm, output_folder)
+    
     print(" -> Pipeline completed.")
+    
 
     from matplotlib import pyplot as plt
 
     # VAD PLOT (NEEDS FURTHER ANALISIS)
-    """
-    time = np.linspace(0, len(vad_oracle)/FS, len(vad_oracle)) 
-    plt.figure()
-    plt.plot( time, vad_oracle , color = 'r')
-    plt.show()
-    """
+
