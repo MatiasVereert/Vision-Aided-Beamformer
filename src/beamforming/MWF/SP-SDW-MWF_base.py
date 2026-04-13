@@ -113,11 +113,11 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
     # Define constants
     Lambda = .9 # interval (0,1)
     mu = .5 #[0, 1] provides a trade-off between noise reduction and speech distortio
-    diag_load = 10
+    diag_load = 1
     rho = 4
     
 
-    L = 1024
+    L = 248
     M = u.shape[0]
     mu_inv = 1 / mu
 
@@ -166,6 +166,12 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
     Q_x = np.zeros((F, M, M), dtype=complex)
 
     
+    # [Initialization outside the loop]
+    # ... previous initializations ...
+    history_buffer = np.zeros(L, dtype=np.float64)
+    # We need a new buffer to hold the past valid time-domain samples of y_0 ... y_M-1
+    y_buffer = np.zeros((L, M), dtype=np.float64) 
+    
     for m in range(tot_frames):
         # --- PROCESS FRAMES ---
         # Extract frame of size 2L
@@ -178,64 +184,62 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
         vad_frame = vad[m * L : m * L + L]
         vad_status = np.mean(vad_frame) > 0.1
 
-        # --- PROCESS FIXED BRANCH ---
-        # Apply the spatial fixed filter to obtain refrence Signal D, Sae (F)
+        # --- PROCESS FIXED BRANCH (y_0) ---
         D = np.einsum('fm, mf->f', w_fixed, U_fram_rfft)
-
-        # --- APPLY DELAY FIXED BRANCH ---
-        # Convert an extract data with out circular conv. overlap residue 
         d_time_2L = np.fft.irfft(D, n=2 * L)
-        d_valid = d_time_2L[L:] 
-        d_combined = np.concatenate((history_buffer, d_valid))
+        d_valid = d_time_2L[L:] # This is the valid L-length speech reference
         
-        # Apply delay by sliding window
+        # --- APPLY DELAY FIXED BRANCH ---
+        d_combined = np.concatenate((history_buffer, d_valid))
         start_idx = L - delay
         end_idx = 2 * L - delay
         d_delayed_valid = d_combined[start_idx : end_idx]
-
-        # Save buffer for posterior frame
         history_buffer = d_valid.copy()
-
-        # Save fixed output to debug
         z_fixed_branch[m * L : m * L + L] = d_valid
 
-        # --- PROCCES ADAPTIVE BRANCH (with previus w) ---
-        # Apply the spatial filter to noise reference signals (D_n)
-        # Ca (F, M, M-1) and data ( M, F) -> expect (F, M-1)  (Contracting M dimention)
-        D_y = np.einsum('fmn, mf->fn', C_block, U_fram_rfft )
+        # --- PROCESS BLOCKING MATRIX (y_1 to y_M-1) ---
+        D_y_raw = np.einsum('fmn, mf->fn', C_block, U_fram_rfft)
+        
+        # CRITICAL FIX: Return to time domain to extract valid linear convolution
+        D_y_time = np.fft.irfft(D_y_raw, n=2 * L, axis=0) 
+        D_y_valid = D_y_time[L:, :] # Shape (L, M-1), free of circular convolution noise
+        
+        # Save post block signal for debugging
+        post_block[m * L : m * L + L] = D_y_valid[:, 0] 
 
-        # Extract post block signal for debuging
-        d_post_block_2L = np.fft.irfft(D_y[:, 0], n=2 * L)
-        d_post_block_2L_valid = d_post_block_2L[L:]
-        post_block[m * L : m * L + L] = d_post_block_2L_valid
+        # --- PREPARE CLEAN OVERLAP-SAVE FRAME FOR ADAPTIVE BRANCH ---
+        # Concatenate Speech Reference (y_0) and Noise References (y_1...y_M-1) in TIME domain
+        y_valid_time = np.column_stack((d_valid, D_y_valid)) # Shape (L, M)
+        
+        # Form the correct 2L Overlap-Save block using the previous valid frame
+        y_frame_2L = np.vstack((y_buffer, y_valid_time)) # Shape (2L, M)
+        y_buffer = y_valid_time.copy() # Save current valid frame for the next iteration
+        
+        # Transform the pure OS frame back to the frequency domain (F, M)
+        D_y = np.fft.rfft(y_frame_2L, axis=0)
 
-        # Concatenate reference D signal without delay (F, M-1) -> (F, M) 
-        D_y = np.column_stack((D, D_y))
-
-        # Proccess spatial filter, convert to time delay, apply overlap save 
+        # --- PROCCES ADAPTIVE BRANCH ---
+        # Now this multiplication is a mathematically safe single-stage circular convolution
         noise = np.einsum('fm,fm->f', D_y, w_adaptive)
-        noise_2L = np.fft.irfft(noise, n=2 * L )
-        noise = noise_2L[L:]
+        noise_2L = np.fft.irfft(noise, n=2 * L)
+        noise_valid = noise_2L[L:] # Now these L samples are truly valid
 
-        # Save to debug
-        z_noise[ m * L : m * L + L] = noise
+        z_noise[ m * L : m * L + L] = noise_valid
 
         # --- COMPUTE OUTPUT (in time domain) ---
-        # 1. IMPORTANTE: Usar la señal retrasada como objetivo
-        e = d_delayed_valid - noise
+        e = d_delayed_valid - noise_valid
         
-        # Save output
         z[m * L : m * L + L] = e
 
-        # Zeropad
+        # Zeropad and convert output to DFT 
         e_2L = np.concatenate((np.zeros(L, dtype=np.float64), e))
-
-        # Convert output to DFT (Esto es tu \underline{e}_{v,2L}[m] del paper)
         e_undeline = np.fft.rfft(e_2L)
         
         # --- UPDATE CORRELATION MATRICES ---
-        # Compute instantaneous correlation matrix (X* X^T)
+        # The D_y here is now exactly equivalent to D_y[m] from the paper (Equation 19-20)
         Q_instant = np.einsum('fm,fn->fmn', D_y.conj(), D_y)
+
+        # ... (Rest of the weight update loop remains exactly the same) ...
 
         # Update matrices based on VAD
         if vad_status: 
@@ -282,7 +286,7 @@ from utils.audio import save_wav
 # Import the fixed branch function we built
 
 if __name__ == "__main__":
-    FS = 48000
+    FS = 16000
     M1, M2 = 12, 1          
     M = M1 * M2
     speed_of_sound = 343.0 
