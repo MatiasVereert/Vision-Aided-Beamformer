@@ -29,8 +29,7 @@ def get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max):
     w_fixed_aligned[0, :] = w_fixed_aligned[0, :].real + 0.0j
     
     # Force Nyquist to real
-    # Force Nyquist to real without artificially zeroing it
-    w_fixed_aligned[-1, :] = w_fixed_aligned[-1, :].real + 0.0j
+    w_fixed_aligned[-1, :] = 0.0 + 0.0j
     
     # Transform to time domain to truncate
     w_time = np.fft.irfft(w_fixed_aligned, n=2 * L, axis=0) 
@@ -43,36 +42,29 @@ def get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max):
     w_fixed = np.fft.rfft(w_time_padded, axis=0)
 
     return w_fixed
-import scipy.linalg
 
 def get_blocking_matrix(w_fixed_freq, L):
     """
-    Calculates an Orthogonal Blocking Matrix using the null space (SVD).
-    This drastically improves White Noise Gain (WNG) and prevents spectral coloration.
+    Calculates a deterministic pairwise-subtraction Blocking Matrix (Griffiths-Jim style).
+    Uses the causal fixed weights directly without conjugation to prevent destroying 
+    the impulse response during the time-domain truncation.
     """
     F, M = w_fixed_freq.shape
-    
-    # 1. Calculate the purely spatial Orthogonal Null Space of the all-ones vector.
-    # This matrix is strictly real, frequency-independent, and shape is (M, M-1).
-    # Its columns are orthonormal: C^T * C = I
-    C_ortho = scipy.linalg.null_space(np.ones((1, M)))
     
     # Initialize the raw frequency-domain Blocking Matrix
     Ca_raw = np.zeros((F, M, M - 1), dtype=complex)
     
-    # 2. Combine the temporal alignment with the orthogonal spatial projection
+    # Populate the matrix to perform pairwise subtraction of ALIGNED signals.
+    # CRITICAL FIX: Removed .conj() to maintain strict causality (bulk delay preserved)
     for n in range(M - 1):
-        for m in range(M):
-            # Multiply the causal alignment phase by the spatial orthogonal weight.
-            # We multiply by M to undo the 1/M normalization specifically for the 
-            # noise references, ensuring the white noise power remains exactly 1x.
-            Ca_raw[:, m, n] = (w_fixed_freq[:, m] * M) * C_ortho[m, n]
-            
-    # 3. Apply the Strict Overlap-Save time constraint
+        Ca_raw[:, n, n] = w_fixed_freq[:, n]
+        Ca_raw[:, n + 1, n] = -w_fixed_freq[:, n + 1]
+        
+    # Apply the Overlap-Save time constraint
     Ca_time = np.fft.irfft(Ca_raw, n=2 * L, axis=0)
     Ca_time_padded = np.zeros_like(Ca_time)
     
-    # Preserve the causal bulk-delayed impulse
+    # This truncation now correctly captures the causal bulk-delayed impulse
     Ca_time_padded[:L, :, :] = Ca_time[:L, :, :]
     
     # Transform back to the frequency domain for the main processing loop
@@ -119,10 +111,10 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
     """
 
     # Define constants
-    Lambda = .95 # interval (0,1)
+    Lambda = .999 # interval (0,1)
     mu = 2 #[0, 1] provides a trade-off between noise reduction and speech distortion
-    diag_load = 1e-9
-    rho = 2
+    diag_load = 1e-6
+    rho = 4
     
 
     L = 128
@@ -169,7 +161,6 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
 
     # Inicalizate Correlation Matirixes as Zero 
     Q_instant = np.zeros((F, M, M), dtype=complex)
-    
 
     Q_y = np.zeros((F, M, M), dtype=complex)
     Q_v = np.zeros((F, M, M), dtype=complex)
@@ -254,34 +245,33 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
         else:
             Q_v = Lambda * Q_v + (1 - Lambda) * Q_instant / 2
             Q_x = Q_y - Q_v
-            # Create a separate variable to ensure the matrix inversion is stable
-            Q_x_reg = regularize_covariance_matrix(Q_x)
+            #Q_x = regularize_covariance_matrix(Q_x)
 
-            # --- UPDATE WEIGHTS ---
-            # Mix using the regularized matrix for the solver
-            Q_mix = Q_v + mu_inv * Q_x_reg 
+            # Mix covariance matrices and add diagonal loading for numerical stability
+            Q_mix = Q_v + mu_inv * Q_x 
             Q_mix = Q_mix + np.eye(M) * diag_load
 
-            # Compute the regularization term using the pure, unregularized speech covariance
+            # Regularization term (Mathematically correct: Wirtinger derivative)
             r_2NL = mu_inv * np.einsum('fmn, fn -> fm', Q_x, w_adaptive)
 
             # Gradient calculation
-            # D_y.conj() is (F, M) and e_undeline is (F,). We scale each row by the scalar error.
             gradient = np.einsum('fm, f -> fm', D_y.conj(), e_undeline) - r_2NL
             
             # Efficiently solve Q_mix * update = gradient across all frequency bins
             gradient_update = np.linalg.solve(Q_mix, gradient)
 
-            # Apply update with the 0.5 unconstrained scalar factor (Table 2)
-            w_adaptive_unconstrained = w_adaptive + rho * (1 - Lambda) * 0.5 * gradient_update
-
+            # --- UPDATE WEIGHTS ---
             if constrained:
-                w_2L = np.fft.irfft(w_adaptive_unconstrained, axis =0) 
-                w_2L[ L:,:] = 0
-                w_adaptive = np.fft.rfft(w_2L, n=2 * L, axis=0)
+                # IMPORTANT: The 0.5 factor is omitted in the constrained update
+                w_adaptive_unconstrained = w_adaptive + rho * (1 - Lambda) * gradient_update
                 
+                # Apply strictly causal projection
+                w_2L = np.fft.irfft(w_adaptive_unconstrained, axis=0) 
+                w_2L[L:, :] = 0.0
+                w_adaptive = np.fft.rfft(w_2L, n=2 * L, axis=0)
             else:
-                w_adaptive = w_adaptive_unconstrained
+                # The 0.5 factor is REQUIRED to approximate the constraint's energy halving
+                w_adaptive = w_adaptive + rho * (1 - Lambda) * 0.5 * gradient_update
 
 
 
@@ -310,28 +300,12 @@ if __name__ == "__main__":
     output_folder = "tests/data/sdw_mwf_output"
     os.makedirs(output_folder, exist_ok=True)
     
-    # === REPLACEMENT: Non-Uniform Linear Array (Logarithmic Spacing) ===
-    max_length = 0.30  # Maximum array length of 30 cm
-
-    # Create logarithmic spacing to cluster microphones for high frequencies
-    # while spreading them out for low frequencies. Ideal for broadband speech.
-    if M > 1:
-        base = 2.0  # Dispersion factor (can be tuned between 1.5 and 3.0)
-        indices = np.arange(M)
-        
-        # Normalize from 0 to 1 and scale to maximum length
-        x_norm = (base**indices - 1) / (base**(M - 1) - 1)
-        x = x_norm * max_length
-    else:
-        x = np.array([0.0])
-
-    # Assemble 3D coordinate matrix (assuming array is along the X-axis)
+    mic_spacing = 0.05
+    x = np.linspace(0, (M1-1)*mic_spacing, M1)
     mic_coords = np.column_stack([x, np.zeros(M), np.zeros(M)])
-
-    # Translate the array to the desired center position
+    
     array_center = np.array([1.25, 2.0, 1.25])
     mic_coords = mic_coords - np.mean(mic_coords, axis=0) + array_center
-    # ===================================================================
     
     r = 1.0 
     ang_target = np.deg2rad(130)

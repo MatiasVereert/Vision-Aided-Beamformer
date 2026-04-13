@@ -43,36 +43,29 @@ def get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max):
     w_fixed = np.fft.rfft(w_time_padded, axis=0)
 
     return w_fixed
-import scipy.linalg
 
 def get_blocking_matrix(w_fixed_freq, L):
     """
-    Calculates an Orthogonal Blocking Matrix using the null space (SVD).
-    This drastically improves White Noise Gain (WNG) and prevents spectral coloration.
+    Calculates a deterministic pairwise-subtraction Blocking Matrix (Griffiths-Jim style).
+    Uses the causal fixed weights directly without conjugation to prevent destroying 
+    the impulse response during the time-domain truncation.
     """
     F, M = w_fixed_freq.shape
-    
-    # 1. Calculate the purely spatial Orthogonal Null Space of the all-ones vector.
-    # This matrix is strictly real, frequency-independent, and shape is (M, M-1).
-    # Its columns are orthonormal: C^T * C = I
-    C_ortho = scipy.linalg.null_space(np.ones((1, M)))
     
     # Initialize the raw frequency-domain Blocking Matrix
     Ca_raw = np.zeros((F, M, M - 1), dtype=complex)
     
-    # 2. Combine the temporal alignment with the orthogonal spatial projection
+    # Populate the matrix to perform pairwise subtraction of ALIGNED signals.
+    # CRITICAL FIX: Removed .conj() to maintain strict causality (bulk delay preserved)
     for n in range(M - 1):
-        for m in range(M):
-            # Multiply the causal alignment phase by the spatial orthogonal weight.
-            # We multiply by M to undo the 1/M normalization specifically for the 
-            # noise references, ensuring the white noise power remains exactly 1x.
-            Ca_raw[:, m, n] = (w_fixed_freq[:, m] * M) * C_ortho[m, n]
-            
-    # 3. Apply the Strict Overlap-Save time constraint
+        Ca_raw[:, n, n] = w_fixed_freq[:, n]
+        Ca_raw[:, n + 1, n] = -w_fixed_freq[:, n + 1]
+        
+    # Apply the Overlap-Save time constraint
     Ca_time = np.fft.irfft(Ca_raw, n=2 * L, axis=0)
     Ca_time_padded = np.zeros_like(Ca_time)
     
-    # Preserve the causal bulk-delayed impulse
+    # This truncation now correctly captures the causal bulk-delayed impulse
     Ca_time_padded[:L, :, :] = Ca_time[:L, :, :]
     
     # Transform back to the frequency domain for the main processing loop
@@ -120,8 +113,8 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
 
     # Define constants
     Lambda = .95 # interval (0,1)
-    mu = 2 #[0, 1] provides a trade-off between noise reduction and speech distortion
-    diag_load = 1e-9
+    mu = 16 #[0, 1] provides a trade-off between noise reduction and speech distortion
+    diag_load = 1e-3
     rho = 2
     
 
