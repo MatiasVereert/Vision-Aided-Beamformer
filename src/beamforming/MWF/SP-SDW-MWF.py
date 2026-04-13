@@ -43,8 +43,6 @@ def get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max):
 
     return w_fixed
 
-
-
 def get_blocking_matrix(w_fixed_freq, L):
     """
     Calculates a deterministic pairwise-subtraction Blocking Matrix (Griffiths-Jim style).
@@ -104,7 +102,6 @@ def regularize_covariance_matrix(Q_x):
     Q_x_reg = Q_x - (neg_min_eig_vals[:, np.newaxis, np.newaxis] * np.eye(M))
     
     return Q_x_reg
-    
 
 
 def sdw_mwf(u, vad, target_pos, source_pos, fs):
@@ -115,10 +112,10 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
 
     # Define constants
     Lambda = .9 # interval (0,1)
-    mu = .5
-    rho = 1
+    mu = .5 #[0, 1] provides a trade-off between noise reduction and speech distortio
+    diag_load = 10
+    rho = 4
     
-    diag_load = 1e-6
 
     L = 1024
     M = u.shape[0]
@@ -230,19 +227,15 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
         # Save output
         z[m * L : m * L + L] = e
 
-
-        # 2. IMPORTANTE: Zero-padding en lugar de overlap con el pasado
-        # Rellenamos con L ceros al principio y luego el error válido
+        # Zeropad
         e_2L = np.concatenate((np.zeros(L, dtype=np.float64), e))
 
         # Convert output to DFT (Esto es tu \underline{e}_{v,2L}[m] del paper)
         e_undeline = np.fft.rfft(e_2L)
         
-        # (Ya no necesitas el e_buffer para el error)
-
         # --- UPDATE CORRELATION MATRICES ---
-        # Compute instantaneous correlation matrix (Outer product per frequency bin)
-        Q_instant = np.einsum('fm,fn->fmn', D_y, D_y.conj())
+        # Compute instantaneous correlation matrix (X* X^T)
+        Q_instant = np.einsum('fm,fn->fmn', D_y.conj(), D_y)
 
         # Update matrices based on VAD
         if vad_status: 
@@ -262,7 +255,7 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
 
             # Regularization term (Q_x is Hermitian, direct multiplication is safe)
             # Q_x: (F, M, M), w_adaptive: (F, M) -> Result: (F, M)
-            r_2NL = mu_inv * np.einsum('fmn, fm -> fn', Q_x, w_adaptive) 
+            r_2NL = mu_inv * np.einsum('fmn, fn -> fm', Q_x, w_adaptive)
 
             # Gradient calculation
             # D_y.conj() is (F, M) and e_undeline is (F,). We scale each row by the scalar error.
@@ -274,15 +267,16 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs):
             # Apply update with the 0.5 unconstrained scalar factor (Table 2)
             w_adaptive = w_adaptive + rho * (1 - Lambda) * 0.5 * gradient_update
 
-
     return z_fixed_branch, post_block, z_noise, z 
 
-
+# Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
+def normalize_signal(sig):
+    max_abs = np.max(np.abs(sig))
+    if max_abs > 0:
+        return sig * (0.99 / max_abs)
+    return sig
+    
 import os
-import numpy as np
-# scipy.signal is no longer strictly needed for STFT/ISTFT, but you might need it elsewhere
-
-# Adjust imports based on your exact file structure
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav
 # Import the fixed branch function we built
@@ -342,12 +336,7 @@ if __name__ == "__main__":
 
     print(z_noise)
     
-    # Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
-    def normalize_signal(sig):
-        max_abs = np.max(np.abs(sig))
-        if max_abs > 0:
-            return sig * (0.99 / max_abs)
-        return sig
+
 
     z_fixed_norm = normalize_signal(z_fixed)
     post_block_norm = normalize_signal(post_block)
@@ -357,13 +346,7 @@ if __name__ == "__main__":
 
     save_wav("2_output_SDW_MWF_fixed.wav", FS, z_fixed_norm, output_folder)
     save_wav("2_output_SDW_MWF_post_block.wav", FS, post_block_norm, output_folder)
-    save_wav("2_output_SDW_MWF_fixed_block_matrix.wav", FS, z_noise_norm, output_folder)
-    save_wav("2_output_SDW_MWF_fixed_output.wav", FS, output_norm, output_folder)
+    save_wav("2_output_SDW_MWF_noise.wav", FS, z_noise_norm, output_folder)
+    save_wav("2_output_SDW_MWF_output.wav", FS, output_norm, output_folder)
     
     print(" -> Pipeline completed.")
-    
-
-    from matplotlib import pyplot as plt
-
-    # VAD PLOT (NEEDS FURTHER ANALISIS)
-
