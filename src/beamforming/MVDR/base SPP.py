@@ -1,13 +1,19 @@
 import numpy as np 
 import scipy.signal as signal
 import matplotlib.pyplot as plt
-from utils.audio import  normalize_signal
 
+# Assuming the import works correctly in your local environment
+from beamforming.signal_model import compute_rtf_steering_vector
+import numpy as np 
+import scipy.signal as signal
+import matplotlib.pyplot as plt
 
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 
 def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft):
+    # Note: 'vad' argument is kept for compatibility with the bridge function, 
+    # but it is completely ignored in favor of the Spatial SPP.
     lamda = 0.99
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
@@ -18,52 +24,90 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
     # Initialize output complex STFT matrix
     Y_stft = np.zeros((K, T), dtype=np.complex128)
     
-    # Initialize noise covariance matrix R_nn for all frequencies (K, M, M)
-    # We use a small diagonal loading to prevent singularities from the start
-    R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
-    
     # Pre-create diagonal loading matrix to be used inside the loop
     diag_load = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+
+    # Initialize noise covariance matrix R_nn
+    R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    
+    # Initialize noisy signal covariance matrix R_xx using the steering vector
+    # We assume an initial PSD (phi_s) for the source to seed the matrix
+    phi_s = 1e-3 
+    R_ss_init = phi_s * np.einsum("fm,fn->fmn", sv, sv.conj())
+    R_xx = R_ss_init + R_nn
+
+    # Initialize the inverse of R_nn for the first frame's SPP calculation
+    R_nn_inv = np.linalg.inv(R_nn + diag_load)
+
+    # SPP Hyperparameters
+    # Threshold for spatial SNR (gamma). 3.0 linear is approx 4.7 dB
+    gamma_th = 3.0 
+    spp_slope = 2.0 
 
     for m in range(T):
         # Extract the current frame across all frequencies, shape (K, M)
         X_frame = X_stft[:, m, :]
 
-        # Define VAD frame state (mapping STFT frame to time-domain VAD)
-        vad_frame = vad[m * hop_length_fft : length_fft + m * hop_length_fft]
-        vad_status = np.mean(vad_frame) > 0.1
-
-        # Update noise covariance ONLY when target speech is absent
-        if not vad_status:
-            # Outer product of the frame: (K, M) and (K, M) -> (K, M, M)
-            R_nn_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
-            R_nn = lamda * R_nn + (1 - lamda) * R_nn_instant
-
-        # Add diagonal loading for numerical stability before inversion
-        R_nn_stable = R_nn + diag_load
+        # --- 1. Calculate A Posteriori Spatial SNR (gamma) ---
+        # Evaluate the current frame against the prior noise spatial structure
         
-        # Invert the covariance matrices for all frequencies simultaneously
+        # Numerator: |v^H * R_nn_inv * x|^2
+        R_nn_inv_x = np.einsum("fmn,fn->fm", R_nn_inv, X_frame)
+        num_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_x)
+        num = np.abs(num_complex)**2
+        
+        # Denominator: v^H * R_nn_inv * v (represents noise power at output)
+        R_nn_inv_v = np.einsum("fmn,fn->fm", R_nn_inv, sv)
+        den_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_v)
+        den = np.real(den_complex) # Guaranteed to be real 
+        
+        # Calculate gamma for all frequencies
+        gamma = num / (den + 1e-10)
+
+        # --- 2. Map Gamma to Spatial Presence Probability (SPP) ---
+        # Using a sigmoid function to map SNR to a probability [0, 1]
+        P = 1.0 / (1.0 + np.exp(-spp_slope * (gamma - gamma_th)))
+        
+        # Clip probabilities to prevent matrices from completely freezing
+        P = np.clip(P, 0.05, 0.95)
+        P_expand = P[:, np.newaxis, np.newaxis]
+
+        # --- 3. Update Covariance Matrices ---
+        # Calculate instantaneous covariance of the observation
+        R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
+        
+        # Update R_xx weighted by the probability of target speech presence
+        R_xx = lamda * R_xx + (1 - lamda) * P_expand * R_instant
+        
+        # Update R_nn weighted by the probability of target speech absence
+        R_nn = lamda * R_nn + (1 - lamda) * (1 - P_expand) * R_instant
+
+        # --- 4. Compute MVDR Weights ---
+        # Prepare stable R_nn and invert it for the current frame
+        R_nn_stable = R_nn + diag_load
         R_nn_inv = np.linalg.inv(R_nn_stable)
 
-        # Calculate MVDR Weights
-        # Numerator: R_nn_inv * d -> (K, M, M) * (K, M) -> (K, M)
+        # Numerator: R_nn_inv * v
         weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, sv)
         
-        # Denominator: d^H * numerator -> (K, M) * (K, M) -> (K,)
+        # Denominator: v^H * numerator
         weights_den = np.einsum("fm,fm->f", sv.conj(), weights_nom)
         
-        # Divide numerator by denominator. 
-        # Expand dims of denominator to allow broadcasting from (K,) to (K, M)
-        weights = weights_nom / weights_den[:, np.newaxis]
+        # Final weights calculation
+        weights = weights_nom / (weights_den[:, np.newaxis] + 1e-10)
 
-        # Apply weights to the current observation to get the clean output
-        # Output is shape (K,) for the current frame
+        # --- 5. Apply Filter ---
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
     return Y_stft
 
-# Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
 
+# Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
+def normalize_signal(sig):
+    max_abs = np.max(np.abs(sig))
+    if max_abs > 0:
+        return sig * (0.99 / max_abs)
+    return sig
 
 import numpy as np
 import scipy.signal as signal
@@ -144,7 +188,7 @@ if __name__ == "__main__":
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/mvdr_base_output"
+    output_folder = "tests/data/mvdr_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
