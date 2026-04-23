@@ -3,6 +3,11 @@ import numpy as np
 from scipy.io import wavfile
 from scipy import signal
 
+def normalize_signal(sig):
+    max_abs = np.max(np.abs(sig))
+    if max_abs > 0:
+        return sig * (0.99 / max_abs)
+    return sig
 
 
 def save_wav(filename, rate, data, folder="resultados_test"):

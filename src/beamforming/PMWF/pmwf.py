@@ -1,33 +1,43 @@
 import numpy as np 
 import scipy.signal as signal
 import matplotlib.pyplot as plt
-from utils.audio import  normalize_signal
-
 
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
+import numpy as np
+import numpy as np
+import numpy as np
 
-def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, min_loading = 1e-6, save_weights=False):
-    lamda = 0.99
-    beta = 1e-3 # relative loading
+import numpy as np
+
+def pmwf_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.98):
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
-
-    # Get steering vectors, expected shape (K, M)
-    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="near_field", squeeze=True)
     
+    # Tuning parameter for the PMWF (Beta = 1 corresponds to Wiener, Beta = 0 to MVDR)
+    Beta = 0
+
+    # Reference mic index
+    ref_mic_idx = 0
+    warmup_frames = 30
+
     # Initialize output complex STFT matrix
     Y_stft = np.zeros((K, T), dtype=np.complex128)
     
-    # Initialize noise covariance matrix R_nn for all frequencies (K, M, M)
-    # We use a small diagonal loading to prevent singularities from the start
-    R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    # Initialize covariance matrices for all frequencies (K, M, M)
+    R_vv = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    R_yy = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
     
     # Pre-create diagonal loading matrix to be used inside the loop
-    diag_load = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    diag_load = np.tile(np.eye(M, dtype=np.complex128) * 1e-3, (K, 1, 1))
 
-    #save weights
-    weights_rec = np.zeros((K,T,M), dtype=np.complex128)
+    # Selection vector u to extract the reference microphone column
+    u = np.zeros(M, dtype=int)
+    u[ref_mic_idx] = 1
+
+    # Identity matrix for the alternative numerator formula
+    I_matrix = np.eye(M, dtype=np.complex128)[np.newaxis, :, :]
+
     for m in range(T):
         # Extract the current frame across all frequencies, shape (K, M)
         X_frame = X_stft[:, m, :]
@@ -36,45 +46,62 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
         vad_frame = vad[m * hop_length_fft : length_fft + m * hop_length_fft]
         vad_status = np.mean(vad_frame) > 0.1
 
-        # Update noise covariance ONLY when target speech is absent
+        # Calculate instantaneous covariance matrix
+        R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
+
+        # FIX 1: Observation covariance matrix R_yy must be updated unconditionally
+        # to ensure it tracks the true signal statistics, preventing stale speech 
+        # energy during noise-only periods.
+        R_yy = alpha * R_yy + (1 - alpha) * R_instant
+
         if not vad_status:
-            # Outer product of the frame: (K, M) and (K, M) -> (K, M, M)
-            R_nn_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
-            R_nn = lamda * R_nn + (1 - lamda) * R_nn_instant
+            # Update noise covariance ONLY when target speech is absent
+            R_vv = alpha * R_vv + (1 - alpha) * R_instant
 
-        # Cálculo dinámico parametrizado
-        tr_R = np.real(np.trace(R_nn, axis1=1, axis2=2))
-        adaptive_load = beta * (tr_R[:, None, None] / M)
-        loading = np.maximum(adaptive_load, min_loading)
-        
-        R_nn_stable = R_nn + np.eye(M)[None, :, :] * loading
-        
-        # Invert the covariance matrices for all frequencies simultaneously
-        R_nn_inv = np.linalg.inv(R_nn_stable)
+        # Dynamic diagonal loading for matrix inversion stability
+        # ... (cálculo de R_yy y R_vv como antes) ...
 
-        # Calculate MVDR Weights
-        # Numerator: R_nn_inv * d -> (K, M, M) * (K, M) -> (K, M)
-        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, sv)
+        # 1. Aplicar la MISMA regularización a ambas matrices
+        eps = 1e-2
+        trace_R_vv = np.trace(R_vv, axis1=1, axis2=2) 
+        dynamic_diag = I_matrix * trace_R_vv[:, np.newaxis, np.newaxis] * eps
         
-        # Denominator: d^H * numerator -> (K, M) * (K, M) -> (K,)
-        weights_den = np.einsum("fm,fm->f", sv.conj(), weights_nom)
+        R_vv_stable = R_vv + dynamic_diag + diag_load  
+        R_yy_stable = R_yy + dynamic_diag + diag_load  # <--- CORRECCIÓN CRÍTICA
         
-        # Divide numerator by denominator. 
-        # Expand dims of denominator to allow broadcasting from (K,) to (K, M)
-        weights = weights_nom / weights_den[:, np.newaxis]
+        R_vv_inv = np.linalg.inv(R_vv_stable)
 
-        weights_rec[:,m,:] = weights
-        # Apply weights to the current observation to get the clean output
-        # Output is shape (K,) for the current frame
-        Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
+        # Batch matrix multiplication: R_vv_inv * R_yy_stable
+        R_vv_inv_R_yy = R_vv_inv @ R_yy_stable
+        
+        lambda_eig = np.trace(R_vv_inv_R_yy, axis1=1, axis2=2) - M
+        
+        # 2. Piso de seguridad para evitar divisiones peligrosas
+        # En lugar de 0.0, usamos un valor pequeño positivo
+        lambda_eig = np.maximum(np.real(lambda_eig), 1e-3) # <--- CORRECCIÓN CRÍTICA
 
-    if save_weights:
-        return Y_stft, weights_rec
-    else:
-        return Y_stft
+        if m < warmup_frames:
+            Y_stft[:, m] = X_frame[:, ref_mic_idx]
+        else:
+            numerator_matrix = R_vv_inv_R_yy - I_matrix
+            weights_nom = numerator_matrix @ u 
+            
+            # Al sumarle Beta (0) a lambda_eig (min 1e-3), el denominador es estable
+            weights_den = Beta + lambda_eig
+            weights = weights_nom / weights_den[:, np.newaxis]
+            
+            Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
+
+    return Y_stft
+
+
 
 # Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
-
+def normalize_signal(sig):
+    max_abs = np.max(np.abs(sig))
+    if max_abs > 0:
+        return sig * (0.99 / max_abs)
+    return sig
 
 import numpy as np
 import scipy.signal as signal
@@ -89,12 +116,8 @@ import os
 import numpy as np
 import scipy.signal as signal
 
-# Assuming these are available from your local environment modules
 from beamforming.signal_model import compute_rtf_steering_vector
-# from simulation_module import SimAcoustic 
-# from utils import save_wav, normalize_signal 
-# from your_mvdr_module import MVDR_recursive 
-# from your_wpe_module import process_wpe_online
+
 
 def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256):
     """
@@ -115,7 +138,7 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     vad_padded = np.pad(vad_oracle, (0, length_fft + hop_length_fft), mode='constant')
 
     # Execute the Recursive MVDR
-    Y_stft = MVDR_recursive(
+    Y_stft = pmwf_recursive(
         X_stft=X_stft, 
         vad=vad_padded, 
         fs=fs, 
@@ -155,7 +178,7 @@ if __name__ == "__main__":
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/mvdr_base_output"
+    output_folder = "tests/data/mvdr_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array

@@ -10,7 +10,8 @@ import noisereduce as nr
 
 
 # Import the Numba function and steering vector helper from your module
-from beamforming.MPDRxWPE.MPDRxWPE import MPDRxWPE_numba, MPDRxWPE_numba_warm, MPDRxWPE_numba_warm_v1, MPDRxWPE_numba_block_warmup
+from beamforming.MPDRxWPE.MPDRxWPE import MPDRxWPE_numba
+
 from beamforming.MPDRxWPE.MPDRxWPE import MPDRxWPE_numba_scaled
 from beamforming.signal_model import compute_rtf_steering_vector
 from evaluation.metrics import evaluate_full_pipeline
@@ -19,593 +20,64 @@ from propagation.simulate_acoustics import SimAcoustic
 from evaluation.polar_plots import precompute_quantized_spatial_response, subsample_weights
 from beamforming.MWF.onlineMWF import online_mwf_numba
 
-
-
-
-class MPDR_WPE_Scaled_Exp_Processor:
+import numpy as np
+from beamforming.MVDR.base import MVDR_recursive
+class MVDR_Processor:
     """
-    Object-oriented wrapper for the MPDR-WPE bilinear framework.
-    Implements Scaled Diagonal Loading (Trace-based) and an 
-    Exponential Forgetting Factor to accelerate initial convergence.
+    Object-oriented wrapper for the recursive MVDR beamformer.
+    It retrieves the oracle VAD mask from the scene configuration.
     """
-    def __init__(self, T_init=62, L=20, Delta=4, alpha_steady=0.994, 
-                 alpha_init=0.90, tau=20.0, beta=1e-2, p_min=1e-10, 
-                 nperseg=1024, noverlap=768):
-        # Initialization and algorithm parameters
-        self.T_init = T_init
-        self.L = L
-        self.Delta = Delta
-        self.alpha_steady = alpha_steady
-        self.alpha_init = alpha_init
-        self.tau = tau
-        self.beta = beta
-        self.p_min = p_min
-        
-        # STFT parameters
+    def __init__(self, nperseg=1024, noverlap=768, min_loading=1e-6):
+        # Store STFT parameters
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
+        self.min_loading = min_loading
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
-        # Extract simulation context
+        # 1. Extract simulation context and VAD
         fs = scene_config['fs']
         source_pos = scene_config['source_pos'].reshape(1, 3)
         mic_coords = scene_config['mic_coords']
+        vad = scene_config.get('vad', None)
         
-        # Transform Time to Frequency domain (STFT)
+        # Saftey check to ensure VAD was successfully passed
+        if vad is None:
+            raise ValueError("MVDR_Processor requires a valid VAD array in scene_config['vad'].")
+
+        # 2. Transform Time to Frequency domain (STFT)
         freqs, times, X_stft = sig.stft(
             mic_signals, fs=fs, window='hamming', 
             nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
         )
         
-        # Transpose array to match Numba function expectations (K, T, M) 
-        # and force contiguous memory layout for maximum speed
-        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
-        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
+        # 3. Transpose to match the expected shape (K, T, M) for the recursive MVDR
+        X_stft_mvdr = np.transpose(X_stft, (1, 2, 0))
+        X_stft_mvdr = np.ascontiguousarray(X_stft_mvdr, dtype=np.complex128)
         
-        # Compute Near-Field Steering Vector for the target source
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
+        # 4. Execute the core recursive MVDR function
+        # Note: Depending on your MVDR_recursive implementation, you might need 
+        # to adjust if it returns only the output or also the weights.
+        Y_stft, weights = MVDR_recursive(
+            X_stft=X_stft_mvdr, 
+            vad=vad, 
+            fs=fs, 
+            array_geometry=mic_coords, 
+            source_pos=source_pos, 
+            length_fft=self.nperseg, 
+            hop_length_fft=self.nperseg - self.noverlap, 
+            min_loading=self.min_loading,
+            save_weights = True
         )
         
-        # Execute core beamforming algorithm with exponential alpha
-        # NOTE: Ensure MPDRxWPE_numba_scaled is imported at the top of evaluate.py
-        X_hat_stft, weights = MPDRxWPE_numba_scaled(
-            X_stft_mpdr, 
-            sv, 
-            T_init=self.T_init,
-            alpha_steady=self.alpha_steady,
-            alpha_init=self.alpha_init,
-            tau=self.tau,
-            L=self.L, 
-            Delta=self.Delta, 
-            beta=self.beta,
-            p_min=self.p_min,
-            save_weights=True
-        )
-        
-        # Transform Frequency back to Time domain (ISTFT)
+        # 5. Transform Frequency back to Time domain (ISTFT)
         _, y_time = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
+            Y_stft, fs=fs, window='hamming', 
             nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
         )
         
         return y_time, weights
 
-class MPDR_WPE_Scaled_Exp_Processor:
-    """
-    Object-oriented wrapper for the MPDR-WPE bilinear framework.
-    Implements Scaled Diagonal Loading (Trace-based) and an 
-    Exponential Forgetting Factor to accelerate initial convergence.
-    """
-    def __init__(self, T_init=62, L=20, Delta=4, alpha_steady=0.994, 
-                 alpha_init=0.90, tau=20.0, beta=1e-2, p_min=1e-10, 
-                 nperseg=1024, noverlap=768):
-        # Initialization and algorithm parameters
-        self.T_init = T_init
-        self.L = L
-        self.Delta = Delta
-        self.alpha_steady = alpha_steady
-        self.alpha_init = alpha_init
-        self.tau = tau
-        self.beta = beta
-        self.p_min = p_min
-        
-        # STFT parameters
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-        self.nfft = nperseg
-
-    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
-        # Extract simulation context
-        fs = scene_config['fs']
-        source_pos = scene_config['source_pos'].reshape(1, 3)
-        mic_coords = scene_config['mic_coords']
-        
-        # Transform Time to Frequency domain (STFT)
-        freqs, times, X_stft = sig.stft(
-            mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        # Transpose array to match Numba function expectations (K, T, M) 
-        # and force contiguous memory layout for maximum speed
-        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
-        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
-        
-        # Compute Near-Field Steering Vector for the target source
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
-        )
-        
-        # Execute core beamforming algorithm with exponential alpha
-        # NOTE: Ensure MPDRxWPE_numba_scaled is imported at the top of evaluate.py
-        X_hat_stft, weights = MPDRxWPE_numba_scaled(
-            X_stft_mpdr, 
-            sv, 
-            T_init=self.T_init,
-            alpha_steady=self.alpha_steady,
-            alpha_init=self.alpha_init,
-            tau=self.tau,
-            L=self.L, 
-            Delta=self.Delta, 
-            beta=self.beta,
-            p_min=self.p_min,
-            save_weights=True
-        )
-        
-        # Transform Frequency back to Time domain (ISTFT)
-        _, y_time = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        return y_time, weights
-
-class MPDR_WPE_Scaled_NR_Processor:
-    """
-    Object-oriented wrapper for the MPDR-WPE bilinear framework.
-    Includes Scaled Diagonal Loading and a post-filtering stage using
-    the noisereduce library to tackle residual diffuse reverberation.
-    """
-    def __init__(self, T_init=62, L=20, Delta=4, alpha=0.994, beta=1e-2, 
-                 p_min=1e-10, nperseg=1024, noverlap=768, nr_prop_decrease=0.8):
-        # MPDR-WPE scaled parameters
-        self.T_init = T_init
-        self.L = L
-        self.Delta = Delta
-        self.alpha = alpha
-        self.beta = beta
-        self.p_min = p_min
-        
-        # STFT parameters
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-        self.nfft = nperseg
-        
-        # Post-filter parameters
-        self.nr_prop_decrease = nr_prop_decrease
-
-    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
-        # 1. Extract simulation context
-        fs = scene_config['fs']
-        source_pos = scene_config['source_pos'].reshape(1, 3)
-        mic_coords = scene_config['mic_coords']
-        
-        # 2. Time to Frequency domain (STFT)
-        freqs, times, X_stft = sig.stft(
-            mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        # 3. Transpose to match Numba function expectations (K, T, M)
-        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
-        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
-        
-        # 4. Compute Steering Vector for the target source
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
-        )
-        
-        # 5. Execute core bilinear algorithm
-        # En MPDR_WPE_Scaled_NR_Processor.process
-        X_hat_stft, weights = MPDRxWPE_numba_scaled(
-            X_stft_mpdr, 
-            sv, 
-            T_init=self.T_init,
-            alpha_steady=self.alpha,  # CAMBIO AQUÍ: de alpha a alpha_steady
-            alpha_init=self.alpha,    # Agregado para cumplir con la firma
-            tau=20.0,                 # Agregado (o pasalo desde el init)
-            L=self.L, 
-            Delta=self.Delta, 
-            beta=self.beta,
-            p_min=self.p_min,
-            save_weights=True
-        )
-                
-        # 6. Frequency to Time domain (ISTFT)
-        _, y_time_intermediate = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        # 7. Post-filtering stage (Non-linear diffuse noise reduction)
-        # We apply the spectral gating on the 1D output of the beamformer
-        y_time_final = nr.reduce_noise(
-            y=y_time_intermediate, 
-            sr=fs, 
-            prop_decrease=self.nr_prop_decrease,
-            stationary=False # False allows tracking dynamic residual reverb
-        )
-        
-        return y_time_final, weights
-
-class MPDR_WPE_Scaled_Processor:
-    """
-    Object-oriented wrapper for the MPDR-WPE bilinear framework.
-    Implements Scaled Diagonal Loading (Trace-based) and Energy Initialization.
-    """
-    def __init__(self, T_init=62, L=20, Delta=4, alpha=0.994, beta=1e-2, p_min=1e-10, nperseg=1024, noverlap=768):
-        self.T_init = T_init  # Number of frames to estimate initial energy (e.g., 62 for ~1 sec at 16kHz)
-        self.L = L
-        self.Delta = Delta
-        self.alpha = alpha
-        self.beta = beta      # Trace scaling factor for diagonal loading
-        self.p_min = p_min    # Minimum energy floor
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-        self.nfft = nperseg
-
-    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
-        # Extract simulation context
-        fs = scene_config['fs']
-        source_pos = scene_config['source_pos'].reshape(1, 3)
-        mic_coords = scene_config['mic_coords']
-        
-        # Time to Frequency domain (STFT)
-        freqs, times, X_stft = sig.stft(
-            mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        # Transpose to match Numba function expectations (K, T, M) and force contiguous memory
-        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
-        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
-        
-        # Compute Steering Vector for the target source
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
-        )
-        
-        # NOTE: Make sure you import MPDRxWPE_numba_scaled at the top of your file
-        # Execute core beamforming algorithm with trace-scaled diagonal loading
-        # En MPDR_WPE_Scaled_NR_Processor.process
-        X_hat_stft, weights = MPDRxWPE_numba_scaled(
-            X_stft_mpdr, 
-            sv, 
-            T_init=self.T_init,
-            alpha_steady=self.alpha,  # CAMBIO AQUÍ: de alpha a alpha_steady
-            alpha_init=self.alpha,    # Agregado para cumplir con la firma
-            tau=20.0,                 # Agregado (o pasalo desde el init)
-            L=self.L, 
-            Delta=self.Delta, 
-            beta=self.beta,
-            p_min=self.p_min,
-            save_weights=True
-        )
-        
-        # Frequency to Time domain (ISTFT)
-        _, y_time = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        return y_time, weights
-
-
-class MWF_Processor:
-    """
-    Object-oriented wrapper for the Online Multichannel Wiener Filter (MWF).
-    """
-    def __init__(self, alpha=0.95, diag_load = 1e-3, nperseg=1024, noverlap=768):
-        self.alpha = alpha
-        self.diag_load = diag_load
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-        self.nfft = nperseg
-
-    def process(self, mic_signals: np.ndarray, scene_config: dict) -> np.ndarray:
-        # 1. Extract simulation context
-        fs = scene_config['fs']
-        source_pos = scene_config['source_pos'].reshape(1, 3)
-        mic_coords = scene_config['mic_coords']
-        
-        # 2. Time to Frequency domain (STFT)
-        freqs, times, X_stft = sig.stft(
-            mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        # 3. Transpose to match Numba function expectations (K, T, M)
-        X_stft_mwf = np.transpose(X_stft, (1, 2, 0))
-        X_stft_mwf = np.ascontiguousarray(X_stft_mwf, dtype=np.complex128)
-        
-        # 4. Compute Steering Vector for the target source
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
-        )
-        
-        # 5. Execute core MWF algorithm
-        X_hat_stft, weights = online_mwf_numba(
-            X_stft_mwf, sv, alpha=self.alpha, 
-        )
-        
-        # 6. Frequency to Time domain (ISTFT)
-        _, y_time = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        return y_time, weights
-    
-class MPDR_WPE_Warmup_Processor:
-    """
-    Object-oriented wrapper for the MPDR-WPE bilinear framework.
-    Includes Diffuse Field Initialization and Exponential Forgetting Factor (Warm-up).
-    """
-    def __init__(self, L=20, Delta=4, alpha_steady=0.994, alpha_init=0.500, tau=20.0, nperseg=1024, noverlap=768, diag_load=1e-2):
-        self.L = L
-        self.Delta = Delta
-        self.alpha_steady = alpha_steady
-        self.alpha_init = alpha_init
-        self.tau = tau
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-        self.nfft = nperseg
-        self.diag_loading = diag_load
-
-    def compute_diffuse_coherence(self, freqs, mic_coords, c=343.0):
-        """
-        Computes the theoretical diffuse field coherence matrix for the given microphone geometry.
-        Formula: Gamma_ij(k) = sinc(2 * pi * f_k * d_ij / c)
-        """
-        K = len(freqs)
-        M = len(mic_coords)
-        Gamma_diffuse = np.zeros((K, M, M), dtype=np.complex128)
-        
-        for i in range(M):
-            for j in range(M):
-                if i == j:
-                    # Auto-coherence is always 1
-                    Gamma_diffuse[:, i, j] = 1.0 + 0.0j
-                else:
-                    # Calculate Euclidean distance between mic i and mic j
-                    d_ij = np.linalg.norm(mic_coords[i] - mic_coords[j])
-                    
-                    # np.sinc(x) computes sin(pi * x) / (pi * x)
-                    # We need sin(2 * pi * f * d / c) / (2 * pi * f * d / c)
-                    # Therefore, we pass x = 2 * f * d / c
-                    arg = 2.0 * freqs * d_ij / c
-                    Gamma_diffuse[:, i, j] = np.sinc(arg) + 0.0j
-                    
-        return Gamma_diffuse
-
-    def process(self, mic_signals: np.ndarray, scene_config: dict) -> np.ndarray:
-        # 1. Extract simulation context
-        fs = scene_config['fs']
-        source_pos = scene_config['source_pos'].reshape(1, 3)
-        mic_coords = scene_config['mic_coords']
-        
-        # 2. Time to Frequency domain (STFT)
-        freqs, times, X_stft = sig.stft(
-            mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        # 3. Transpose to match Numba function expectations (K, T, M)
-        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
-        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
-        
-        # 4. Compute Steering Vector for the target source
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
-        )
-        
-        # 5. Precompute Diffuse Field Coherence Matrix
-        Gamma_diffuse = self.compute_diffuse_coherence(freqs, mic_coords)
-        
-        # 6. Execute core beamforming algorithm with warm-up parameters
-        X_hat_stft, weights = MPDRxWPE_numba_warm_v1(
-            X_stft_mpdr, 
-            sv, 
-            Gamma_diffuse,
-            alpha_steady=self.alpha_steady,
-            alpha_init=self.alpha_init,
-            tau=self.tau,
-            L=self.L, 
-            Delta=self.Delta, 
-            epsilon=self.diag_loading,
-            save_weights=True
-        )
-        
-        # 7. Frequency to Time domain (ISTFT)
-        _, y_time = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        return y_time, weights
-
-class MPDR_WPE_BlockWarmup_Processor:
-    """
-    Object-oriented wrapper for the MPDR-WPE bilinear framework.
-    Implements Data-Driven Block Initialization (Warm-up).
-    """
-    def __init__(self, T_warmup=62, L=20, Delta=4, alpha=0.994, nperseg=1024, noverlap=768, diag_load=1e-2):
-        self.T_warmup = T_warmup
-        self.L = L
-        self.Delta = Delta
-        self.alpha = alpha
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-        self.nfft = nperseg
-        self.diag_loading = diag_load
-
-    def process(self, mic_signals: np.ndarray, scene_config: dict):
-        # Extract simulation context
-        fs = scene_config['fs']
-        source_pos = scene_config['source_pos'].reshape(1, 3)
-        mic_coords = scene_config['mic_coords']
-        
-        # Time to Frequency domain (STFT)
-        freqs, times, X_stft = sig.stft(
-            mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        # Transpose to match Numba function expectations (K, T, M) and force contiguous memory
-        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
-        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
-        
-        # Compute Steering Vector for the target source
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
-        )
-        
-        # Execute core beamforming algorithm with block warm-up
-        X_hat_stft, weights = MPDRxWPE_numba_block_warmup(
-            X_stft_mpdr, 
-            sv, 
-            T_warmup=self.T_warmup,
-            alpha=self.alpha,
-            L=self.L, 
-            Delta=self.Delta, 
-            epsilon=self.diag_loading,
-            save_weights=True
-        )
-        
-        # Frequency to Time domain (ISTFT)
-        _, y_time = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        return y_time, weights
-    
-class DS_Processor:
-    """
-    Standard Delay-and-Sum beamformer for baseline comparison.
-    Produces a completely static spatial filter.
-    """
-    def __init__(self, nperseg=1024, noverlap=768):
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-        self.nfft = nperseg
-
-    def process(self, mic_signals: np.ndarray, scene_config: dict) -> np.ndarray:
-        fs = scene_config['fs']
-        source_pos = scene_config['source_pos'].reshape(1, 3)
-        mic_coords = scene_config['mic_coords']
-        
-        # STFT
-        freqs, times, X_stft = sig.stft(
-            mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        X_stft_ds = np.transpose(X_stft, (1, 2, 0))
-        K, T, M = X_stft_ds.shape
-        
-        # Compute exact steering vector
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
-        )
-        
-        # Initialize output tensors
-        weights = np.zeros((K, T, M), dtype=np.complex128)
-        X_hat_stft = np.zeros((K, T), dtype=np.complex128)
-        
-        # Apply static Delay-and-Sum weights
-        for k in range(K):
-            # The static weight is simply the steering vector divided by M
-            w_ds = sv[k] / M
-            for t in range(T):
-                weights[k, t, :] = w_ds
-                # Complex conjugate dot product
-                X_hat_stft[k, t] = np.vdot(w_ds, X_stft_ds[k, t, :])
-                
-        # ISTFT
-        _, y_time = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        return y_time, weights
-
-class MPDR_WPE_BlockWarmup_Processor:
-    """
-    Object-oriented wrapper for the MPDR-WPE bilinear framework.
-    Implements Data-Driven Block Initialization (Warm-up).
-    """
-    def __init__(self, T_warmup=62, L=20, Delta=4, alpha=0.994, nperseg=1024, noverlap=768, diag_load=1e-2):
-        self.T_warmup = T_warmup
-        self.L = L
-        self.Delta = Delta
-        self.alpha = alpha
-        self.nperseg = nperseg
-        self.noverlap = noverlap
-        self.nfft = nperseg
-        self.diag_loading = diag_load
-
-    def process(self, mic_signals: np.ndarray, scene_config: dict):
-        # Extract simulation context
-        fs = scene_config['fs']
-        source_pos = scene_config['source_pos'].reshape(1, 3)
-        mic_coords = scene_config['mic_coords']
-        
-        # Time to Frequency domain (STFT)
-        freqs, times, X_stft = sig.stft(
-            mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        # Transpose to match Numba function expectations (K, T, M) and force contiguous memory
-        X_stft_mpdr = np.transpose(X_stft, (1, 2, 0))
-        X_stft_mpdr = np.ascontiguousarray(X_stft_mpdr, dtype=np.complex128)
-        
-        # Compute Steering Vector for the target source
-        sv = compute_rtf_steering_vector(
-            freqs, source_pos, mic_coords, 
-            ref_mic_idx=0, mode="near_field", squeeze=True
-        )
-        
-        # Execute core beamforming algorithm with block warm-up
-        X_hat_stft, weights = MPDRxWPE_numba_block_warmup(
-            X_stft_mpdr, 
-            sv, 
-            T_warmup=self.T_warmup,
-            alpha=self.alpha,
-            L=self.L, 
-            Delta=self.Delta, 
-            epsilon=self.diag_loading,
-            save_weights=True
-        )
-        
-        # Frequency to Time domain (ISTFT)
-        _, y_time = sig.istft(
-            X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
-        )
-        
-        return y_time, weights
     
 class MPDR_WPE_Processor:
     """
@@ -723,6 +195,12 @@ def run_benchmark_scenario(scenario_id: str,
 
     #HARDCODE
     target_anechoic =  target_early + target_late
+
+    # --- NEW: Extract VAD and inject it into the scene_config dictionary ---
+    # This allows any processor requiring VAD (like MVDR) to access it 
+    # without changing the generic .process() signature.
+    vad = scene_data.get("VAD", None)
+    scene_config['vad'] = vad
     
     # Sum all early interferences at the reference microphone (index 0)
     # to compute the true spatial SIR against the combined interference field.
@@ -945,74 +423,21 @@ if __name__ == "__main__":
             alpha=0.994, 
             nperseg=1024, 
             noverlap=768,
-            diag_load=1e-14
+            diag_load=1e-14)
+        ,
 
-        ),
-
-        "MPDR_WPE_Scaled_NR": MPDR_WPE_Scaled_NR_Processor(
-            T_init=62, 
-            L=20, 
-            Delta=4, 
-            alpha=0.994, 
-            beta=1e-2, 
-            p_min=1e-10,
+        "MVDR_Oracle_VAD": MVDR_Processor(
             nperseg=1024, 
-            noverlap=768,
-            nr_prop_decrease=0.7  # Puedes jugar con este valor
+            noverlap=768, 
+            min_loading=1e-6
         ),
+    }
         
-        "MPDR_WPE_Warmup": MPDR_WPE_Warmup_Processor(
-            L=20, 
-            Delta=4, 
-            alpha_steady=0.994, 
-            alpha_init=0.500, 
-            tau=20.0, 
-            nperseg=1024, 
-            noverlap=768,
-            diag_load=1e-2
-        ),
-        
-        "MPDR_WPE_BlockWarmup": MPDR_WPE_BlockWarmup_Processor(
-            T_warmup=62, # Approx 1 second for 16kHz, 1024 window, 256 hop
-            L=20, 
-            Delta=4, 
-            alpha=0.994, 
-            nperseg=1024, 
-            noverlap=768,
-            diag_load=1e-2
-        ),
-
-        "MPDR_WPE_Scaled": MPDR_WPE_Scaled_Processor(
-            T_init=62,       # Approx 1 second for 16kHz, 1024 window, 768 overlap
-            L=20, 
-            Delta=4, 
-            alpha=0.994, 
-            beta=1e-2,       # Ajusta este parámetro (1e-2 o 1e-3 suelen ser buenos puntos de partida)
-            p_min=1e-6,
-            nperseg=1024, 
-            noverlap=768
-        ),
 
 
         #"MWF_Test": MWF_Processor(alpha=0.95, diag_load=1e-3, nperseg=1024, noverlap=768)
-    }
     
-    processors_dict = {
-        
-        "Delay_and_Sum" : DS_Processor(nperseg=1024, noverlap=768),
-        "MPDR_WPE_Scaled_NR": MPDR_WPE_Scaled_NR_Processor(
-            T_init=62, 
-            L=20, 
-            Delta=4, 
-            alpha=0.994, 
-            beta=1e-2, 
-            p_min=1e-10,
-            nperseg=1024, 
-            noverlap=768,
-            nr_prop_decrease=0.7  # Puedes jugar con este valor
-        ),
-        
-        }
+
 
     output_directory = "tests/data/benchmark_results"
     

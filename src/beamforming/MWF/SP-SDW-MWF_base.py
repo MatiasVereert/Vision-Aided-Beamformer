@@ -9,6 +9,37 @@ from numba import njit
 from beamforming.signal_model import steering_vector, compute_rtf_steering_vector
 from scipy.spatial.distance import pdist
 
+import numpy as np
+import matplotlib.pyplot as plt
+import nara_wpe  as nwpe
+
+
+def compute_equivalent_weights(w_fixed, C_block, w_adaptive, L, frecs, fs):
+    """
+    Computes the equivalent global weights of the SP-SDW-MWF system 
+    combining the fixed branch, blocking matrix, and adaptive weights.
+    """
+    # Number of frequency bins and microphones
+    F, M = w_fixed.shape
+    delay = L // 2
+    
+    # Calculate the delay phase shift for the fixed branch
+    d_delta = np.exp(-1j * 2 * np.pi * frecs * (delay / fs))
+    
+    # Build the transformation matrix B(f) of shape (F, M, M)
+    w_fixed_expanded = w_fixed[:, :, np.newaxis]
+    B = np.concatenate((w_fixed_expanded, C_block), axis=2)
+    
+    # Multiply B(f) with w_adaptive(f) -> shape (F, M)
+    # Using einsum: 'fmn, fn -> fm'
+    adaptive_part = np.einsum('fmn,fn->fm', B, w_adaptive)
+    
+    # Calculate the equivalent global weights
+    w_eq = d_delta[:, np.newaxis] * w_fixed - adaptive_part
+    
+    return w_eq
+
+
 def get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max):
     # Calculate the physical maximum delay in seconds
     max_delay_sec = d_max / 343.0
@@ -43,6 +74,8 @@ def get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max):
     w_fixed = np.fft.rfft(w_time_padded, axis=0)
 
     return w_fixed
+
+
 import scipy.linalg
 
 def get_blocking_matrix(w_fixed_freq, L):
@@ -112,7 +145,7 @@ def regularize_covariance_matrix(Q_x):
     return Q_x_reg
 
 
-def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
+def sdw_mwf(u, vad, array_pos, source_pos, fs, constrained = True, ouput_weights = False):
     """
     Computes the fixed branch (speech reference) of the SP-SDW-MWF.
     u shape: (M, N_samples)
@@ -120,8 +153,8 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
 
     # Define constants
     Lambda = .95 # interval (0,1)
-    mu = 2 #[0, 1] provides a trade-off between noise reduction and speech distortion
-    diag_load = 1e-9
+    mu = 8 #[0, 1] provides a trade-off between noise reduction and speech distortion
+    diag_load = 1e-3
     rho = 2
     
 
@@ -149,7 +182,7 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
     post_block = np.zeros(tot_frames * L, dtype=np.float64)
 
     # This aligns the phases relative to mic 0, keeping delays strictly local
-    sv = compute_rtf_steering_vector(frecs, source_pos, target_pos, ref_mic_idx=0, mode="near_field", squeeze=True)
+    sv = compute_rtf_steering_vector(frecs, source_pos, array_pos, ref_mic_idx=0, mode="near_field", squeeze=True)
     
     # Normalize by M to prevent amplitude clipping
     w_fixed_raw= sv.conj() / M
@@ -178,6 +211,7 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
     history_buffer = np.zeros(L, dtype=np.float64)
     # We need a new buffer to hold the past valid time-domain samples of y_0 ... y_M-1
     
+    weights_rec = np.zeros( (tot_frames, F, M), dtype = np.complex128)
     
     for m in range(tot_frames):
         # --- PROCESS FRAMES ---
@@ -284,8 +318,17 @@ def sdw_mwf(u, vad, target_pos, source_pos, fs, constrained = True):
                 w_adaptive = w_adaptive_unconstrained
 
 
+            if ouput_weights:
+                weights_rec[m,:,:] = compute_equivalent_weights(w_fixed, C_block, w_adaptive, L, frecs, fs)           
+                
 
-    return z_fixed_branch, post_block, z_noise, z 
+    if ouput_weights:
+        return z_fixed_branch, post_block, z_noise, z , weights_rec
+    else:
+        return z_fixed_branch, post_block, z_noise, z 
+    
+
+
 
 # Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
 def normalize_signal(sig):
@@ -360,16 +403,16 @@ if __name__ == "__main__":
     
     # Execute the delay-and-sum fixed branch in frequency domain
     # Mapping: u = room_input_ideal, target_pos = mic_coords, source_pos = source_pos_2d
-    z_fixed, post_block , z_noise, output = sdw_mwf(room_input_ideal,
+    z_fixed, post_block , z_noise, output, weights = sdw_mwf(room_input_ideal,
                                vad_oracle, 
                                mic_coords, 
                                source_pos_2d, 
-                               FS)
+                               FS,
+                               ouput_weights=True)
     
     print(" -> Normalizing and saving reconstructed time-domain signals...")
 
     print(z_noise)
-    
 
 
     z_fixed_norm = normalize_signal(z_fixed)
@@ -408,7 +451,6 @@ if __name__ == "__main__":
     print(" -> Normalizing and saving reconstructed time-domain signals...")
 
     print(z_noise)
-    
 
 
     z_fixed_norm = normalize_signal(z_fixed)
@@ -422,7 +464,4 @@ if __name__ == "__main__":
     save_wav("2_ROOM_output_SDW_MWF_noise.wav", FS, z_noise_norm, output_folder)
     save_wav("2_ROOM_output_SDW_MWF_output.wav", FS, output_norm, output_folder)
 
-
-
-    
     print(" -> Pipeline completed.")

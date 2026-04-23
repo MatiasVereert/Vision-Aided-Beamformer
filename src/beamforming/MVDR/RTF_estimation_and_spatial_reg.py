@@ -1,6 +1,7 @@
 import numpy as np 
 import scipy.signal as signal
 import matplotlib.pyplot as plt
+from utils.audio import  normalize_signal
 
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
@@ -9,10 +10,12 @@ import numpy as np
 import scipy.linalg as la
 
 
+from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
+
 import numpy as np
 import scipy.linalg as la
 
-def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.85):
+def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.85, save_weights=False):
     lamda = 0.99
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
@@ -30,6 +33,10 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
     
     # Pre-create diagonal loading matrix to be used inside the loop
     diag_load = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+
+    # weights rec
+    weights_rec = np.zeros((K, M,), dtype=np.complex128)
+
 
     for m in range(T):
         # Extract the current frame across all frequencies, shape (K, M)
@@ -88,14 +95,12 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
         # Output is shape (K,) for the current frame
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
-    return Y_stft
+        weights_rec[:,m] = weights
 
-# Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
-def normalize_signal(sig):
-    max_abs = np.max(np.abs(sig))
-    if max_abs > 0:
-        return sig * (0.99 / max_abs)
-    return sig
+    if save_weights:
+        return Y_stft, weights_rec
+    else:
+        return Y_stft
 
 import numpy as np
 import scipy.signal as signal
@@ -157,10 +162,6 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     # Truncate to original length
     original_length = time_domain_input.shape[1]
     return y_time[:original_length]
-
-
-
-from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
 
 
 
