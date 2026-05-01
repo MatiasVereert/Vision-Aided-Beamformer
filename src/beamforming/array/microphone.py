@@ -35,19 +35,26 @@ class Microphone():
         self.fixed_phase_mismatch = None
         self.last_M = 0
 
-        # --- FIR FILTER DESIGN (Bandpass 100Hz - 8kHz) ---
-        f_min, f_max = 100, 8000
+        # --- FIR FILTER DESIGN (Bandpass) ---
+        f_min = 100
         attenuation = 50 # dB
         gap = 50 # Hz (Transition width)
+        
+        # Dynamically calculate f_max to ensure the transition band 
+        # strictly fits below the Nyquist limit for any given sample rate.
+        nyquist = 0.5 * self.fs
+        
+        # We target 8kHz, but if Nyquist is too low, we adapt f_max.
+        # We subtract 'gap' and a small safety margin (10 Hz) from Nyquist.
+        f_max = min(8000.0, nyquist - gap - 10.0)
 
         n_taps = int(attenuation * self.fs / (22 * gap))
         if n_taps % 2 == 0: n_taps += 1 
 
-        edges = [0, f_min - gap, f_min, f_max, f_max + gap, 0.5 * self.fs]
+        edges = [0, f_min - gap, f_min, f_max, f_max + gap, nyquist]
         
         self.taps = signal.remez(n_taps, edges, [0, 1, 0], fs=self.fs)
         self.a = 1.0
-
 
     def set_custom_errors(self, std_gain_dB=0.0, std_phase_deg=0.0, snr_dB=60.0):
         """
@@ -254,4 +261,4 @@ if __name__ == "__main__":
              data=signals[0,:],
              folder="src/beamforming/array"
              )
-    print("[Done] Process finished successfully.")
+    print("[Done] Process finished successfully.")  

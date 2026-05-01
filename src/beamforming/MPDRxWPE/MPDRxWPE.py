@@ -108,8 +108,6 @@ def MPDRxWPE_numba(y_stft, sv, alpha=0.994, L=20, Delta=6, epsilon=1e-3, save_we
 
 
 
-
-
 @njit(parallel=True, fastmath=True)
 def MPDRxWPE_numba_scaled(y_stft, sv, T_init, alpha_steady=0.994, alpha_init=0.90, tau=20.0, L=20, Delta=6, beta=1e-3, min_loading=1e-10, save_weights=False):
     # Optimized MPDR-WPE bilinear framework using Numba.
@@ -250,7 +248,7 @@ import os
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav
 from beamforming.signal_model import compute_rtf_steering_vector
-from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
+from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
 
 # Paste your MPDRxWPE_numba_scaled function here 
 # (assuming it is imported or defined above this block in your real script)

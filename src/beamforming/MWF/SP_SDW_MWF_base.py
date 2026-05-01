@@ -9,9 +9,103 @@ from numba import njit
 from beamforming.signal_model import steering_vector, compute_rtf_steering_vector
 from scipy.spatial.distance import pdist
 
+from nara_wpe.wpe import OnlineWPE
+from nara_wpe.utils import stft, istft
+from nara_wpe.wpe import online_wpe_step, get_power_online, OnlineWPE
+
+from nara_wpe.wpe import wpe # Importamos la versión Batch/Offline
+from nara_wpe.utils import stft, istft
+
+def process_wpe_offline(u, taps=10, delay=2, iterations=3, stft_size=256, stft_shift=64):
+    """
+    Offline (Batch) WPE wrapper.
+    Processes the entire signal at once to compute a fixed optimal dereverberation filter.
+    This guarantees a stationary output, avoiding conflicts with downstream adaptive filters.
+    """
+    # 1. Transform to STFT domain
+    # nara_wpe stft returns (channels, frames, frequency_bins)
+    Y = stft(u, size=stft_size, shift=stft_shift)
+    
+    # nara_wpe offline expects input shape: (frequency_bins, channels, frames)
+    Y_wpe = Y.transpose(2, 0, 1)
+    
+    # 2. Apply Batch WPE (typically 3 to 5 iterations is enough)
+    Z_wpe = wpe(Y_wpe, taps=taps, delay=delay, iterations=iterations)
+    
+    # 3. Reconstruct the time-domain signal
+    # Transpose back to (channels, frames, frequency_bins)
+    Z_out = Z_wpe.transpose(1, 2, 0)
+    
+    z_time = istft(Z_out, size=stft_size, shift=stft_shift)
+    
+    # Ensure output length matches input
+    z_time = z_time[:, :u.shape[1]]
+    
+    return z_time
 import numpy as np
-import matplotlib.pyplot as plt
-import nara_wpe  as nwpe
+# Import your nara_wpe functions here
+
+def process_wpe_online(u, taps=5, delay=2, alpha=0.9999, stft_size=256, stft_shift=64):
+    """
+    Online WPE wrapper (Functional Approach).
+    Processes a multichannel time-domain signal frame by frame to simulate 
+    online dereverberation. Bypasses the buggy OnlineWPE class state management 
+    by handling the Q and G matrices directly.
+    """
+    # 1. Transform to STFT domain
+    Y = stft(u, size=stft_size, shift=stft_shift)
+    Y = Y.transpose(1, 2, 0)  # Shape: (frames, bins, channels)
+    T, F, M = Y.shape
+    
+    buffer_target_size = taps + delay + 1
+    if T < buffer_target_size:
+        print("Warning: Signal is too short for WPE with given taps and delay.")
+        return u
+        
+    # 2. Initialize Q (Inverse Correlation) and G (Filter) matrices manually
+    Q = np.stack([np.identity(M * taps) for _ in range(F)])
+    G = np.zeros((F, M * taps, M))
+    
+    # Pre-allocate output array Z to avoid list appends and stacking overhead
+    Z = np.zeros_like(Y)
+    
+    # 3. Bypass the first unprocessed frames to maintain strict temporal alignment
+    Z[:taps + delay, :, :] = Y[:taps + delay, :, :]
+    
+    # 4. Process frame by frame using array slicing instead of list buffers
+    for t in range(taps + delay, T):
+        # Extract sliding window directly from Y. 
+        # This returns a view, avoiding memory reallocation overhead.
+        Y_step = Y[t - (taps + delay): t + 1, :, :]
+        
+        # Compute power. get_power_online expects (bins, channels, frames)
+        power = get_power_online(Y_step.transpose(1, 2, 0))
+        
+        # Perform functional online dereverberation step
+        Z_frame, Q, G = online_wpe_step(
+            Y_step,
+            power,
+            Q,
+            G,
+            alpha=alpha,
+            taps=taps,
+            delay=delay
+        )
+        
+        # Store the processed frame directly in the pre-allocated array
+        Z[t, :, :] = Z_frame
+            
+    # 5. Reconstruct the time-domain signal
+    # Transpose back to (channels, frames, frequency_bins) for istft
+    Z_out = Z.transpose(2, 0, 1)
+    
+    # Inverse STFT to get the time-domain audio
+    z_time = istft(Z_out, size=stft_size, shift=stft_shift)
+    
+    # Ensure the output length exactly matches the original input length 
+    z_time = z_time[:, :u.shape[1]]
+    
+    return z_time
 
 
 def compute_equivalent_weights(w_fixed, C_block, w_adaptive, L, frecs, fs):
@@ -74,8 +168,6 @@ def get_fixed_weights(w_fixed_raw, L, frecs, fs, d_max):
     w_fixed = np.fft.rfft(w_time_padded, axis=0)
 
     return w_fixed
-
-
 import scipy.linalg
 
 def get_blocking_matrix(w_fixed_freq, L):
@@ -145,7 +237,7 @@ def regularize_covariance_matrix(Q_x):
     return Q_x_reg
 
 
-def sdw_mwf(u, vad, array_pos, source_pos, fs, constrained = True, ouput_weights = False):
+def sdw_mwf(u, vad, mic_coords, source_pos, fs, constrained = True, ouput_weights = False):
     """
     Computes the fixed branch (speech reference) of the SP-SDW-MWF.
     u shape: (M, N_samples)
@@ -182,7 +274,7 @@ def sdw_mwf(u, vad, array_pos, source_pos, fs, constrained = True, ouput_weights
     post_block = np.zeros(tot_frames * L, dtype=np.float64)
 
     # This aligns the phases relative to mic 0, keeping delays strictly local
-    sv = compute_rtf_steering_vector(frecs, source_pos, array_pos, ref_mic_idx=0, mode="near_field", squeeze=True)
+    sv = compute_rtf_steering_vector(frecs, source_pos, mic_coords, ref_mic_idx=0, mode="near_field", squeeze=True)
     
     # Normalize by M to prevent amplitude clipping
     w_fixed_raw= sv.conj() / M
@@ -326,7 +418,6 @@ def sdw_mwf(u, vad, array_pos, source_pos, fs, constrained = True, ouput_weights
         return z_fixed_branch, post_block, z_noise, z , weights_rec
     else:
         return z_fixed_branch, post_block, z_noise, z 
-    
 
 
 
@@ -343,38 +434,32 @@ from utils.audio import save_wav
 # Import the fixed branch function we built
 
 if __name__ == "__main__":
+    # Basic simulation parameters
     FS = 16000
     M1, M2 = 12, 1          
     M = M1 * M2
     speed_of_sound = 343.0 
+
+    iSIR_dB = 0
     
-    print("=== INTEGRATION TEST: FIXED BRANCH (SDW-MWF) ===")
+    print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
     output_folder = "tests/data/sdw_mwf_output"
     os.makedirs(output_folder, exist_ok=True)
     
-    # === REPLACEMENT: Non-Uniform Linear Array (Logarithmic Spacing) ===
-    max_length = 0.30  # Maximum array length of 30 cm
-
-    # Create logarithmic spacing to cluster microphones for high frequencies
-    # while spreading them out for low frequencies. Ideal for broadband speech.
+    # Create logarithmic spacing for the microphone array
+    max_length = 0.30
     if M > 1:
-        base = 2.0  # Dispersion factor (can be tuned between 1.5 and 3.0)
+        base = 2.0
         indices = np.arange(M)
-        
-        # Normalize from 0 to 1 and scale to maximum length
         x_norm = (base**indices - 1) / (base**(M - 1) - 1)
         x = x_norm * max_length
     else:
         x = np.array([0.0])
 
-    # Assemble 3D coordinate matrix (assuming array is along the X-axis)
     mic_coords = np.column_stack([x, np.zeros(M), np.zeros(M)])
-
-    # Translate the array to the desired center position
     array_center = np.array([1.25, 2.0, 1.25])
     mic_coords = mic_coords - np.mean(mic_coords, axis=0) + array_center
-    # ===================================================================
     
     r = 1.0 
     ang_target = np.deg2rad(130)
@@ -382,86 +467,89 @@ if __name__ == "__main__":
     
     source_pos = array_center + np.array([r * np.cos(ang_target), r * np.sin(ang_target), 0.0])
     interf_pos1 = array_center + np.array([r * np.cos(ang_interf), r * np.sin(ang_interf), 0.0])
+    source_pos_2d = source_pos.reshape(1, 3)
 
     print(" -> Initializing acoustic scene...")
     acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=40, fs=FS)
+    acoustic_scene.set_source("tools/data/signals/FA01_09.wav", gain=1, position=source_pos_2d)
+    acoustic_scene.set_interference("tools/data/signals/MC15_03.wav", gain=1, position=interf_pos1.reshape(1,3))
 
-    source_path = "tools/data/signals/FA01_09.wav"
-    int_path1 = "tools/data/signals/MC15_03.wav"
-
-    acoustic_scene.set_source(source_path, gain=1, position=source_pos.reshape(1,3))
-    acoustic_scene.set_interference(int_path1, gain=1, position=interf_pos1.reshape(1,3))
-
-    print(" -> Computing free field simulation...")
-    # room_input_ideal shape is expected to be (M, N_samples)
-    room_input_ideal, vad_oracle = acoustic_scene.free_field(iSIR_dB=0, normalize=True, mode="ideal", VAD = True)
-    save_wav("1_input_mix_mic0.wav", FS, room_input_ideal[0], output_folder)
+    # -------------------------------------------------------------------
+    # PHASE 1: FREE FIELD SIMULATION (Anechoic)
+    # -------------------------------------------------------------------
+    cache_ff_path = os.path.join(output_folder, "cache_free_field.npz")
     
-    print(" -> Applying Fixed Branch (SDW-MWF Delay-and-Sum)...")
-    # Ensure source_pos is shape (1, 3) for the steering vector broadcasting
-    source_pos_2d = source_pos.reshape(1, 3)
+    if os.path.exists(cache_ff_path):
+        print("\n--- PHASE 1: LOADING FREE FIELD SIMULATION FROM CACHE ---")
+        cache_data = np.load(cache_ff_path)
+        free_field_input = cache_data['input']
+        vad_oracle_ff = cache_data['vad']
+    else:
+        print("\n--- PHASE 1: COMPUTING FREE FIELD SIMULATION ---")
+        free_field_input, vad_oracle_ff = acoustic_scene.free_field(iSIR_dB=iSIR_dB, normalize=True, mode="ideal", VAD=True)
+        # Save to cache
+        np.savez(cache_ff_path, input=free_field_input, vad=vad_oracle_ff)
+        
+    save_wav("1_FF_input_mix_mic0.wav", FS, free_field_input[0], output_folder)
     
-    # Execute the delay-and-sum fixed branch in frequency domain
-    # Mapping: u = room_input_ideal, target_pos = mic_coords, source_pos = source_pos_2d
-    z_fixed, post_block , z_noise, output, weights = sdw_mwf(room_input_ideal,
-                               vad_oracle, 
-                               mic_coords, 
-                               source_pos_2d, 
-                               FS,
-                               ouput_weights=True)
+    print(" -> Applying SDW-MWF...")
+    z_fixed_ff, post_block_ff, z_noise_ff, output_ff, _ = sdw_mwf(
+        free_field_input, vad_oracle_ff, mic_coords, source_pos_2d, FS, ouput_weights=True
+    )
     
-    print(" -> Normalizing and saving reconstructed time-domain signals...")
+    save_wav("2_FF_output_fixed.wav", FS, normalize_signal(z_fixed_ff), output_folder)
+    save_wav("2_FF_output_noise.wav", FS, normalize_signal(z_noise_ff), output_folder)
+    save_wav("2_FF_output_final.wav", FS, normalize_signal(output_ff), output_folder)
 
-    print(z_noise)
-
-
-    z_fixed_norm = normalize_signal(z_fixed)
-    post_block_norm = normalize_signal(post_block)
-    z_noise_norm = normalize_signal(z_noise)
-    output_norm = normalize_signal(output)
+    # -------------------------------------------------------------------
+    # PHASE 2: ROOM SIMULATION (Reverberant)
+    # -------------------------------------------------------------------
+    cache_room_path = os.path.join(output_folder, "cache_room.npz")
     
-
-    save_wav("2_output_SDW_MWF_fixed.wav", FS, z_fixed_norm, output_folder)
-    save_wav("2_output_SDW_MWF_post_block.wav", FS, post_block_norm, output_folder)
-    save_wav("2_output_SDW_MWF_noise.wav", FS, z_noise_norm, output_folder)
-    save_wav("2_output_SDW_MWF_output.wav", FS, output_norm, output_folder)
-
-
-    print(" -> Computing Room Impulse Responses (ISB)...")
-    room_dimensions = np.array([4.0, 5.0, 2.5])
+    if os.path.exists(cache_room_path):
+        print("\n--- PHASE 2: LOADING ROOM SIMULATION FROM CACHE ---")
+        cache_data = np.load(cache_room_path)
+        room_input = cache_data['input']
+        vad_oracle_room = cache_data['vad']
+    else:
+        print("\n--- PHASE 2: COMPUTING ROOM SIMULATION ---")
+        room_dimensions = np.array([4.0, 5.0, 2.5])
+        room_sim_dic = acoustic_scene.get_eval_scene(
+            room_dimensions=room_dimensions, desire_RT=0.5, iSIR_dB=iSIR_dB, mode="ideal"
+        )
+        room_input = room_sim_dic["mic_signals"]
+        vad_oracle_room = room_sim_dic["VAD"]
+        # Save to cache
+        np.savez(cache_room_path, input=room_input, vad=vad_oracle_room)
     
-    # T60 = 0.2s for a moderate room reverberation
-    room_sim_dic = acoustic_scene.get_eval_scene( room_dimensions= room_dimensions,
-                                                     desire_RT = .5,
-                                                     iSIR_dB=0,
-                                                     mode = "ideal")
+    save_wav("3_ROOM_input_mix_mic0.wav", FS, room_input[0], output_folder)
+
+    print(" -> Applying SDW-MWF (Without WPE)...")
+    z_fixed_rm, post_block_rm, z_noise_rm, output_rm = sdw_mwf(
+        room_input, vad_oracle_room, mic_coords, source_pos_2d, FS
+    )
     
-    room_input_ideal = room_sim_dic["mic_signals"]
-    vad_oracle_room = room_sim_dic["VAD"]
+    save_wav("4_ROOM_output_fixed.wav", FS, normalize_signal(z_fixed_rm), output_folder)
+    save_wav("4_ROOM_output_noise.wav", FS, normalize_signal(z_noise_rm), output_folder)
+    save_wav("4_ROOM_output_final.wav", FS, normalize_signal(output_rm), output_folder)
 
+    # -------------------------------------------------------------------
+    # PHASE 3: WPE DEREVERBERATION + SDW-MWF
+    # -------------------------------------------------------------------
+    print("\n--- PHASE 3: WPE + SDW-MWF PIPELINE ---")
+    print(" -> Applying Online WPE Dereverberation on Room Simulation...")
     
-    # Execute the delay-and-sum fixed branch in frequency domain
-    # Mapping: u = room_input_ideal, target_pos = mic_coords, source_pos = source_pos_2d
-    z_fixed, post_block , z_noise, output = sdw_mwf(room_input_ideal,
-                               vad_oracle_room, 
-                               mic_coords, 
-                               source_pos_2d, 
-                               FS)
+    wpe_output = process_wpe_online(room_input)
     
-    print(" -> Normalizing and saving reconstructed time-domain signals...")
+    save_wav("5_WPE_input_mix_mic0.wav", FS, wpe_output[0], output_folder)
 
-    print(z_noise)
-
-
-    z_fixed_norm = normalize_signal(z_fixed)
-    post_block_norm = normalize_signal(post_block)
-    z_noise_norm = normalize_signal(z_noise)
-    output_norm = normalize_signal(output)
+    print(" -> Applying SDW-MWF on Dereverberated Signals...")
+    z_fixed_wpe, post_block_wpe, z_noise_wpe, output_wpe = sdw_mwf(
+        wpe_output, vad_oracle_room, mic_coords, source_pos_2d, FS
+    )
     
+    save_wav("6_WPE_ROOM_output_fixed.wav", FS, normalize_signal(z_fixed_wpe), output_folder)
+    save_wav("6_WPE_ROOM_output_noise.wav", FS, normalize_signal(z_noise_wpe), output_folder)
+    save_wav("6_WPE_ROOM_output_final.wav", FS, normalize_signal(output_wpe), output_folder)
 
-    save_wav("2_ROOM_output_SDW_MWF_fixed.wav", FS, z_fixed_norm, output_folder)
-    save_wav("2_ROOM_output_SDW_MWF_post_block.wav", FS, post_block_norm, output_folder)
-    save_wav("2_ROOM_output_SDW_MWF_noise.wav", FS, z_noise_norm, output_folder)
-    save_wav("2_ROOM_output_SDW_MWF_output.wav", FS, output_norm, output_folder)
-
-    print(" -> Pipeline completed.")
+    print("\n -> Pipeline completed successfully.")

@@ -7,13 +7,17 @@ from beamforming.signal_model import compute_rtf_steering_vector
 import numpy as np 
 import scipy.signal as signal
 import matplotlib.pyplot as plt
+from utils.audio import  normalize_signal
+
 
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 
-def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft):
-    # Note: 'vad' argument is kept for compatibility with the bridge function, 
-    # but it is completely ignored in favor of the Spatial SPP.
+import numpy as np
+from beamforming.signal_model import compute_rtf_steering_vector
+
+def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
+    # Forgetting factor for covariance matrix smoothing
     lamda = 0.99
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
@@ -24,9 +28,6 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
     # Initialize output complex STFT matrix
     Y_stft = np.zeros((K, T), dtype=np.complex128)
     
-    # Pre-create diagonal loading matrix to be used inside the loop
-    diag_load = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
-
     # Initialize noise covariance matrix R_nn
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
     
@@ -37,12 +38,21 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
     R_xx = R_ss_init + R_nn
 
     # Initialize the inverse of R_nn for the first frame's SPP calculation
-    R_nn_inv = np.linalg.inv(R_nn + diag_load)
+    # We use min_loading here to prevent singularities at t=0
+    initial_diag_load = np.tile(np.eye(M, dtype=np.complex128) * min_loading, (K, 1, 1))
+    R_nn_inv = np.linalg.inv(R_nn + initial_diag_load)
 
     # SPP Hyperparameters
     # Threshold for spatial SNR (gamma). 3.0 linear is approx 4.7 dB
     gamma_th = 3.0 
     spp_slope = 2.0 
+    
+    # RTF Estimation Hyperparameters
+    alpha_rtf = 0.98         # Smoothing factor for RTF update
+    spp_threshold_rtf = 0.8  # Minimum SPP required to update the RTF
+
+    # Weights recording initialization
+    weights_rec = np.zeros((K, T, M), dtype=np.complex128)
 
     for m in range(T):
         # Extract the current frame across all frequencies, shape (K, M)
@@ -64,9 +74,51 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
         # Calculate gamma for all frequencies
         gamma = num / (den + 1e-10)
 
-        # --- 2. Map Gamma to Spatial Presence Probability (SPP) ---
-        # Using a sigmoid function to map SNR to a probability [0, 1]
-        P = 1.0 / (1.0 + np.exp(-spp_slope * (gamma - gamma_th)))
+        # --- 1. Probabilistic Spatial Presence Probability (SPP) ---
+        # Evaluate the complex Gaussian likelihood of the observation
+        
+        # Target spatial covariance matrix derived from the steering vector
+        R_target_dir = np.einsum("fm,fn->fmn", sv, sv.conj())
+        
+        # Hypothesis 1: Target + Background Noise
+        R_h1 = R_target_dir + R_nn
+        
+        # Hypothesis 0: Background Noise Only
+        R_h0 = R_nn
+        
+        # Add diagonal loading for numerical stability during matrix inversion
+        diag_load_matrix = np.eye(M)[None, :, :] * 1e-6
+        R_h1_stable = R_h1 + diag_load_matrix
+        R_h0_stable = R_h0 + diag_load_matrix
+        
+        # Calculate determinants and inverses
+        det_h1 = np.abs(np.linalg.det(R_h1_stable))
+        det_h0 = np.abs(np.linalg.det(R_h0_stable))
+        
+        inv_h1 = np.linalg.inv(R_h1_stable)
+        inv_h0 = np.linalg.inv(R_h0_stable)
+        
+        # Mahalanobis distances: d = x^H * R^-1 * x
+        d1 = np.real(np.einsum("fm,fmn,fn->f", X_frame.conj(), inv_h1, X_frame))
+        d0 = np.real(np.einsum("fm,fmn,fn->f", X_frame.conj(), inv_h0, X_frame))
+        
+        # --- 2. Calculate SPP in the Log-Domain to prevent overflow ---
+        # Log-likelihoods: L = -d - log(det(R))
+        # We want P = 1 / (1 + exp(L0 - L1))
+        # delta_L = L0 - L1 = (d1 - d0) + log(det(R_h1)) - log(det(R_h0))
+        
+        # Add small epsilon to determinants to avoid log(0)
+        log_det_h1 = np.log(det_h1 + 1e-15)
+        log_det_h0 = np.log(det_h0 + 1e-15)
+        
+        delta_L = (d1 - d0) + log_det_h1 - log_det_h0
+        
+        # Clip delta_L to strictly bound the math and prevent overflow in np.exp()
+        # np.exp(50) is safe, preventing inf. np.exp(-50) prevents exactly 0.
+        delta_L_clipped = np.clip(delta_L, -50.0, 50.0)
+        
+        # Final probability calculation using stable logistic formulation
+        P = 1.0 / (1.0 + np.exp(delta_L_clipped))
         
         # Clip probabilities to prevent matrices from completely freezing
         P = np.clip(P, 0.05, 0.95)
@@ -82,9 +134,43 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
         # Update R_nn weighted by the probability of target speech absence
         R_nn = lamda * R_nn + (1 - lamda) * (1 - P_expand) * R_instant
 
-        # --- 4. Compute MVDR Weights ---
-        # Prepare stable R_nn and invert it for the current frame
-        R_nn_stable = R_nn + diag_load
+        # --- 3.5. Estimate and Update RTF Dynamically ---
+        # Calculate the speech spatial covariance matrix
+        R_ss = R_xx - R_nn
+        
+        # Select reference microphone
+        ref_mic = 0
+        
+        # Extract the reference column and diagonal for RTF calculation
+        R_ss_ref_col = R_ss[:, :, ref_mic]
+        
+        # Ensure the denominator is strictly positive to avoid instabilities
+        R_ss_ref_diag = np.maximum(np.real(R_ss[:, ref_mic, ref_mic]), 1e-12)
+        
+        # Calculate the instantaneous RTF estimate
+        rtf_inst = R_ss_ref_col / R_ss_ref_diag[:, np.newaxis]
+        
+        # Update the steering vector ONLY when we have high confidence of speech presence
+        for f in range(K):
+            if P[f] > spp_threshold_rtf:
+                # Recursively smooth the RTF to maintain stability
+                sv[f, :] = alpha_rtf * sv[f, :] + (1 - alpha_rtf) * rtf_inst[f, :]
+                
+        # Normalize the updated SV to prevent magnitude drift over time
+        sv = sv / (np.linalg.norm(sv, axis=1, keepdims=True) + 1e-10)
+
+        # --- 4. Compute MVDR Weights with Dynamic Diagonal Loading ---
+        # Calculate dynamic loading based on the noise covariance trace
+        tr_R = np.real(np.trace(R_nn, axis1=1, axis2=2))
+        adaptive_load = beta * (tr_R[:, None, None] / M)
+        
+        # Apply the minimum loading threshold
+        loading = np.maximum(adaptive_load, min_loading)
+        
+        # Apply stabilization
+        R_nn_stable = R_nn + np.eye(M)[None, :, :] * loading
+
+        # Invert the stable covariance matrix safely
         R_nn_inv = np.linalg.inv(R_nn_stable)
 
         # Numerator: R_nn_inv * v
@@ -95,19 +181,15 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
         
         # Final weights calculation
         weights = weights_nom / (weights_den[:, np.newaxis] + 1e-10)
-
+        weights_rec[:, m, :] = weights
+        
         # --- 5. Apply Filter ---
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
-    return Y_stft
-
-
-# Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
-def normalize_signal(sig):
-    max_abs = np.max(np.abs(sig))
-    if max_abs > 0:
-        return sig * (0.99 / max_abs)
-    return sig
+    if save_weights:
+        return Y_stft, weights_rec
+    else:
+        return Y_stft
 
 import numpy as np
 import scipy.signal as signal
@@ -126,7 +208,7 @@ import scipy.signal as signal
 from beamforming.signal_model import compute_rtf_steering_vector
 # from simulation_module import SimAcoustic 
 # from utils import save_wav, normalize_signal 
-# from your_mvdr_module import MVDR_recursive 
+# from your_mvdr_module import SPP_SPP_MVDR_recursive 
 # from your_wpe_module import process_wpe_online
 
 def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256):
@@ -148,14 +230,12 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     vad_padded = np.pad(vad_oracle, (0, length_fft + hop_length_fft), mode='constant')
 
     # Execute the Recursive MVDR
-    Y_stft = MVDR_recursive(
+    Y_stft = SPP_MVDR_recursive(
         X_stft=X_stft, 
-        vad=vad_padded, 
         fs=fs, 
         array_geometry=mic_coords, 
         source_pos=source_pos_2d, 
-        length_fft=length_fft, 
-        hop_length_fft=hop_length_fft
+
     )
     
     # Compute Inverse STFT
@@ -172,7 +252,7 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
 
 
 
-from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
+from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
 
 
 
@@ -188,7 +268,7 @@ if __name__ == "__main__":
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/mvdr_output"
+    output_folder = "tests/data/SPP_RFT_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
@@ -275,7 +355,7 @@ if __name__ == "__main__":
     print("\n--- PHASE 3: WPE + MVDR PIPELINE ---")
     print(" -> Applying Online WPE Dereverberation on Room Simulation...")
     
-    wpe_output = process_wpe_online(room_input)
+    wpe_output = process_wpe_online(room_input, delay = 1)
     
     save_wav("5_WPE_input_mix_mic0.wav", FS, wpe_output[0], output_folder)
 

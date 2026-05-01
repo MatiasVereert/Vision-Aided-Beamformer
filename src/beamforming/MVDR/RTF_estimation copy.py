@@ -7,6 +7,7 @@ from utils.audio import  normalize_signal
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 import numpy as np
+
 def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.85, save_weights=False, min_loading = 1e-6):
     lamda = 0.99
     K, T, M = X_stft.shape  
@@ -72,7 +73,7 @@ def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, 
 
         # --- Calculate MVDR Weights using the MIXED RTF ---
         # Numerator: R_nn_inv * rtf_mixed -> (K, M, M) * (K, M) -> (K, M)
-        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, rtf_empirical)
+        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, rtf_mixed)
         
         # Denominator: rtf_mixed^H * numerator -> (K, M) * (K, M) -> (K,)
         weights_den = np.einsum("fm,fm->f", rtf_mixed.conj(), weights_nom)
@@ -178,7 +179,7 @@ if __name__ == "__main__":
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/rtf_mvdr_output"
+    output_folder = "tests/data/rtf_load_mvdr_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
@@ -204,7 +205,7 @@ if __name__ == "__main__":
     source_pos_2d = source_pos.reshape(1, 3)
 
     print(" -> Initializing acoustic scene...")
-    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=40, fs=FS)
+    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=20, fs=FS)
     acoustic_scene.set_source("tools/data/signals/FA01_09.wav", gain=1, position=source_pos_2d)
     acoustic_scene.set_interference("tools/data/signals/MC15_03.wav", gain=1, position=interf_pos1.reshape(1,3))
 

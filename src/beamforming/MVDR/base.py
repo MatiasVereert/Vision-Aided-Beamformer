@@ -23,8 +23,6 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
     # We use a small diagonal loading to prevent singularities from the start
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
     
-    # Pre-create diagonal loading matrix to be used inside the loop
-    diag_load = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
 
     #save weights
     weights_rec = np.zeros((K,T,M), dtype=np.complex128)
@@ -139,12 +137,13 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
 
 
 
-from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
 
 
 
 
 if __name__ == "__main__":
+    from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
+
     # Basic simulation parameters
     FS = 16000
     M1, M2 = 12, 1          
@@ -181,7 +180,7 @@ if __name__ == "__main__":
     source_pos_2d = source_pos.reshape(1, 3)
 
     print(" -> Initializing acoustic scene...")
-    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=40, fs=FS)
+    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=20, fs=FS)
     acoustic_scene.set_source("tools/data/signals/FA01_09.wav", gain=1, position=source_pos_2d)
     acoustic_scene.set_interference("tools/data/signals/MC15_03.wav", gain=1, position=interf_pos1.reshape(1,3))
 

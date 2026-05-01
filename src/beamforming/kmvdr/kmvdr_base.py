@@ -10,14 +10,12 @@ import numpy as np
 import scipy.signal as signal
 
 
-import numpy as np
-
 # Note: Assuming this import is available in your environment just like in base.py
 from beamforming.signal_model import compute_rtf_steering_vector
 
 def KMVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, M1, M2, P=2, 
                     alpha=0.95, ALS_iterations=2, beta=1e-3, min_loading=1e-6, 
-                    length_fft=512, hop_length_fft=256):
+                    length_fft=512, hop_length_fft=256, save_weights=False):
     """
     Functional implementation of the Kronecker MVDR beamformer.
     It expects X_stft in the shape (Frequency_bins, Time_frames, Mics).
@@ -33,8 +31,9 @@ def KMVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, M1, M2, P=2,
                                      ref_mic_idx=0, mode="near_field", squeeze=True)
     sv = np.nan_to_num(sv)
 
-    # Initialize output complex STFT matrix
+    # Initialize output complex STFT matrix and weights storage
     Y_stft = np.zeros((K, T), dtype=np.complex128)
+    weights_rec = np.zeros((K, T, M), dtype=np.complex128)
 
     # Initialize state variables
     R_cov = np.tile(np.eye(M, dtype=np.complex128) * 1e-5, (K, 1, 1))
@@ -59,7 +58,7 @@ def KMVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, M1, M2, P=2,
         vad_frame = vad[m * hop_length_fft : length_fft + m * hop_length_fft]
         vad_status = np.mean(vad_frame) > 0.1
 
-        # 1. Update covariance matrix R ONLY when target speech is absent (noise only)
+        # 1. Update covariance matrix R ONLY when target speech is absent
         if not vad_status:
             update_term = np.matmul(x_t, x_t.conj().transpose(0, 2, 1))
             R_cov = alpha * R_cov + (1 - alpha) * update_term
@@ -101,6 +100,10 @@ def KMVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, M1, M2, P=2,
         # Calculate final combined filter
         h_total = np.einsum('fap, fbp -> fab', h1, h2).reshape(K, M)
 
+        # Save weights if requested
+        if save_weights:
+            weights_rec[:, m, :] = h_total
+
         # 4. Feedback Loop for robustness (WNG)
         w_norm2 = np.sum(np.abs(h_total)**2, axis=1)[:, None, None]
         current_wng = 1.0 / (w_norm2 + 1e-12)
@@ -112,7 +115,10 @@ def KMVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, M1, M2, P=2,
         # 5. Apply weights to the current observation
         Y_stft[:, m] = (h_total.conj()[:, None, :] @ x_t)[:, 0, 0]
 
-    return Y_stft
+    if save_weights:
+        return Y_stft, weights_rec
+    else:
+        return Y_stft
 
 def apply_kmvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, 
                             M1, M2, P=2, length_fft=512, hop_length_fft=256):
@@ -162,16 +168,16 @@ def apply_kmvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_po
 
 
 
-from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav, normalize_signal
 
 if __name__ == "__main__":
+    
     import os
     import numpy as np
     from propagation.simulate_acoustics import SimAcoustic
     from utils.audio import save_wav
-    from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
+    from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
 
     # Basic simulation parameters identical to base.py
     FS = 16000

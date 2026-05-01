@@ -6,10 +6,11 @@ import os
 from beamforming.signal_model import compute_rtf_steering_vector
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav, normalize_signal
-from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
+from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
+from beamforming.MPDRxWPE.mpdr import MPDR_recursive
 
 
-def MPDR_recursive(X_stft, fs, array_geometry, source_pos, length_fft, hop_length_fft, beta=1e-3, min_loading=1e-6):
+def MPDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
     """
     MPDR implementation: Updates the covariance matrix continuously using the 
     observed signal, without relying on a Voice Activity Detector (VAD).
@@ -19,13 +20,19 @@ def MPDR_recursive(X_stft, fs, array_geometry, source_pos, length_fft, hop_lengt
     frecs = np.linspace(0, fs/2, K)
 
     # Get steering vectors, expected shape (K, M)
-    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="near_field", squeeze=True)
+    sv = compute_rtf_steering_vector(
+        frecs, source_pos, array_geometry, 
+        ref_mic_idx=0, mode="near_field", squeeze=True
+    )
     
     # Initialize output complex STFT matrix
     Y_stft = np.zeros((K, T), dtype=np.complex128)
     
     # Initialize observation covariance matrix R_yy for all frequencies (K, M, M)
     R_yy = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    
+    # Initialize tracking weight matrix
+    weights_rec = np.zeros((K, T, M), dtype=np.complex128)
     
     for m in range(T):
         # Extract the current frame across all frequencies, shape (K, M)
@@ -47,21 +54,28 @@ def MPDR_recursive(X_stft, fs, array_geometry, source_pos, length_fft, hop_lengt
         R_yy_inv = np.linalg.inv(R_yy_stable)
 
         # Calculate MPDR Weights
-        # Numerator: R_yy_inv * d -> (K, M, M) * (K, M) -> (K, M)
+        # Numerator: R_yy_inv * sv -> (K, M, M) * (K, M) -> (K, M)
         weights_nom = np.einsum("fmn,fn->fm", R_yy_inv, sv)
         
-        # Denominator: d^H * numerator -> (K, M) * (K, M) -> (K,)
+        # Denominator: sv^H * numerator -> (K, M) * (K, M) -> (K,)
         weights_den = np.einsum("fm,fm->f", sv.conj(), weights_nom)
         
         # Divide numerator by denominator. 
         # Expand dims of denominator to allow broadcasting from (K,) to (K, M)
         weights = weights_nom / weights_den[:, np.newaxis]
+        
+        # Save weights for analysis
+        if save_weights:
+            weights_rec[:, m, :] = weights
 
         # Apply weights to the current observation to get the clean output
         # Output is shape (K,) for the current frame
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
-    return Y_stft
+    if save_weights:
+        return Y_stft, weights_rec
+    else:
+        return Y_stft
 
 
 def apply_mpdr_stft_bridge(time_domain_input, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256, beta=1e-3, min_loading=1e-6):
@@ -85,8 +99,6 @@ def apply_mpdr_stft_bridge(time_domain_input, mic_coords, source_pos_2d, fs, len
         fs=fs, 
         array_geometry=mic_coords, 
         source_pos=source_pos_2d, 
-        length_fft=length_fft, 
-        hop_length_fft=hop_length_fft,
         beta=beta,
         min_loading=min_loading
     )

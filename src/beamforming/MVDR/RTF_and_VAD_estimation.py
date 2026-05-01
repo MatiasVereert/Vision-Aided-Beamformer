@@ -7,6 +7,82 @@ from utils.audio import  normalize_signal
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 import numpy as np
+
+import numpy as np
+import scipy.signal as signal
+import pyroomacoustics as pra
+import numpy as np
+import scipy.signal as signal
+import pyroomacoustics as pra
+import numpy as np
+import scipy.signal as signal
+import pyroomacoustics as pra
+import numpy as np
+import scipy.signal as signal
+
+# We import your validated steering vector function
+from beamforming.signal_model import compute_rtf_steering_vector
+
+def compute_spatial_vad_offline(signals, mic_coords, source_pos, fs=16000, frame_len=512, hop_len=256, coherence_threshold=0.30, **kwargs):
+    """
+    Ultra-fast single-point SRP-PHAT using the system's validated Steering Vector model.
+    Includes magnitude weighting to prevent noise bins from dragging down the coherence score.
+    """
+    M, sig_len = signals.shape
+
+    # 1. Compute STFT
+    f_axis, t_axis, Zxx = signal.stft(signals, fs=fs, nperseg=frame_len, noverlap=frame_len - hop_len)
+    K, T = Zxx.shape[1], Zxx.shape[2]
+
+    # 2. Get geometric steering vectors directly from your validated function
+    sv = compute_rtf_steering_vector(f_axis, source_pos, mic_coords, ref_mic_idx=0, mode="near_field", squeeze=True)
+    sv_transposed = sv.T # Shape: (M, K)
+
+    # 3. PHAT Normalization (Phase isolation)
+    eps = 1e-10
+    Zxx_phat = Zxx / (np.abs(Zxx) + eps)
+    sv_phat = sv_transposed / (np.abs(sv_transposed) + eps) 
+
+    # 4. Align the phases using the CONJUGATE of the normalized Steering Vector
+    sv_expanded = sv_phat[:, :, np.newaxis] 
+    Zxx_aligned = Zxx_phat * np.conj(sv_expanded)
+
+    # 5. Coherent sum across microphones
+    coherent_sum = np.sum(Zxx_aligned, axis=0) # Shape: (K, T)
+
+    # 6. Calculate coherence score (Filtered and Energy-Weighted)
+    idx_min = int(500 / (fs / frame_len))  
+    idx_max = int(4000 / (fs / frame_len)) 
+    
+    # Extract magnitude weights from the reference microphone to emphasize speech bins
+    mag_weights = np.abs(Zxx[0, idx_min:idx_max, :])
+    
+    # Compute weighted mean across frequency bins instead of a flat unweighted mean
+    weighted_coherent_sum = np.sum(mag_weights * np.abs(coherent_sum[idx_min:idx_max, :]), axis=0)
+    sum_weights = np.sum(mag_weights, axis=0) + eps
+    
+    # Normalize by M to keep score strictly between 0.0 and 1.0
+    coherence_score = (weighted_coherent_sum / sum_weights) / M
+
+    # 7. Print debug info
+    print(f"      [VAD DEBUG] Mean Coherence: {np.mean(coherence_score):.3f} | Max Peak: {np.max(coherence_score):.3f}")
+
+    # 8. Energy threshold (Safely increased to 1e-4)
+    frame_energies = np.sum(np.abs(Zxx[0, :, :])**2, axis=0)
+    energy_thresh = np.max(frame_energies) * 1e-4
+
+    # 9. Build Binary VAD Mask
+    vad_time = np.zeros(sig_len)
+    
+    for t_idx in range(T):
+        if frame_energies[t_idx] > energy_thresh and coherence_score[t_idx] > coherence_threshold:
+            start_sample = t_idx * hop_len
+            end_sample = min(start_sample + frame_len, sig_len)
+            vad_time[start_sample:end_sample] = 1.0
+
+    return vad_time
+
+
 def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.85, save_weights=False, min_loading = 1e-6):
     lamda = 0.99
     K, T, M = X_stft.shape  
@@ -161,10 +237,67 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     return y_time[:original_length]
 
 
+def plot_vad_comparison(vad_oracle, vad_estimated, fs, title="VAD Comparison"):
+    """
+    Superpone el VAD oráculo y el VAD estimado en el tiempo.
+    """
+    # Eje temporal en segundos
+    time_axis = np.arange(len(vad_oracle)) / fs
+    
+    plt.figure(figsize=(12, 3))
+    # VAD oráculo con offset 1, VAD estimado con offset 0
+    plt.plot(time_axis, vad_oracle + 0.05, label='VAD Oracle (offset +0.05)', color='green', alpha=0.7)
+    plt.plot(time_axis, vad_estimated, label='VAD Estimado', color='blue', alpha=0.7)
+    
+    plt.xlabel('Tiempo (s)')
+    plt.ylabel('Decisión')
+    plt.yticks([0, 1], ['Silencio', 'Voz'])
+    plt.title(title)
+    plt.legend(loc='upper right')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_az_estimate(azimuth_est, azimuth_real, fs, hop_len=256, title="DOA Estimation"):
+    """
+    Plots the expected azimuth versus the multi-source estimated azimuths over time.
+    """
+    # Calculate correct time axis based on the STFT frames and hop length
+    T = azimuth_est.shape[0]
+    time_axis = np.arange(T) * hop_len / fs
+
+    # Reference vector for the expected real target
+    azimuth_vector = np.full(T, azimuth_real)
+    
+    plt.figure(figsize=(12, 3))
+    
+    # Plot real target azimuth
+    plt.plot(time_axis, azimuth_vector, label='Real Target', color='blue', alpha=0.7, linestyle='--')
+    
+    # Plot estimated sources (ignoring NaNs from silent frames)
+    num_src = azimuth_est.shape[1]
+    colors = ['green', 'orange', 'purple', 'red']
+    
+    for i in range(num_src):
+        plt.plot(time_axis, azimuth_est[:, i], 
+                 label=f'Estimate Source {i+1}', 
+                 marker='.', 
+                 linestyle='None', 
+                 markersize=3,
+                 color=colors[i % len(colors)], 
+                 alpha=0.6)
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Azimuth (Radians)')
+    plt.title(title)
+    plt.legend(loc='upper right')
+    plt.ylim(0, 2 * np.pi)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
 
 from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
-
-
 
 
 if __name__ == "__main__":
@@ -176,9 +309,10 @@ if __name__ == "__main__":
 
     iSIR_dB = 0
     
-    print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
+    print("=== INTEGRATION TEST: PIPELINE WITH SRP-PHAT SPATIAL VAD ===")
     
-    output_folder = "tests/data/rtf_mvdr_output"
+    # New output folder to avoid overwriting previous tests
+    output_folder = "tests/data/rtf_mvdr_output_srp_vad"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
@@ -217,17 +351,28 @@ if __name__ == "__main__":
         print("\n--- PHASE 1: LOADING FREE FIELD SIMULATION FROM CACHE ---")
         cache_data = np.load(cache_ff_path)
         free_field_input = cache_data['input']
-        vad_oracle_ff = cache_data['vad']
+        # We load the oracle VAD just for reference, but we won't use it for MVDR
+        vad_oracle_ff = cache_data['vad'] 
     else:
         print("\n--- PHASE 1: COMPUTING FREE FIELD SIMULATION ---")
         free_field_input, vad_oracle_ff = acoustic_scene.free_field(iSIR_dB=iSIR_dB, normalize=True, mode="ideal", VAD=True)
-        # Save to cache
         np.savez(cache_ff_path, input=free_field_input, vad=vad_oracle_ff)
         
     save_wav("1_FF_input_mix_mic0.wav", FS, free_field_input[0], output_folder)
     
+    # Compute Spatial VAD offline using SRP-PHAT (20cm tolerance sphere)
+    print(" -> Estimating Spatial VAD offline using SRP-PHAT (Free Field)...")
+    # Reemplaza tu línea actual por esta:
+    spatial_vad_ff = compute_spatial_vad_offline(free_field_input, mic_coords, source_pos, fs=16000, frame_len=512, hop_len=256, coherence_threshold=0.45)
+
+
+
+
+    plot_vad_comparison(vad_oracle_ff, spatial_vad_ff, FS, title="Free Field VAD: Oracle vs Estimado (SRP-PHAT)")
+    
     print(" -> Applying Recursive MVDR...")
-    output_ff = apply_mvdr_stft_bridge(free_field_input, vad_oracle_ff, mic_coords, source_pos_2d, FS)
+    # Pass our estimated spatial VAD instead of vad_oracle_ff
+    output_ff = apply_mvdr_stft_bridge(free_field_input, spatial_vad_ff, mic_coords, source_pos_2d, FS)
     
     save_wav("2_FF_output_final.wav", FS, normalize_signal(output_ff), output_folder)
 
@@ -240,7 +385,6 @@ if __name__ == "__main__":
         print("\n--- PHASE 2: LOADING ROOM SIMULATION FROM CACHE ---")
         cache_data = np.load(cache_room_path)
         room_input = cache_data['input']
-        vad_oracle_room = cache_data['vad']
     else:
         print("\n--- PHASE 2: COMPUTING ROOM SIMULATION ---")
         room_dimensions = np.array([4.0, 5.0, 2.5])
@@ -249,13 +393,16 @@ if __name__ == "__main__":
         )
         room_input = room_sim_dic["mic_signals"]
         vad_oracle_room = room_sim_dic["VAD"]
-        # Save to cache
         np.savez(cache_room_path, input=room_input, vad=vad_oracle_room)
     
     save_wav("3_ROOM_input_mix_mic0.wav", FS, room_input[0], output_folder)
 
+    # Compute Spatial VAD offline using SRP-PHAT on reverberant signals
+    print(" -> Estimating Spatial VAD offline using SRP-PHAT (Room)...")
+    spatial_vad_room = compute_spatial_vad_offline(room_input, mic_coords, source_pos_2d, radius_m=0.20, fs=FS)
+
     print(" -> Applying Recursive MVDR (Without WPE)...")
-    output_rm = apply_mvdr_stft_bridge(room_input, vad_oracle_room, mic_coords, source_pos_2d, FS)
+    output_rm = apply_mvdr_stft_bridge(room_input, spatial_vad_room, mic_coords, source_pos_2d, FS)
     
     save_wav("4_ROOM_output_final.wav", FS, normalize_signal(output_rm), output_folder)
 
@@ -269,9 +416,13 @@ if __name__ == "__main__":
     
     save_wav("5_WPE_input_mix_mic0.wav", FS, wpe_output[0], output_folder)
 
+    # Compute Spatial VAD offline using SRP-PHAT on WPE-cleaned signals (highly accurate)
+    print(" -> Estimating Spatial VAD offline using SRP-PHAT (WPE)...")
+    spatial_vad_wpe = compute_spatial_vad_offline(wpe_output, mic_coords, source_pos_2d, radius_m=0.20, fs=FS)
+
     print(" -> Applying Recursive MVDR on Dereverberated Signals...")
-    output_wpe = apply_mvdr_stft_bridge(wpe_output, vad_oracle_room, mic_coords, source_pos_2d, FS)
+    output_wpe = apply_mvdr_stft_bridge(wpe_output, spatial_vad_wpe, mic_coords, source_pos_2d, FS)
     
     save_wav("6_WPE_ROOM_output_final.wav", FS, normalize_signal(output_wpe), output_folder)
 
-    print("\n -> Pipeline completed successfully.")
+    print("\n -> Pipeline completed successfully. Check the new folder for results.")

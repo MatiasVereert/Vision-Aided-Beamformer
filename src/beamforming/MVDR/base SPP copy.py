@@ -1,106 +1,166 @@
 import numpy as np 
 import scipy.signal as signal
 import matplotlib.pyplot as plt
-from utils.audio import  normalize_signal
 
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
-import numpy as np
+import numpy as np 
+import scipy.signal as signal
+import matplotlib.pyplot as plt
+from utils.audio import  normalize_signal
 
+
+# Assuming the import works correctly in your local environment
+from beamforming.signal_model import compute_rtf_steering_vector
+import numpy as np 
+import scipy.signal as signal
 import scipy.linalg as la
 
+# Assuming the import works correctly in your local environment
+from beamforming.signal_model import compute_rtf_steering_vector
 
-from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
-
-import numpy as np
-import scipy.linalg as la
-
-def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.85, save_weights=False):
+def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft):
+    # Note: 'vad' argument is kept for compatibility with the bridge function, 
+    # but it is completely ignored in favor of the Spatial SPP.
     lamda = 0.99
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
 
-    # Get geometric steering vectors as an initial fallback anchor, expected shape (K, M)
+    # Get steering vectors, expected shape (K, M)
     sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="near_field", squeeze=True)
     
     # Initialize output complex STFT matrix
     Y_stft = np.zeros((K, T), dtype=np.complex128)
     
-    # Initialize covariance matrices for all frequencies (K, M, M)
-    # R_nn tracks noise, R_xx tracks noisy speech
-    R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
-    R_xx = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
-    
     # Pre-create diagonal loading matrix to be used inside the loop
     diag_load = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
 
-    # weights rec
-    weights_rec = np.zeros((K, T, M), dtype=np.complex128)
+    # Initialize noise covariance matrix R_nn
+    R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    
+    # Initialize noisy signal covariance matrix R_xx using the steering vector
+    # We assume an initial PSD (phi_s) for the source to seed the matrix
+    phi_s = 1e-3 
+    R_ss_init = phi_s * np.einsum("fm,fn->fmn", sv, sv.conj())
+    R_xx = R_ss_init + R_nn
 
+    # Initialize the inverse of R_nn for the first frame's SPP calculation
+    R_nn_inv = np.linalg.inv(R_nn + diag_load)
+
+    # SPP Hyperparameters
+    # Threshold for spatial SNR (gamma). 3.0 linear is approx 4.7 dB
+    gamma_th = 3.0 
+    spp_slope = 2.0 
+
+    # --- NEW: Spatial Coherence Model Initialization ---
+    # 1. Calculate physical distance between mic 0 and mic 1
+    d_mics = np.linalg.norm(array_geometry[0] - array_geometry[1]) if M > 1 else 0.001
+    c_sound = 343.0
+
+    # 2. Calculate theoretical diffuse coherence field (Sinc function)
+    # Note: np.sinc(x) computes sin(pi * x) / (pi * x). 
+    # We need sin(2 * pi * f * d / c) / (2 * pi * f * d / c), so x = 2 * f * d / c
+    gamma_diff = np.sinc(2.0 * frecs * d_mics / c_sound)
+
+    # 3. Initialize short-time smoothed PSD matrix for real coherence measurement
+    Phi_smoothed = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    alpha_coh = 0.8 # Faster tracking smoothing factor for local coherence
+    # -------------------------------------------------
 
     for m in range(T):
         # Extract the current frame across all frequencies, shape (K, M)
         X_frame = X_stft[:, m, :]
 
-        # Define VAD frame state (mapping STFT frame to time-domain VAD)
-        vad_frame = vad[m * hop_length_fft : length_fft + m * hop_length_fft]
-        vad_status = np.mean(vad_frame) > 0.1
-
-        # Calculate instantaneous covariance matrix: (K, M) and (K, M) -> (K, M, M)
+        # Calculate instantaneous covariance of the observation
         R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
 
-        # Update matrices based on VAD status
-        if not vad_status:
-            # Update noise covariance ONLY when target speech is absent
-            R_nn = lamda * R_nn + (1 - lamda) * R_instant
+        # --- NEW: Compute Coherence-based Probability Modifier ---
+        # Smooth the PSD specifically for coherence calculation
+        Phi_smoothed = alpha_coh * Phi_smoothed + (1.0 - alpha_coh) * R_instant
+
+        # (This goes inside the frame loop)
+        if M > 1:
+            gamma_real_sum = np.zeros(K)
+            gamma_diff_sum = np.zeros(K)
+            pair_count = 0
+            
+            # Loop through adjacent microphone pairs to average coherence
+            for i in range(M - 1):
+                j = i + 1
+                phi_ii = np.real(Phi_smoothed[:, i, i])
+                phi_jj = np.real(Phi_smoothed[:, j, j])
+                phi_ij = Phi_smoothed[:, i, j]
+                
+                gamma_pair = (np.abs(phi_ij)**2) / (phi_ii * phi_jj + 1e-10)
+                
+                # Calculate specific distance for this pair
+                d_pair = np.linalg.norm(array_geometry[i] - array_geometry[j])
+                gamma_diff_pair = np.sinc(2.0 * frecs * d_pair / c_sound)
+                
+                gamma_real_sum += gamma_pair
+                gamma_diff_sum += gamma_diff_pair
+                pair_count += 1
+                
+            gamma_real_avg = gamma_real_sum / pair_count
+            gamma_diff_avg = gamma_diff_sum / pair_count
+
+            # Map average coherence to a probability modifier [0, 1]
+            P_coh = (gamma_real_avg - gamma_diff_avg) / (1.0 - gamma_diff_avg + 1e-10)
+            P_coh = np.clip(P_coh, 0.05, 1.0)
         else:
-            # Update noisy speech covariance when target speech is present
-            R_xx = lamda * R_xx + (1 - lamda) * R_instant
+            P_coh = 1.0
+        # ---------------------------------------------------------
 
-        # Add diagonal loading for numerical stability
+        # --- 1. Calculate A Posteriori Spatial SNR (gamma) ---
+        # Numerator: |v^H * R_nn_inv * x|^2
+        R_nn_inv_x = np.einsum("fmn,fn->fm", R_nn_inv, X_frame)
+        num_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_x)
+        num = np.abs(num_complex)**2
+        
+        # Denominator: v^H * R_nn_inv * v (represents noise power at output)
+        R_nn_inv_v = np.einsum("fmn,fn->fm", R_nn_inv, sv)
+        den_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_v)
+        den = np.real(den_complex) # Guaranteed to be real 
+        
+        # Calculate gamma for all frequencies
+        gamma = num / (den + 1e-10)
+
+        # --- 2. Map Gamma to Spatial Presence Probability (SPP) ---
+        # Get the standard directional SPP
+        P_sigmoide = 1.0 / (1.0 + np.exp(-spp_slope * (gamma - gamma_th)))
+        
+        # Multiply by the coherence constraint mask
+        P = P_sigmoide * P_coh
+        
+        # Clip probabilities to prevent matrices from completely freezing
+        P = np.clip(P, 0.05, 0.95)
+        P_expand = P[:, np.newaxis, np.newaxis]
+
+        # --- 3. Update Covariance Matrices ---
+        # Update R_xx weighted by the final joint probability
+        R_xx = lamda * R_xx + (1 - lamda) * P_expand * R_instant
+        
+        # Update R_nn weighted by the complementary probability
+        R_nn = lamda * R_nn + (1 - lamda) * (1 - P_expand) * R_instant
+
+        # --- 4. Compute MVDR Weights ---
+        # Prepare stable R_nn and invert it for the current frame
         R_nn_stable = R_nn + diag_load
-
-        # --- Generalized Eigenvalue Decomposition (GEVD) for RTF Estimation ---
-        rtf_empirical = np.zeros((K, M), dtype=np.complex128)
-        
-        # Scipy's eigh does not natively broadcast over 3D arrays, so we loop over frequencies
-        for f in range(K):
-            # Calculate eigenvalues and eigenvectors using GEVD for the current frequency
-            eigenvalues, eigenvectors = la.eigh(R_xx[f], R_nn_stable[f])
-
-            # The dominant eigenvector corresponds to the largest eigenvalue (last in the sorted array)
-            rtf_gevd = eigenvectors[:, -1]
-
-            # Normalize to the reference microphone (mic 0). Add epsilon to avoid division by zero
-            rtf_empirical[f, :] = rtf_gevd / (rtf_gevd[0] + 1e-10)
-
-        # --- Regularization: Mix Empirical RTF with Geometric Steering Vector ---
-        # Linearly interpolate between the estimated RTF and the theoretical DOA
-        rtf_mixed = alpha * rtf_empirical + (1.0 - alpha) * sv
-        
-        # Invert the noise covariance matrices for all frequencies simultaneously
         R_nn_inv = np.linalg.inv(R_nn_stable)
 
-        # --- Calculate MVDR Weights using the MIXED RTF ---
-        # Numerator: R_nn_inv * rtf_mixed -> (K, M, M) * (K, M) -> (K, M)
-        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, rtf_mixed)
+        # Numerator: R_nn_inv * v
+        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, sv)
         
-        # Denominator: rtf_mixed^H * numerator -> (K, M) * (K, M) -> (K,)
-        weights_den = np.einsum("fm,fm->f", rtf_mixed.conj(), weights_nom)
+        # Denominator: v^H * numerator
+        weights_den = np.einsum("fm,fm->f", sv.conj(), weights_nom)
         
-        # Divide numerator by denominator. Add small epsilon to prevent NaNs
+        # Final weights calculation
         weights = weights_nom / (weights_den[:, np.newaxis] + 1e-10)
 
-        # Apply weights to the current observation to get the clean output
-        # Output is shape (K,) for the current frame
+        # --- 5. Apply Filter ---
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
-        weights_rec[:,m,:] = weights
-
-    if save_weights:
-        return Y_stft, weights_rec
-    else:
-        return Y_stft
+    return Y_stft
 
 import numpy as np
 import scipy.signal as signal
@@ -165,6 +225,10 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
 
 
 
+from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
+
+
+
 if __name__ == "__main__":
     # Basic simulation parameters
     FS = 16000
@@ -175,8 +239,7 @@ if __name__ == "__main__":
     iSIR_dB = 0
     
     print("=== INTEGRATION TEST: PIPELINE (DATA GENERATION & PROCESSING) ===")
-    
-    output_folder = "tests/data/rf_mvdr_reg_output"
+    output_folder = "tests/data/mvdr_SPP_Coherence_output_"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array

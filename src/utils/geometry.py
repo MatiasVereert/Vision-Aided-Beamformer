@@ -1,7 +1,56 @@
 import numpy as np 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
 
+def generate_source_and_interferences(N_interferences: int, radius: float, delta_ang_deg: float, array_center: np.ndarray) -> tuple:
+    """
+    Generates the 3D coordinates for the target source and N interferences.
+    The target source is fixed at 0 degrees.
+    Interferences are placed alternately at +/- multiples of delta_ang.
+    
+    Parameters:
+    N_interferences: Number of interference sources to generate
+    radius: Distance from the array center to the sources (meters)
+    delta_ang_deg: Angular spacing between interferences (degrees)
+    array_center: 1D array [x, y, z] with the array's geometric center
+    
+    Returns:
+    source_pos: (3,) numpy array with the target source coordinates
+    interferences_pos: (N_interferences, 3) numpy array with the interference coordinates
+    """
+    # Convert delta angle to radians for trigonometric functions
+    delta_ang_rad = np.deg2rad(delta_ang_deg)
+    
+    # The target source is always at 0 degrees relative to the center.
+    # Assuming 0 degrees aligns with the positive X-axis in the 2D plane:
+    # x = x_c + r*cos(0), y = y_c + r*sin(0)
+    source_pos = np.copy(array_center)
+    source_pos[0] += radius 
+    
+    # Initialize the array to hold all interference coordinates
+    interferences_pos = np.zeros((N_interferences, 3))
+    
+    for i in range(N_interferences):
+        # Calculate the sequence multiplier: 1, 1, 2, 2, 3, 3...
+        # Using integer division: (0//2)+1=1, (1//2)+1=1, (2//2)+1=2...
+        multiplier = (i // 2) + 1
+        
+        # Alternate the sign: +, -, +, -, ...
+        # Even indices (0, 2, 4...) get +, odd indices (1, 3, 5...) get -
+        sign = 1 if i % 2 == 0 else -1
+        
+        # Calculate the current angle in radians
+        angle_rad = sign * multiplier * delta_ang_rad
+        
+        # Calculate the cartesian coordinates for the current interference
+        x = array_center[0] + radius * np.cos(angle_rad)
+        y = array_center[1] + radius * np.sin(angle_rad)
+        z = array_center[2] # Maintain the same height (Z) as the array center
+        
+        interferences_pos[i] = [x, y, z]
+        
+    return source_pos, interferences_pos
 
 def source_rotation(radius, samples, axis = 'h'):
     """
