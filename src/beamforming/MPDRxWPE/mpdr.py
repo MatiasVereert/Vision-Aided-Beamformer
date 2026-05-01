@@ -7,7 +7,6 @@ from beamforming.signal_model import compute_rtf_steering_vector
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav, normalize_signal
 from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
-from beamforming.MPDRxWPE.mpdr import MPDR_recursive
 
 
 def MPDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
