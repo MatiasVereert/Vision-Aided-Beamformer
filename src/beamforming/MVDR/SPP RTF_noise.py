@@ -1,15 +1,11 @@
-
-
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 import numpy as np 
 import scipy.signal as signal
-import matplotlib.pyplot as plt
-from utils.audio import  normalize_signal
-
-
-# Assuming the import works correctly in your local environment
-from beamforming.signal_model import compute_rtf_steering_vector
+import os
+from utils.audio import normalize_signal, save_wav
+from propagation.simulate_acoustics import SimAcoustic
+from dereverberation.nara_wrappers import process_wpe_online
 
 
 def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
@@ -28,20 +24,17 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
     
     # Initialize noisy signal covariance matrix R_xx using the steering vector
-    # We assume an initial PSD (phi_s) for the source to seed the matrix
     phi_s = 1e-3 
     R_ss_init = phi_s * np.einsum("fm,fn->fmn", sv, sv.conj())
     R_xx = R_ss_init + R_nn
 
     # Initialize the inverse of R_nn for the first frame's SPP calculation
-    # We use min_loading here to prevent singularities at t=0
     initial_diag_load = np.tile(np.eye(M, dtype=np.complex128) * min_loading, (K, 1, 1))
     R_nn_inv = np.linalg.inv(R_nn + initial_diag_load)
 
     # SPP Hyperparameters
-    # Threshold for spatial SNR (gamma). 3.0 linear is approx 4.7 dB
-    gamma_th = 12  #Set to 3
-    spp_slope = 4.0 # set ti 2
+    gamma_th = 3.0  
+    spp_slope = 2.0 
 
     # Weights recording initialization
     weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -50,94 +43,65 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
         # Extract the current frame across all frequencies, shape (K, M)
         X_frame = X_stft[:, m, :]
 
-        # --- 1. Calculate A Posteriori Spatial SNR (gamma) ---
-        # Evaluate the current frame against the prior noise spatial structure
-        
-        # Numerator: |v^H * R_nn_inv * x|^2
+        # --- 1. Calculate A Posteriori Spatial SNR (gamma) using Geometric Steering Vector ---
         R_nn_inv_x = np.einsum("fmn,fn->fm", R_nn_inv, X_frame)
         num_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_x)
         num = np.abs(num_complex)**2
         
-        # Denominator: v^H * R_nn_inv * v (represents noise power at output)
-        R_nn_inv_v = np.einsum("fmn,fn->fm", R_nn_inv, sv)
-        den_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_v)
-        den = np.real(den_complex) # Guaranteed to be real 
+        R_nn_inv_sv = np.einsum("fmn,fn->fm", R_nn_inv, sv)
+        den_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_sv)
+        den = np.real(den_complex) 
         
-        # Calculate gamma for all frequencies
         gamma = num / (den + 1e-10)
 
         # --- 2. Map Gamma to Spatial Presence Probability (SPP) ---
-        # Using a sigmoid function to map SNR to a probability [0, 1]
         P = 1.0 / (1.0 + np.exp(-spp_slope * (gamma - gamma_th)))
-        
-        # Clip probabilities to prevent matrices from completely freezing
         P = np.clip(P, 0.05, 0.95)
         P_expand = P[:, np.newaxis, np.newaxis]
 
         # --- 3. Update Covariance Matrices ---
-        # Calculate instantaneous covariance of the observation
         R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
         
-        # Update R_xx weighted by the probability of target speech presence
         R_xx = lamda * R_xx + (1 - lamda) * P_expand * R_instant
-        
-        # Update R_nn weighted by the probability of target speech absence
         R_nn = lamda * R_nn + (1 - lamda) * (1 - P_expand) * R_instant
 
-        # --- 4. Compute MVDR Weights with Dynamic Diagonal Loading ---
-        # Calculate dynamic loading based on the noise covariance trace
+        # --- 4. Estimate RTF via Covariance Subtraction (CS) ---
+        # Calculate the spatial covariance of the source signal
+        R_ss = R_xx - R_nn
+        
+        # Extract the column corresponding to the reference microphone (index 0)
+        rtf_num = R_ss[:, :, 0]
+        # Get the power at the reference microphone to normalize the RTF
+        rtf_den = np.real(R_ss[:, 0, 0])
+        
+        # Calculate the dynamic CS-RTF constraint
+        rtf_est = rtf_num / (rtf_den[:, np.newaxis] + 1e-10)
+
+        # --- 5. Compute MVDR Weights with Dynamic Diagonal Loading ---
         tr_R = np.real(np.trace(R_nn, axis1=1, axis2=2))
         adaptive_load = beta * (tr_R[:, None, None] / M)
         
-        # Apply the minimum loading threshold
         loading = np.maximum(adaptive_load, min_loading)
-        
-        # Apply stabilization
         R_nn_stable = R_nn + np.eye(M)[None, :, :] * loading
-
-        # Invert the stable covariance matrix safely
         R_nn_inv = np.linalg.inv(R_nn_stable)
 
-        # Numerator: R_nn_inv * v
-        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, sv)
+        # Numerator: R_nn_inv * rtf_est (Using the estimated RTF constraint)
+        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, rtf_est)
         
-        # Denominator: v^H * numerator
-        weights_den = np.einsum("fm,fm->f", sv.conj(), weights_nom)
+        # Denominator: rtf_est^H * numerator (Using the estimated RTF constraint)
+        weights_den = np.einsum("fm,fm->f", rtf_est.conj(), weights_nom)
         
-        # Final weights calculation
         weights = weights_nom / (weights_den[:, np.newaxis] + 1e-10)
         weights_rec[:, m, :] = weights
         
-        # --- 5. Apply Filter ---
+        # --- 6. Apply Filter ---
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
     if save_weights:
         return Y_stft, weights_rec
     else:
         return Y_stft
-    
 
-
-
-import numpy as np
-import scipy.signal as signal
-
-# Assuming these are available from your local environment modules
-from beamforming.signal_model import compute_rtf_steering_vector
-    
-import os
-from propagation.simulate_acoustics import SimAcoustic
-from utils.audio import save_wav
-import os
-import numpy as np
-import scipy.signal as signal
-
-# Assuming these are available from your local environment modules
-from beamforming.signal_model import compute_rtf_steering_vector
-# from simulation_module import SimAcoustic 
-# from utils import save_wav, normalize_signal 
-# from your_mvdr_module import SPP_SPP_MVDR_recursive 
-# from your_wpe_module import process_wpe_online
 
 def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256):
     """
@@ -157,13 +121,12 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     # Pad VAD to avoid index out of bounds during the last STFT frames
     vad_padded = np.pad(vad_oracle, (0, length_fft + hop_length_fft), mode='constant')
 
-    # Execute the Recursive MVDR
+    # Execute the Recursive MVDR passing the geometry for SPP steering vector
     Y_stft = SPP_MVDR_recursive(
         X_stft=X_stft, 
         fs=fs, 
         array_geometry=mic_coords, 
         source_pos=source_pos_2d, 
-
     )
     
     # Compute Inverse STFT
@@ -179,13 +142,10 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     return y_time[:original_length]
 
 
-from dereverberation.nara_wrappers import process_wpe_online
-
-
 if __name__ == "__main__":
     # Basic simulation parameters
     FS = 16000
-    M1, M2 = 12, 1          
+    M1, M2 = 8, 1          
     M = M1 * M2
     speed_of_sound = 343.0 
 
@@ -193,7 +153,7 @@ if __name__ == "__main__":
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/mvdr_SPP_output"
+    output_folder = "tests/data/mvdr_SPP0_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
@@ -236,7 +196,6 @@ if __name__ == "__main__":
     else:
         print("\n--- PHASE 1: COMPUTING FREE FIELD SIMULATION ---")
         free_field_input, vad_oracle_ff = acoustic_scene.free_field(iSIR_dB=iSIR_dB, normalize=True, mode="ideal", VAD=True)
-        # Save to cache
         np.savez(cache_ff_path, input=free_field_input, vad=vad_oracle_ff)
         
     save_wav("1_FF_input_mix_mic0.wav", FS, free_field_input[0], output_folder)
@@ -264,7 +223,6 @@ if __name__ == "__main__":
         )
         room_input = room_sim_dic["mic_signals"]
         vad_oracle_room = room_sim_dic["VAD"]
-        # Save to cache
         np.savez(cache_room_path, input=room_input, vad=vad_oracle_room)
     
     save_wav("3_ROOM_input_mix_mic0.wav", FS, room_input[0], output_folder)
@@ -273,6 +231,7 @@ if __name__ == "__main__":
     output_rm = apply_mvdr_stft_bridge(room_input, vad_oracle_room, mic_coords, source_pos_2d, FS)
     
     save_wav("4_ROOM_output_final.wav", FS, normalize_signal(output_rm), output_folder)
+    save_wav("4_ROOM_output_final.wav", FS, normalize_signal(output_rm), output_folder)
 
     # -------------------------------------------------------------------
     # PHASE 3: WPE DEREVERBERATION + RECURSIVE MVDR
@@ -280,7 +239,7 @@ if __name__ == "__main__":
     print("\n--- PHASE 3: WPE + MVDR PIPELINE ---")
     print(" -> Applying Online WPE Dereverberation on Room Simulation...")
     
-    wpe_output = process_wpe_online(room_input, delay = 3, taps = 7)
+    wpe_output = process_wpe_online(room_input, delay=1, taps=12)
     
     save_wav("5_WPE_input_mix_mic0.wav", FS, wpe_output[0], output_folder)
 
@@ -289,4 +248,4 @@ if __name__ == "__main__":
     
     save_wav("6_WPE_ROOM_output_final.wav", FS, normalize_signal(output_wpe), output_folder)
 
-    print("\n -> Pipeline completed successfully.") 
+    print("\n -> Pipeline completed successfully.")

@@ -1,15 +1,12 @@
-
-
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 import numpy as np 
 import scipy.signal as signal
 import matplotlib.pyplot as plt
-from utils.audio import  normalize_signal
-
-
-# Assuming the import works correctly in your local environment
-from beamforming.signal_model import compute_rtf_steering_vector
+from utils.audio import normalize_signal, save_wav
+import os
+from propagation.simulate_acoustics import SimAcoustic
+from dereverberation.nara_wrappers import process_wpe_online
 
 
 def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
@@ -21,8 +18,9 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
     # Get steering vectors, expected shape (K, M)
     sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="near_field", squeeze=True)
     
-    # Initialize output complex STFT matrix
+    # Initialize output complex STFT matrices
     Y_stft = np.zeros((K, T), dtype=np.complex128)
+    Y_spp_stft = np.zeros((K, T), dtype=np.complex128) # New matrix for SPP-filtered output
     
     # Initialize noise covariance matrix R_nn
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
@@ -40,8 +38,8 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
 
     # SPP Hyperparameters
     # Threshold for spatial SNR (gamma). 3.0 linear is approx 4.7 dB
-    gamma_th = 12  #Set to 3
-    spp_slope = 4.0 # set ti 2
+    gamma_th = 8  # Set to 3
+    spp_slope = 5 # Set to 2
 
     # Weights recording initialization
     weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -73,6 +71,9 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
         # Clip probabilities to prevent matrices from completely freezing
         P = np.clip(P, 0.05, 0.95)
         P_expand = P[:, np.newaxis, np.newaxis]
+
+        # Apply the SPP mask directly to the reference microphone (mic index 0)
+        Y_spp_stft[:, m] = P * X_frame[:, 0]
 
         # --- 3. Update Covariance Matrices ---
         # Calculate instantaneous covariance of the observation
@@ -112,32 +113,10 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
     if save_weights:
-        return Y_stft, weights_rec
+        return Y_stft, Y_spp_stft, weights_rec
     else:
-        return Y_stft
+        return Y_stft, Y_spp_stft
     
-
-
-
-import numpy as np
-import scipy.signal as signal
-
-# Assuming these are available from your local environment modules
-from beamforming.signal_model import compute_rtf_steering_vector
-    
-import os
-from propagation.simulate_acoustics import SimAcoustic
-from utils.audio import save_wav
-import os
-import numpy as np
-import scipy.signal as signal
-
-# Assuming these are available from your local environment modules
-from beamforming.signal_model import compute_rtf_steering_vector
-# from simulation_module import SimAcoustic 
-# from utils import save_wav, normalize_signal 
-# from your_mvdr_module import SPP_SPP_MVDR_recursive 
-# from your_wpe_module import process_wpe_online
 
 def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256):
     """
@@ -157,18 +136,25 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     # Pad VAD to avoid index out of bounds during the last STFT frames
     vad_padded = np.pad(vad_oracle, (0, length_fft + hop_length_fft), mode='constant')
 
-    # Execute the Recursive MVDR
-    Y_stft = SPP_MVDR_recursive(
+    # Execute the Recursive MVDR and get both standard output and SPP masked output
+    Y_stft, Y_spp_stft = SPP_MVDR_recursive(
         X_stft=X_stft, 
         fs=fs, 
         array_geometry=mic_coords, 
         source_pos=source_pos_2d, 
-
     )
     
-    # Compute Inverse STFT
+    # Compute Inverse STFT for MVDR output
     _, y_time = signal.istft(
         Y_stft, 
+        fs=fs, 
+        nperseg=length_fft, 
+        noverlap=length_fft - hop_length_fft
+    )
+
+    # Compute Inverse STFT for SPP masked output
+    _, y_spp_time = signal.istft(
+        Y_spp_stft, 
         fs=fs, 
         nperseg=length_fft, 
         noverlap=length_fft - hop_length_fft
@@ -176,16 +162,13 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     
     # Truncate to original length
     original_length = time_domain_input.shape[1]
-    return y_time[:original_length]
-
-
-from dereverberation.nara_wrappers import process_wpe_online
+    return y_time[:original_length], y_spp_time[:original_length]
 
 
 if __name__ == "__main__":
     # Basic simulation parameters
     FS = 16000
-    M1, M2 = 12, 1          
+    M1, M2 = 8, 1          
     M = M1 * M2
     speed_of_sound = 343.0 
 
@@ -193,7 +176,7 @@ if __name__ == "__main__":
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/mvdr_SPP_output"
+    output_folder = "tests/data/mvdr_SPP_spatial_debug_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
@@ -213,16 +196,19 @@ if __name__ == "__main__":
     r = 1.0 
     ang_target = np.deg2rad(130)
     ang_interf = np.deg2rad(50)
+    ang_interf2 = np.deg2rad(-50)
     
     source_pos = array_center + np.array([r * np.cos(ang_target), r * np.sin(ang_target), 0.0])
     interf_pos1 = array_center + np.array([r * np.cos(ang_interf), r * np.sin(ang_interf), 0.0])
+    interf_pos2 = array_center + np.array([r * np.cos(ang_interf2), r * np.sin(ang_interf2), 0.0])
     source_pos_2d = source_pos.reshape(1, 3)
 
     print(" -> Initializing acoustic scene...")
     acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=15, fs=FS)
     acoustic_scene.set_source(r"tools\data\signals\p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
+    acoustic_scene.set_interference(r"tools\data\signals\p011_emo_anger_sentences.wav", gain=1, position=interf_pos1.reshape(1,3))
     acoustic_scene.set_interference(r"tools\data\signals\hairdryer_07_SH_MKH800.wav", gain=1, position=interf_pos1.reshape(1,3))
-
+    
     # -------------------------------------------------------------------
     # PHASE 1: FREE FIELD SIMULATION (Anechoic)
     # -------------------------------------------------------------------
@@ -242,9 +228,10 @@ if __name__ == "__main__":
     save_wav("1_FF_input_mix_mic0.wav", FS, free_field_input[0], output_folder)
     
     print(" -> Applying Recursive MVDR...")
-    output_ff = apply_mvdr_stft_bridge(free_field_input, vad_oracle_ff, mic_coords, source_pos_2d, FS)
+    output_ff, output_spp_ff = apply_mvdr_stft_bridge(free_field_input, vad_oracle_ff, mic_coords, source_pos_2d, FS)
     
     save_wav("2_FF_output_final.wav", FS, normalize_signal(output_ff), output_folder)
+    save_wav("2_FF_output_SPP_mask.wav", FS, normalize_signal(output_spp_ff), output_folder)
 
     # -------------------------------------------------------------------
     # PHASE 2: ROOM SIMULATION (Reverberant)
@@ -270,9 +257,10 @@ if __name__ == "__main__":
     save_wav("3_ROOM_input_mix_mic0.wav", FS, room_input[0], output_folder)
 
     print(" -> Applying Recursive MVDR (Without WPE)...")
-    output_rm = apply_mvdr_stft_bridge(room_input, vad_oracle_room, mic_coords, source_pos_2d, FS)
+    output_rm, output_spp_rm = apply_mvdr_stft_bridge(room_input, vad_oracle_room, mic_coords, source_pos_2d, FS)
     
     save_wav("4_ROOM_output_final.wav", FS, normalize_signal(output_rm), output_folder)
+    save_wav("4_ROOM_output_SPP_mask.wav", FS, normalize_signal(output_spp_rm), output_folder)
 
     # -------------------------------------------------------------------
     # PHASE 3: WPE DEREVERBERATION + RECURSIVE MVDR
@@ -280,13 +268,14 @@ if __name__ == "__main__":
     print("\n--- PHASE 3: WPE + MVDR PIPELINE ---")
     print(" -> Applying Online WPE Dereverberation on Room Simulation...")
     
-    wpe_output = process_wpe_online(room_input, delay = 3, taps = 7)
+    wpe_output = process_wpe_online(room_input, delay=2, stft_size = 1024 , stft_shift=128)
     
     save_wav("5_WPE_input_mix_mic0.wav", FS, wpe_output[0], output_folder)
 
     print(" -> Applying Recursive MVDR on Dereverberated Signals...")
-    output_wpe = apply_mvdr_stft_bridge(wpe_output, vad_oracle_room, mic_coords, source_pos_2d, FS)
+    output_wpe, output_spp_wpe = apply_mvdr_stft_bridge(wpe_output, vad_oracle_room, mic_coords, source_pos_2d, FS)
     
     save_wav("6_WPE_ROOM_output_final.wav", FS, normalize_signal(output_wpe), output_folder)
+    save_wav("6_WPE_ROOM_output_SPP_mask.wav", FS, normalize_signal(output_spp_wpe), output_folder)
 
-    print("\n -> Pipeline completed successfully.") 
+    print("\n -> Pipeline completed successfully.")

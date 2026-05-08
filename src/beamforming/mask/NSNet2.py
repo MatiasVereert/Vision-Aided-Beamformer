@@ -1,18 +1,19 @@
-
-
-# Assuming the import works correctly in your local environment
-from beamforming.signal_model import compute_rtf_steering_vector
-import numpy as np 
+import os
+import numpy as np
 import scipy.signal as signal
-import matplotlib.pyplot as plt
-from utils.audio import  normalize_signal
+import onnxruntime as ort
 
-
-# Assuming the import works correctly in your local environment
+# Assuming these are available from your local environment modules
 from beamforming.signal_model import compute_rtf_steering_vector
+from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
+from propagation.simulate_acoustics import SimAcoustic
+from utils.audio import save_wav, normalize_signal
 
-
-def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
+def Neural_MVDR_recursive(X_stft, fs, array_geometry, source_pos, ort_session, beta=1e-3, min_loading=1e-6, save_weights=False):
+    """
+    Recursive MVDR using a Neural Network (e.g., NSNet2) for mask estimation
+    instead of the statistical Spatial Presence Probability (SPP).
+    """
     # Forgetting factor for covariance matrix smoothing
     lamda = 0.99
     K, T, M = X_stft.shape  
@@ -28,61 +29,77 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
     
     # Initialize noisy signal covariance matrix R_xx using the steering vector
-    # We assume an initial PSD (phi_s) for the source to seed the matrix
     phi_s = 1e-3 
     R_ss_init = phi_s * np.einsum("fm,fn->fmn", sv, sv.conj())
     R_xx = R_ss_init + R_nn
 
-    # Initialize the inverse of R_nn for the first frame's SPP calculation
-    # We use min_loading here to prevent singularities at t=0
-    initial_diag_load = np.tile(np.eye(M, dtype=np.complex128) * min_loading, (K, 1, 1))
-    R_nn_inv = np.linalg.inv(R_nn + initial_diag_load)
-
-    # SPP Hyperparameters
-    # Threshold for spatial SNR (gamma). 3.0 linear is approx 4.7 dB
-    gamma_th = 12  #Set to 3
-    spp_slope = 4.0 # set ti 2
+    # RTF Estimation Hyperparameters
+    alpha_rtf = 0.98         # Smoothing factor for RTF update
+    spp_threshold_rtf = 0.8  # Minimum Neural Probability required to update the RTF
 
     # Weights recording initialization
     weights_rec = np.zeros((K, T, M), dtype=np.complex128)
+
+    # Get ONNX input name dynamically
+    onnx_input_name = ort_session.get_inputs()[0].name
 
     for m in range(T):
         # Extract the current frame across all frequencies, shape (K, M)
         X_frame = X_stft[:, m, :]
 
-        # --- 1. Calculate A Posteriori Spatial SNR (gamma) ---
-        # Evaluate the current frame against the prior noise spatial structure
+        # --- 1. Neural Mask Estimation (Replaces SPP) ---
+        # Extract magnitude spectrum from the reference microphone (mic 0)
+        # Note: Depending on your specific NSNet2 ONNX export, you might need to
+        # apply log10() or specific scaling here. We assume raw magnitude for now.
+        mag_ref = np.abs(X_frame[:, 0])
         
-        # Numerator: |v^H * R_nn_inv * x|^2
-        R_nn_inv_x = np.einsum("fmn,fn->fm", R_nn_inv, X_frame)
-        num_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_x)
-        num = np.abs(num_complex)**2
+        # Prepare input tensor for ONNX. Standard shape is usually (Batch, Time, Freq)
+        # For frame-by-frame inference: (1, 1, K)
+        onnx_input = mag_ref.astype(np.float32).reshape(1, 1, -1)
         
-        # Denominator: v^H * R_nn_inv * v (represents noise power at output)
-        R_nn_inv_v = np.einsum("fmn,fn->fm", R_nn_inv, sv)
-        den_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_v)
-        den = np.real(den_complex) # Guaranteed to be real 
+        # Run real-time inference
+        # If your ONNX model requires explicit hidden state passing (h_in, h_out),
+        # you must initialize it before the loop and pass it in the dictionary here.
+        neural_mask = ort_session.run(None, {onnx_input_name: onnx_input})[0]
         
-        # Calculate gamma for all frequencies
-        gamma = num / (den + 1e-10)
-
-        # --- 2. Map Gamma to Spatial Presence Probability (SPP) ---
-        # Using a sigmoid function to map SNR to a probability [0, 1]
-        P = 1.0 / (1.0 + np.exp(-spp_slope * (gamma - gamma_th)))
-        
-        # Clip probabilities to prevent matrices from completely freezing
-        P = np.clip(P, 0.05, 0.95)
+        # Extract probability P and clip to prevent covariance matrices from freezing
+        P = np.clip(neural_mask.flatten(), 0.05, 0.95)
         P_expand = P[:, np.newaxis, np.newaxis]
 
-        # --- 3. Update Covariance Matrices ---
+        # --- 2. Update Covariance Matrices ---
         # Calculate instantaneous covariance of the observation
         R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
         
-        # Update R_xx weighted by the probability of target speech presence
+        # Update R_xx weighted by the neural probability of target speech presence
         R_xx = lamda * R_xx + (1 - lamda) * P_expand * R_instant
         
-        # Update R_nn weighted by the probability of target speech absence
+        # Update R_nn weighted by the neural probability of target speech absence
         R_nn = lamda * R_nn + (1 - lamda) * (1 - P_expand) * R_instant
+
+        # --- 3. Estimate and Update RTF Dynamically ---
+        # Calculate the speech spatial covariance matrix
+        R_ss = R_xx - R_nn
+        
+        # Select reference microphone
+        ref_mic = 0
+        
+        # Extract the reference column and diagonal for RTF calculation
+        R_ss_ref_col = R_ss[:, :, ref_mic]
+        
+        # Ensure the denominator is strictly positive to avoid instabilities
+        R_ss_ref_diag = np.maximum(np.real(R_ss[:, ref_mic, ref_mic]), 1e-12)
+        
+        # Calculate the instantaneous RTF estimate
+        rtf_inst = R_ss_ref_col / R_ss_ref_diag[:, np.newaxis]
+        
+        # Update the steering vector ONLY when neural network detects speech
+        for f in range(K):
+            if P[f] > spp_threshold_rtf:
+                # Recursively smooth the RTF to maintain stability
+                sv[f, :] = alpha_rtf * sv[f, :] + (1 - alpha_rtf) * rtf_inst[f, :]
+                
+        # Normalize the updated SV to prevent magnitude drift over time
+        sv = sv / (np.linalg.norm(sv, axis=1, keepdims=True) + 1e-10)
 
         # --- 4. Compute MVDR Weights with Dynamic Diagonal Loading ---
         # Calculate dynamic loading based on the noise covariance trace
@@ -115,33 +132,11 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
         return Y_stft, weights_rec
     else:
         return Y_stft
-    
 
 
-
-import numpy as np
-import scipy.signal as signal
-
-# Assuming these are available from your local environment modules
-from beamforming.signal_model import compute_rtf_steering_vector
-    
-import os
-from propagation.simulate_acoustics import SimAcoustic
-from utils.audio import save_wav
-import os
-import numpy as np
-import scipy.signal as signal
-
-# Assuming these are available from your local environment modules
-from beamforming.signal_model import compute_rtf_steering_vector
-# from simulation_module import SimAcoustic 
-# from utils import save_wav, normalize_signal 
-# from your_mvdr_module import SPP_SPP_MVDR_recursive 
-# from your_wpe_module import process_wpe_online
-
-def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256):
+def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, ort_session, length_fft=320, hop_length_fft=160):
     """
-    Helper function to wrap the STFT -> MVDR -> ISTFT process.
+    Helper function to wrap the STFT -> Neural MVDR -> ISTFT process.
     """
     # Compute STFT
     freqs, times, Zxx = signal.stft(
@@ -153,17 +148,14 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     
     # Transpose Zxx from (M, K, T) to (K, T, M)
     X_stft = np.transpose(Zxx, (1, 2, 0))
-    
-    # Pad VAD to avoid index out of bounds during the last STFT frames
-    vad_padded = np.pad(vad_oracle, (0, length_fft + hop_length_fft), mode='constant')
 
-    # Execute the Recursive MVDR
-    Y_stft = SPP_MVDR_recursive(
+    # Execute the Recursive Neural MVDR
+    Y_stft = Neural_MVDR_recursive(
         X_stft=X_stft, 
         fs=fs, 
         array_geometry=mic_coords, 
         source_pos=source_pos_2d, 
-
+        ort_session=ort_session
     )
     
     # Compute Inverse STFT
@@ -179,21 +171,27 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     return y_time[:original_length]
 
 
-from dereverberation.nara_wrappers import process_wpe_online
-
-
 if __name__ == "__main__":
     # Basic simulation parameters
     FS = 16000
     M1, M2 = 12, 1          
     M = M1 * M2
     speed_of_sound = 343.0 
-
     iSIR_dB = 0
+    
+    # Load the ONNX model (NSNet2 causal baseline)
+    # Ensure the model file is in the correct path relative to your execution directory
+    onnx_model_path = r"tools\data\redes\nsnet2-20ms-baseline.onnx"
+    print(f" -> Loading Neural Mask Model from {onnx_model_path}...")
+    try:
+        ort_session = ort.InferenceSession(onnx_model_path)
+    except Exception as e:
+        print(f"Error loading ONNX model. Please download the NSNet2 ONNX file and place it at the specified path.\n{e}")
+        exit()
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/mvdr_SPP_output"
+    output_folder = "tests/data/Neural_MVDR_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
@@ -219,7 +217,7 @@ if __name__ == "__main__":
     source_pos_2d = source_pos.reshape(1, 3)
 
     print(" -> Initializing acoustic scene...")
-    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=15, fs=FS)
+    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=40, fs=FS)
     acoustic_scene.set_source(r"tools\data\signals\p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
     acoustic_scene.set_interference(r"tools\data\signals\hairdryer_07_SH_MKH800.wav", gain=1, position=interf_pos1.reshape(1,3))
 
@@ -236,13 +234,12 @@ if __name__ == "__main__":
     else:
         print("\n--- PHASE 1: COMPUTING FREE FIELD SIMULATION ---")
         free_field_input, vad_oracle_ff = acoustic_scene.free_field(iSIR_dB=iSIR_dB, normalize=True, mode="ideal", VAD=True)
-        # Save to cache
         np.savez(cache_ff_path, input=free_field_input, vad=vad_oracle_ff)
         
     save_wav("1_FF_input_mix_mic0.wav", FS, free_field_input[0], output_folder)
     
-    print(" -> Applying Recursive MVDR...")
-    output_ff = apply_mvdr_stft_bridge(free_field_input, vad_oracle_ff, mic_coords, source_pos_2d, FS)
+    print(" -> Applying Neural MVDR...")
+    output_ff = apply_mvdr_stft_bridge(free_field_input, vad_oracle_ff, mic_coords, source_pos_2d, FS, ort_session)
     
     save_wav("2_FF_output_final.wav", FS, normalize_signal(output_ff), output_folder)
 
@@ -264,29 +261,34 @@ if __name__ == "__main__":
         )
         room_input = room_sim_dic["mic_signals"]
         vad_oracle_room = room_sim_dic["VAD"]
-        # Save to cache
         np.savez(cache_room_path, input=room_input, vad=vad_oracle_room)
     
     save_wav("3_ROOM_input_mix_mic0.wav", FS, room_input[0], output_folder)
 
-    print(" -> Applying Recursive MVDR (Without WPE)...")
-    output_rm = apply_mvdr_stft_bridge(room_input, vad_oracle_room, mic_coords, source_pos_2d, FS)
+    print(" -> Applying Neural MVDR (Without WPE)...")
+    output_rm = apply_mvdr_stft_bridge(room_input, vad_oracle_room, mic_coords, source_pos_2d, FS, ort_session)
     
     save_wav("4_ROOM_output_final.wav", FS, normalize_signal(output_rm), output_folder)
 
     # -------------------------------------------------------------------
-    # PHASE 3: WPE DEREVERBERATION + RECURSIVE MVDR
+    # PHASE 3: WPE DEREVERBERATION + NEURAL MVDR
     # -------------------------------------------------------------------
-    print("\n--- PHASE 3: WPE + MVDR PIPELINE ---")
+    print("\n--- PHASE 3: WPE + NEURAL MVDR PIPELINE ---")
     print(" -> Applying Online WPE Dereverberation on Room Simulation...")
     
-    wpe_output = process_wpe_online(room_input, delay = 3, taps = 7)
+    # Increased delay to 3 to protect early reflections and prevent target cancellation
+    wpe_output = process_wpe_online(room_input, delay=3)
+    
+    # Variance normalization to ensure the signal scale matches expected NN inputs
+    rms_room = np.sqrt(np.mean(room_input**2, axis=1, keepdims=True))
+    rms_wpe = np.sqrt(np.mean(wpe_output**2, axis=1, keepdims=True))
+    wpe_output = wpe_output * (rms_room / (rms_wpe + 1e-10))
     
     save_wav("5_WPE_input_mix_mic0.wav", FS, wpe_output[0], output_folder)
 
-    print(" -> Applying Recursive MVDR on Dereverberated Signals...")
-    output_wpe = apply_mvdr_stft_bridge(wpe_output, vad_oracle_room, mic_coords, source_pos_2d, FS)
+    print(" -> Applying Neural MVDR on Dereverberated Signals...")
+    output_wpe = apply_mvdr_stft_bridge(wpe_output, vad_oracle_room, mic_coords, source_pos_2d, FS, ort_session)
     
     save_wav("6_WPE_ROOM_output_final.wav", FS, normalize_signal(output_wpe), output_folder)
 
-    print("\n -> Pipeline completed successfully.") 
+    print("\n -> Pipeline completed successfully.")
