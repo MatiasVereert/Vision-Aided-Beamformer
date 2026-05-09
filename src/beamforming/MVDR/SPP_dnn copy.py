@@ -13,97 +13,97 @@ from dereverberation.nara_wrappers import process_wpe_online
 # Import standard DeepFilterNet enhance function
 from df.enhance import enhance, init_df
 
-
-import tensorflow as tf
 import numpy as np
 import tensorflow as tf
 # Note: On the Kria KV260, you will likely replace the above with:
 # import tflite_runtime.interpreter as tflite
-import numpy as np
-import tensorflow as tf
-
-
-def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono, blend_alpha=0.95):
+def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono, blend_alpha=1):
     """
-    Applies the quantized DTLN TF-Lite models using a strict real-time 
-    frame-by-frame loop. Model 1 processes the STFT magnitude, and 
-    Model 2 refines the time-domain signal.
-    
-    Args:
-        interpreter_1: Initialized tf.lite.Interpreter for model 1.
-        interpreter_2: Initialized tf.lite.Interpreter for model 2.
-        audio_mono: 1D numpy array of the audio signal (must be 16kHz).
-        blend_alpha: Wet/Dry mix ratio (0.0 = only input, 1.0 = Max DTLN).
-        
-    Returns:
-        out_audio: 1D numpy array containing the enhanced signal.
+    Applies the Float32 DTLN TF-Lite models using a strict real-time 
+    frame-by-frame loop. Handles LSTM hidden states properly to prevent 
+    signal degradation. Compensates for algorithmic delay during blending.
     """
+    # 1. Normalize input to prevent LSTM saturation
+    max_val = np.max(np.abs(audio_mono))
+    if max_val > 0.0:
+        # Scale to peak at 0.9 to give the network optimal headroom
+        audio_mono = audio_mono * (0.9 / max_val)
+
     audio_mono = np.asarray(audio_mono, dtype=np.float32)
     
-    # DTLN specific frame parameters
     block_len = 512
     block_shift = 128
     
-    # Initialize buffers for overlap-and-add
     out_audio = np.zeros_like(audio_mono)
-    in_buffer = np.zeros(block_len, dtype=np.float32)
-    out_buffer = np.zeros(block_len, dtype=np.float32)
+    in_buffer = np.zeros((block_len), dtype=np.float32)
+    out_buffer = np.zeros((block_len), dtype=np.float32)
     
-    # Get input/output indices and expected shapes
+    # Get input/output indices 
     input_details_1 = interpreter_1.get_input_details()
     output_details_1 = interpreter_1.get_output_details()
-    expected_shape_1 = input_details_1[0]['shape']  # Expected: (1, 1, 257)
     
     input_details_2 = interpreter_2.get_input_details()
     output_details_2 = interpreter_2.get_output_details()
-    expected_shape_2 = input_details_2[0]['shape']  # Expected: (1, 1, 512)
 
-    # Calculate number of frames
+    # INITIALIZE LSTM STATES
+    states_1 = np.zeros(input_details_1[1]['shape'], dtype=np.float32)
+    states_2 = np.zeros(input_details_2[1]['shape'], dtype=np.float32)
+
     num_blocks = (len(audio_mono) - (block_len - block_shift)) // block_shift
     
     for idx in range(num_blocks):
-        # 1. Shift input buffer and load new samples
+        # Shift buffer and load data directly
         in_buffer[:-block_shift] = in_buffer[block_shift:]
         start_idx = idx * block_shift
         in_buffer[-block_shift:] = audio_mono[start_idx : start_idx + block_shift]
         
-        # 2. Compute rFFT and extract magnitude (Model 1 input)
-        fft_in = np.fft.rfft(in_buffer)
-        mag_in = np.abs(fft_in)
+        # Compute FFT, magnitude and phase
+        in_block_fft = np.fft.rfft(in_buffer)
+        in_mag = np.abs(in_block_fft)
+        in_phase = np.angle(in_block_fft)
         
-        # 3. Prepare magnitude input for Model 1 dynamically
-        in_mag = np.reshape(mag_in, expected_shape_1).astype(np.float32)
+        # Reshape magnitude
+        in_mag = np.reshape(in_mag, (1, 1, -1)).astype(np.float32)
+        
+        # Feed magnitude AND previous states to Model 1
+        interpreter_1.set_tensor(input_details_1[1]['index'], states_1)
         interpreter_1.set_tensor(input_details_1[0]['index'], in_mag)
         interpreter_1.invoke()
         
-        # 4. Retrieve mask from Model 1 and apply to the complex STFT
+        # Extract mask and NEW states
         out_mask = interpreter_1.get_tensor(output_details_1[0]['index'])
-        out_mask = np.squeeze(out_mask)
-        estimated_stft = fft_in * out_mask
+        states_1 = interpreter_1.get_tensor(output_details_1[1]['index']) 
         
-        # 5. Inverse rFFT back to time domain
-        estimated_block_time = np.fft.irfft(estimated_stft, n=block_len)
+        # Reconstruct complex FFT and apply IFFT
+        estimated_complex = in_mag * out_mask * np.exp(1j * in_phase)
+        estimated_block = np.fft.irfft(estimated_complex, n=block_len)
+        estimated_block = np.reshape(estimated_block, (1, 1, -1)).astype(np.float32)
         
-        # 6. Prepare time-domain input for Model 2
-        in_time = np.reshape(estimated_block_time, expected_shape_2).astype(np.float32)
-        interpreter_2.set_tensor(input_details_2[0]['index'], in_time)
+        # Feed time-domain block AND previous states to Model 2
+        interpreter_2.set_tensor(input_details_2[1]['index'], states_2)
+        interpreter_2.set_tensor(input_details_2[0]['index'], estimated_block)
         interpreter_2.invoke()
         
-        # 7. Get final output block from Model 2
+        # Extract final audio block and NEW states
         out_block = interpreter_2.get_tensor(output_details_2[0]['index'])
-        out_block = np.squeeze(out_block)
+        states_2 = interpreter_2.get_tensor(output_details_2[1]['index'])
         
-        # 8. Shift output buffer and perform overlap-add
+        # Overlap-add
         out_buffer[:-block_shift] = out_buffer[block_shift:]
-        out_buffer[-block_shift:] = np.zeros(block_shift)
-        out_buffer += out_block
+        out_buffer[-block_shift:] = np.zeros((block_shift))
+        out_buffer += np.squeeze(out_block)
         
-        # 9. Extract the processed valid shift to the output array
         out_audio[start_idx : start_idx + block_shift] = out_buffer[:block_shift]
 
-    # Apply Wet/Dry blending
+    # 2. Apply Wet/Dry blending with precise delay compensation
     if blend_alpha < 1.0:
-        out_audio = (blend_alpha * out_audio) + ((1.0 - blend_alpha) * audio_mono)
+        delay = block_len - block_shift # 384 samples algorithmic delay
+        
+        # Shift the dry audio to align perfectly with the processed output
+        audio_mono_delayed = np.zeros_like(audio_mono)
+        audio_mono_delayed[delay:] = audio_mono[:-delay]
+        
+        out_audio = (blend_alpha * out_audio) + ((1.0 - blend_alpha) * audio_mono_delayed)
 
     return out_audio
 
@@ -240,8 +240,8 @@ if __name__ == "__main__":
     
     # Initialize BOTH DTLN TF-Lite Interpreters
     print(" -> [Neural Network] Loading global quantized DTLN TF-Lite models...")
-    tflite_model_1_path = r"tools\data\redes\model_quant_1.tflite" 
-    tflite_model_2_path = r"tools\data\redes\model_quant_2.tflite" 
+    tflite_model_1_path = r"tools\data\redes\model_1.tflite" 
+    tflite_model_2_path = r"tools\data\redes\model_2.tflite" 
     
     try:
         # Load Model 1
@@ -311,7 +311,7 @@ if __name__ == "__main__":
     
     # Output saves
     save_wav("1A_FF_output_dtln_only_16k.wav", FS, output_ff_dtln_only, output_folder)
-    save_wav("1A_FF_input_mic0_16k.wav", FS, free_field_input[0], output_folder)
+    save_wav("1B_FF_input_mic0_16k.wav", FS, free_field_input[0], output_folder)
 
     save_wav("1C_FF_MVDR_output_16k.wav", FS, normalize_signal(output_ff_mvdr), output_folder)
     save_wav("1D_FF_DTLN_Post_16k.wav", FS, normalize_signal(output_ff_dtln), output_folder)
@@ -345,7 +345,7 @@ if __name__ == "__main__":
 
     # Output saves
     save_wav("2A_RM_input_mic0_16k.wav", FS, room_input[0], output_folder)
-    save_wav("1A_FF_output_dtln_only_16k.wav", FS, output_rm_dtln, output_folder)
+    save_wav("2B_RM_output_dtln_only_16k.wav", FS, output_rm_dtln_only, output_folder)
     save_wav("2C_RM_MVDR_output_16k.wav", FS, normalize_signal(output_rm_mvdr), output_folder)
     save_wav("2D_RM_DTLN_Post_16k.wav", FS, normalize_signal(output_rm_dtln), output_folder)
 

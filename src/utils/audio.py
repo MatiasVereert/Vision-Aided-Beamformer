@@ -43,9 +43,17 @@ def load_audio_source(filename, target_fs, target_duration_sec):
 
     # 3. Resampling (Si fs del archivo != fs del sistema)
     if fs_file != target_fs:
-        print(f"[Loader] Remuestreando de {fs_file} Hz a {target_fs} Hz...")
-        number_of_samples = int(len(data) * float(target_fs) / fs_file)
-        data = signal.resample(data, number_of_samples)
+            print(f"[Loader] Remuestreando de {fs_file} Hz a {target_fs} Hz...")
+            
+            # Calculate the greatest common divisor to simplify the resampling ratio
+            gcd_val = np.gcd(int(target_fs), int(fs_file))  
+            
+            # Determine the up and down factors for the polyphase filter
+            up_factor = int(target_fs) // gcd_val
+            down_factor = int(fs_file) // gcd_val
+            
+            # Apply the polyphase resampling
+            data = signal.resample_poly(data, up=up_factor, down=down_factor)
 
     # 4. Ajustar duración
     target_samples = int(target_duration_sec * target_fs)
