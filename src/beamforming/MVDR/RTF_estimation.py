@@ -7,12 +7,13 @@ from utils.audio import  normalize_signal
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 import numpy as np
-def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.85, save_weights=False, min_loading = 1e-6):
+
+def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.8, save_weights=False, min_loading = 1e-6):
     lamda = 0.99
     K, T, M = X_stft.shape  
 
     frecs = np.linspace(0, fs/2, K)
-    beta = 1e-3
+    beta = 1e-2
     # Get geometric steering vectors as an initial fallback anchor, expected shape (K, M)
     sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="near_field", squeeze=True)
     

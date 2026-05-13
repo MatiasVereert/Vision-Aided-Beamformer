@@ -1,6 +1,4 @@
-import numpy as np 
-import scipy.signal as signal
-import matplotlib.pyplot as plt
+
 
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
@@ -13,21 +11,19 @@ from utils.audio import  normalize_signal
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 
-def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, save_weights = False):
-    # but it is completely ignored in favor of the Spatial SPP.
+
+def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
+    # Forgetting factor for covariance matrix smoothing
     lamda = 0.99
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
 
     # Get steering vectors, expected shape (K, M)
-    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="near_field", squeeze=True)
+    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="far_field", squeeze=True)
     
     # Initialize output complex STFT matrix
     Y_stft = np.zeros((K, T), dtype=np.complex128)
     
-    # Pre-create diagonal loading matrix to be used inside the loop
-    diag_load = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
-
     # Initialize noise covariance matrix R_nn
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
     
@@ -38,51 +34,50 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, save_weights = Fa
     R_xx = R_ss_init + R_nn
 
     # Initialize the inverse of R_nn for the first frame's SPP calculation
-    R_nn_inv = np.linalg.inv(R_nn + diag_load)
+    # We use min_loading here to prevent singularities at t=0
+    initial_diag_load = np.tile(np.eye(M, dtype=np.complex128) * min_loading, (K, 1, 1))
+    R_nn_inv = np.linalg.inv(R_nn + initial_diag_load)
 
     # SPP Hyperparameters
     # Threshold for spatial SNR (gamma). 3.0 linear is approx 4.7 dB
-    gamma_th = 3.0 
-    spp_slope = 2.0 
+    gamma_th = 15  #Set to 3
+    spp_slope = 4.0 # set ti 2
 
-    # weights recording
-    weights_rec = np.zeros((K,T,M), dtype=np.complex128)
+    # Weights recording initialization
+    weights_rec = np.zeros((K, T, M), dtype=np.complex128)
 
+    # Before the frame loop (m), initialize the memory for smoothed loading
+    # Alpha controls the smoothing time constant for the diagonal loading
+    alpha_load = 0.9999
+    load_prev = None
 
     for m in range(T):
         # Extract the current frame across all frequencies, shape (K, M)
-        # Extract the current frame across all frequencies, shape (K, M)
         X_frame = X_stft[:, m, :]
 
-        # --- NEW: Instantaneous Gain Normalization ---
-        # Calculate the magnitude of the signal at each microphone
-        mags = np.abs(X_frame) + 1e-12
-        
-        # Calculate a correction factor relative to the reference microphone (idx 0)
-        # This preserves the delicate phase differences but crushes gain mismatches
-        gain_correction = mags[:, 0:1] / mags
-        X_frame_norm = X_frame * gain_correction
-
         # --- 1. Calculate A Posteriori Spatial SNR (gamma) ---
-        # USE THE NORMALIZED FRAME HERE instead of raw X_frame
-        R_nn_inv_x = np.einsum("fmn,fn->fm", R_nn_inv, X_frame_norm)
+        # Evaluate the current frame against the prior noise spatial structure
+        
+        # Numerator: |v^H * R_nn_inv * x|^2
+        R_nn_inv_x = np.einsum("fmn,fn->fm", R_nn_inv, X_frame)
         num_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_x)
         num = np.abs(num_complex)**2
+        num = np.abs(num_complex)**2
         
+        # Denominator: v^H * R_nn_inv * v (represents noise power at output)
         R_nn_inv_v = np.einsum("fmn,fn->fm", R_nn_inv, sv)
         den_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_v)
-        den = np.real(den_complex) 
+        den = np.real(den_complex) # Guaranteed to be real 
         
+        # Calculate gamma for all frequencies
         gamma = num / (den + 1e-10)
-        
-        # ... [El resto de tu código de actualización P, R_xx y R_nn sigue usando X_frame normal] ...
 
         # --- 2. Map Gamma to Spatial Presence Probability (SPP) ---
         # Using a sigmoid function to map SNR to a probability [0, 1]
         P = 1.0 / (1.0 + np.exp(-spp_slope * (gamma - gamma_th)))
         
         # Clip probabilities to prevent matrices from completely freezing
-        P = np.clip(P, 0.05, 0.95)
+        P = np.clip(P, 0.0001, .9)
         P_expand = P[:, np.newaxis, np.newaxis]
 
         # --- 3. Update Covariance Matrices ---
@@ -95,11 +90,22 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, save_weights = Fa
         # Update R_nn weighted by the probability of target speech absence
         R_nn = lamda * R_nn + (1 - lamda) * (1 - P_expand) * R_instant
 
-        # --- 4. Compute MVDR Weights ---
-        # Prepare stable R_nn and invert it for the current frame
-        R_nn_stable = R_nn + diag_load
+        # --- 4. Compute MVDR Weights with Dynamic Diagonal Loading ---
+        tr_R = np.real(np.trace(R_nn, axis1=1, axis2=2))
+        instant_load = beta * (tr_R[:, None, None] / M)
+        
+        # Apply heavy low-pass filtering to the loading factor across time frames
+        if m == 0:
+            smoothed_load = instant_load
+        else:
+            smoothed_load = alpha_load * load_prev + (1 - alpha_load) * instant_load
+        
+        # Update the state variable for the next iteration
+        load_prev = smoothed_load
+        
+        loading = np.maximum(smoothed_load, min_loading)
+        R_nn_stable = R_nn + np.eye(M)[None, :, :] * loading
         R_nn_inv = np.linalg.inv(R_nn_stable)
-
         # Numerator: R_nn_inv * v
         weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, sv)
         
@@ -108,7 +114,8 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, save_weights = Fa
         
         # Final weights calculation
         weights = weights_nom / (weights_den[:, np.newaxis] + 1e-10)
-        weights_rec[:,m,:] = weights
+        weights_rec[:, m, :] = weights
+        
         # --- 5. Apply Filter ---
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
@@ -116,9 +123,6 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, save_weights = Fa
         return Y_stft, weights_rec
     else:
         return Y_stft
-
-
-
 
 import numpy as np
 import scipy.signal as signal
@@ -180,10 +184,7 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     return y_time[:original_length]
 
 
-
-from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
-
-
+from dereverberation.nara_wrappers import process_wpe_online
 
 
 if __name__ == "__main__":
@@ -197,7 +198,7 @@ if __name__ == "__main__":
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/mvdr_SPP0_output"
+    output_folder = "tests/data/mvdr_SPP_dnn_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
@@ -223,9 +224,9 @@ if __name__ == "__main__":
     source_pos_2d = source_pos.reshape(1, 3)
 
     print(" -> Initializing acoustic scene...")
-    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=40, fs=FS)
-    acoustic_scene.set_source("tools/data/signals/FA01_09.wav", gain=1, position=source_pos_2d)
-    acoustic_scene.set_interference("tools/data/signals/MC15_03.wav", gain=1, position=interf_pos1.reshape(1,3))
+    acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=15, fs=FS)
+    acoustic_scene.set_source(r"data/audio/input/p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
+    acoustic_scene.set_interference(r"data/audio/input/hairdryer_07_SH_MKH800.wav", gain=1, position=interf_pos1.reshape(1,3))
 
     # -------------------------------------------------------------------
     # PHASE 1: FREE FIELD SIMULATION (Anechoic)
@@ -284,7 +285,7 @@ if __name__ == "__main__":
     print("\n--- PHASE 3: WPE + MVDR PIPELINE ---")
     print(" -> Applying Online WPE Dereverberation on Room Simulation...")
     
-    wpe_output = process_wpe_online(room_input)
+    wpe_output = process_wpe_online(room_input, delay = 3, taps = 7)
     
     save_wav("5_WPE_input_mix_mic0.wav", FS, wpe_output[0], output_folder)
 
@@ -293,4 +294,4 @@ if __name__ == "__main__":
     
     save_wav("6_WPE_ROOM_output_final.wav", FS, normalize_signal(output_wpe), output_folder)
 
-    print("\n -> Pipeline completed successfully.")
+    print("\n -> Pipeline completed successfully.") 

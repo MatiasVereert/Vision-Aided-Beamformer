@@ -4,30 +4,18 @@ import itertools
 import h5py
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 
-# Agregar junto a los demás imports
+import tensorflow as tf
+from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
+
 from evaluation.polar_plots import precompute_quantized_spatial_response, subsample_weights
 from beamforming.array.geometry import generate_log_array_coords, generate_source_and_interferences
 from beamforming.array.microphone import Microphone
 from propagation.simulate_acoustics_v1 import SimAcoustic
 from dereverberation.nara_wrappers import process_wpe_online
-import os
-import time
-import itertools
-import h5py
-import pandas as pd
-import numpy as np
-from tqdm import tqdm  # Add this import for the progress bar
-
-from beamforming.array.geometry import generate_log_array_coords, generate_source_and_interferences
-from beamforming.array.microphone import Microphone
-from propagation.simulate_acoustics_v1 import SimAcoustic
-from dereverberation.nara_wrappers import process_wpe_online
-
-# Import the actual metrics pipeline
 from evaluation.metrics import evaluate_full_pipeline
 
-# Imported the real wrappers for the spatial filtering algorithms
 from evaluation.bf_wrappers import (
     DS_Processor,
     MVDR_Recursive_Processor,
@@ -38,23 +26,21 @@ from evaluation.bf_wrappers import (
     SPP_MVDR_Recursive_Processor
 )
 
-# Dynamically calculate the absolute path of the project root
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../"))
-def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, processor_obj, 
-                                mic_signals, y_processed, target_anechoic, weights, 
-                                exp_config, row_data, scene_base_config, current_room_dims):
-    """
-    Guarda o actualiza el archivo maestro H5 con una jerarquía: /Procesador/Metrica/Caso.
-    Calcula los datos espaciales 3D en el momento para que el Dashboard pueda animarlos.
-    """
-    import h5py
-    from evaluation.polar_plots import precompute_quantized_spatial_response, subsample_weights
 
+def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, processor_obj, 
+                                mic_signals, y_processed, target_reference, weights, 
+                                exp_config, row_data, scene_base_config, current_room_dims,
+                                audio_dtln_alone=None, y_post_dtln=None):
+    """
+    Saves or updates the master H5 file. Includes audio streams for DTLN
+    so the Dashboard can play the neural-enhanced versions.
+    Notice target_reference replaces target_anechoic.
+    """
     fs = scene_base_config['fs']
     
     with h5py.File(master_path, 'a') as f:
-        # Ruta jerárquica: /MVDR/Delta_PESQ/best_case
         case_path = f"{proc_name}/{metric_name}/{case_type}"
         
         if case_path in f:
@@ -75,16 +61,22 @@ def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, 
         # 2. AUDIO
         grp_audio = grp.create_group("audio")
         grp_audio.create_dataset("mic_signals", data=mic_signals, compression="gzip")
-        grp_audio.create_dataset("target_anechoic", data=target_anechoic, compression="gzip")
+        grp_audio.create_dataset("target_reference", data=target_reference, compression="gzip")
         grp_audio.create_dataset(f"processed_{proc_name}", data=y_processed, compression="gzip")
         
-        # 3. METRICS (Copiamos todas las métricas de la fila actual)
+        # Save neural enhanced streams if available
+        if audio_dtln_alone is not None:
+            grp_audio.create_dataset("processed_dtln_alone", data=audio_dtln_alone, compression="gzip")
+        if y_post_dtln is not None:
+            grp_audio.create_dataset(f"processed_{proc_name}_dtln", data=y_post_dtln, compression="gzip")
+        
+        # 3. METRICS
         grp_res = grp.create_group("metrics")
         for k, v in row_data.items():
-            if any(m in k for m in ["PESQ", "STOI", "SDR", "SIR", "SAR", "CD"]):
+            if any(m in k for m in ["PESQ", "STOI", "SDR", "SIR", "SAR", "SINR", "CD"]):
                 grp_res.attrs[k] = v if not np.isnan(v) else "NaN"
                     
-        # 4. WEIGHTS & SPATIAL (Para el lóbulo 3D del Dashboard)
+        # 4. WEIGHTS & SPATIAL
         nfft = getattr(processor_obj, 'nfft', 1024)
         hop = nfft - getattr(processor_obj, 'noverlap', 768)
         
@@ -106,7 +98,7 @@ def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, 
         grp_spat.attrs.update({"min_dB": -30.0, "target_fps": 24})
 
 
-def run_grid_search(grid_params, room_profiles, processors, scene_base_config, output_dir="results/"):
+def run_grid_search(grid_params, room_profiles, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None):
     os.makedirs(output_dir, exist_ok=True)
     
     # 1. Generate combinations
@@ -121,13 +113,15 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
         x['use_wpe']                                                # Node 4
     ))
     
+    # --- DERIVE DYNAMIC t_early FROM WPE CONFIG ---
+    # Preserves exactly the prediction delay window to avoid penalizing useful early reflections
+    t_early_dynamic = (scene_base_config['wpe_stft_shift'] * scene_base_config['wpe_delay']) / scene_base_config['fs']
+    tqdm.write(f"[*] Derived Dynamic t_early: {t_early_dynamic*1000:.1f} ms based on WPE parameters.")
     tqdm.write(f"[*] Total experiments to run: {len(experiments)} per processor.")
 
-    # Leaderboard tracks the BEST and WORST Delta scores for Top-K saving
-    # 1. Definir métricas a trackear (usamos Deltas Totales)
-    tracked_metrics = ["Delta_tot_PESQ", "Delta_tot_STOI", "Delta_tot_SDR", "Delta_tot_SIR", "Delta_tot_SAR", "Delta_tot_CD"]
+    # Track metrics, adding SINR to support spatial vs global acoustic noise evaluation
+    tracked_metrics = ["Delta_tot_PESQ", "Delta_tot_STOI", "Delta_tot_SDR", "Delta_tot_SIR", "Delta_tot_SAR", "Delta_tot_SINR", "Delta_tot_CD"]
 
-    # 2. Inicializar Leaderboard multidimensional
     leaderboard = {
         proc: {
             m: {"best_val": -np.inf if m != "Delta_tot_CD" else np.inf, 
@@ -144,28 +138,23 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
     current_isir_db, current_gain_mismatch, current_phase_mismatch, current_use_wpe = None, None, None, None
     
     acoustic_scene, scene_data, mic_signals_degraded, mic_signals_ready = None, None, None, None 
+    target_reference = None
     baseline_metrics = {}
-    wpe_metrics = {} # Añadimos esta variable de estado
+    wpe_metrics = {} 
     
-    # --- CASCADING STATE VARIABLES ---
-    current_rt60, current_M, current_N_int, current_mismatch_pos = None, None, None, None
-    current_isir_db, current_gain_mismatch, current_phase_mismatch, current_use_wpe = None, None, None, None
-    
-    acoustic_scene, scene_data, mic_signals_degraded, mic_signals_ready = None, None, None, None 
-    baseline_metrics = {}
-    
+    audio_dtln_alone = None
+    dtln_alone_metrics = {}
+
     mic_simulator = Microphone(fs=scene_base_config['fs'])
     start_total_time = time.time()
-
-    # Determine a safe steady-state slice threshold for spatial metrics
-    # Leaves at least 1/3 of the signal if duration is very short.
     eval_start_s = min(5.0, scene_base_config['duration'] * 0.3)
+
+    use_dtln = interpreter_1 is not None and interpreter_2 is not None
 
     # 4. Main Orchestrator Loop
     for i, exp in enumerate(tqdm(experiments, desc="Running Benchmark", unit="exp")):
         tqdm.write(f"\n--- Iteration {i+1}/{len(experiments)} | Config: {exp} ---")
         
-        # --- STRICT CASCADING CACHE LOGIC ---
         recalc_physics = (exp['rt60'] != current_rt60 or exp['M'] != current_M or 
                           exp['N_interferences'] != current_N_int or exp['mismatch_pos'] != current_mismatch_pos)
         recalc_mixture = recalc_physics or (exp['isir_db'] != current_isir_db)
@@ -174,10 +163,10 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
         recalc_wpe = recalc_hardware or (exp['use_wpe'] != current_use_wpe)
         
         # ---------------------------------------------------------
-        # NODE 1: GEOMETRY AND PHYSICS (Heavy Computation)
+        # NODE 1: GEOMETRY AND PHYSICS
         # ---------------------------------------------------------
         if recalc_physics:
-            tqdm.write(" -> [NODE 1] Physics changed. Re-computing RIRs and convolutions...")
+            tqdm.write(" -> [NODE 1] Physics changed. Re-computing RIRs...")
             current_room_dims = room_profiles[exp['rt60']]
             room_center = current_room_dims / 2.0
             
@@ -208,11 +197,12 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                 )
             
             acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'], ray_tracing=True)
-            acoustic_scene.convolve_signals()
+            # Inject dynamic t_early directly into convolution logic
+            acoustic_scene.convolve_signals(t_early=t_early_dynamic)
             current_rt60, current_M, current_N_int, current_mismatch_pos = exp['rt60'], exp['M'], exp['N_interferences'], exp['mismatch_pos']
             
         # ---------------------------------------------------------
-        # NODE 2: ACOUSTIC MIXTURE (Lightweight Matrix Ops)
+        # NODE 2: ACOUSTIC MIXTURE
         # ---------------------------------------------------------
         if recalc_mixture:
             tqdm.write(f" -> [NODE 2] Applying acoustic mixture (iSIR = {exp['isir_db']} dB)...")
@@ -220,11 +210,12 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             current_isir_db = exp['isir_db']
             scene_base_config['VAD'] = scene_data["VAD"]
             
-        target_anechoic = scene_data["target_early"] + scene_data["target_late"]
+        # Updated Ground Truth: strictly evaluating against the coherent early speech arrival
+        target_reference = scene_data["target_early"]
         unprocessed_mic_signals = scene_data["mic_signals"]
 
         # ---------------------------------------------------------
-        # NODE 3: HARDWARE EMULATION & BASELINE (Lightweight)
+        # NODE 3: HARDWARE EMULATION & BASELINE
         # ---------------------------------------------------------
         if recalc_hardware:
             tqdm.write(f" -> [NODE 3] Emulating hardware (Gain: {exp['mismatch_gain']}dB, Phase: {exp['mismatch_phase']}deg)...")
@@ -234,13 +225,14 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             mic_signals_degraded = mic_simulator.emulate(unprocessed_mic_signals)
             current_gain_mismatch, current_phase_mismatch = exp['mismatch_gain'], exp['mismatch_phase']
 
-            # Evaluate baseline against the degraded signal before any processing
             tqdm.write(" -> Evaluating Baseline Metrics...")
             baseline_metrics = evaluate_full_pipeline(
-                ref_sig=target_anechoic[0],
-                deg_sig=mic_signals_degraded[0], # Fixed: Now using the strictly degraded signal
+                ref_sig=target_reference[0],
+                deg_sig=mic_signals_degraded[0], 
                 fs=scene_base_config['fs'],
-                interf_sig=scene_data["interference_early"][0],
+                interf_early=scene_data["interference_early"][0],
+                interf_late=scene_data["interference_late"][0],
+                target_late=scene_data["target_late"][0],
                 compute_pesq=True,
                 compute_cd=True,
                 eval_start_s=eval_start_s,
@@ -248,7 +240,7 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             )
 
         # ---------------------------------------------------------
-        # NODE 4: PRE-PROCESSING 
+        # NODE 4: WPE PRE-PROCESSING 
         # ---------------------------------------------------------
         if recalc_wpe:
             if exp['use_wpe']:
@@ -258,26 +250,41 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                     alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'], stft_shift=scene_base_config['wpe_stft_shift']
                 )
                 
-                # Evaluar métricas a la salida del WPE (Solo se calcula una vez por bloque de caché)
                 tqdm.write(" -> Evaluating WPE Metrics...")
                 wpe_metrics = evaluate_full_pipeline(
-                    ref_sig=target_anechoic[0],
-                    deg_sig=mic_signals_ready[0],
-                    fs=scene_base_config['fs'],
-                    interf_sig=scene_data["interference_early"][0],
-                    compute_pesq=True,
-                    compute_cd=True,
-                    eval_start_s=eval_start_s,
-                    inspection_name=f"WPE_Exp_{i}"
+                    ref_sig=target_reference[0], deg_sig=mic_signals_ready[0], fs=scene_base_config['fs'],
+                    interf_early=scene_data["interference_early"][0],
+                    interf_late=scene_data["interference_late"][0],
+                    target_late=scene_data["target_late"][0],
+                    compute_pesq=True, compute_cd=True,
+                    eval_start_s=eval_start_s, inspection_name=f"WPE_Exp_{i}"
                 )
             else:
                 tqdm.write(" -> [NODE 4] Bypassing WPE pre-processing...")
                 mic_signals_ready = mic_signals_degraded.copy()
-                wpe_metrics = baseline_metrics.copy() # Si no hay WPE, la salida es el baseline
+                wpe_metrics = baseline_metrics.copy() 
             
             current_use_wpe = exp['use_wpe']
+
+            # ---------------------------------------------------------
+            # NODE 4.5: SINGLE-MIC DTLN
+            # ---------------------------------------------------------
+            if use_dtln:
+                tqdm.write(" -> [NODE 4.5] Applying DTLN to reference microphone...")
+                audio_dtln_alone = apply_dtln_post_tflite_realtime(
+                    interpreter_1=interpreter_1, interpreter_2=interpreter_2, 
+                    audio_mono=mic_signals_ready[0]
+                )
+                dtln_alone_metrics = evaluate_full_pipeline(
+                    ref_sig=target_reference[0], deg_sig=audio_dtln_alone, fs=scene_base_config['fs'],
+                    interf_early=scene_data["interference_early"][0],
+                    interf_late=scene_data["interference_late"][0],
+                    target_late=scene_data["target_late"][0],
+                    compute_pesq=True, compute_cd=True,
+                    eval_start_s=eval_start_s, inspection_name=f"DTLN_Alone_Exp_{i}"
+                )
         else:
-            tqdm.write(" -> [CACHE] Reusing previous WPE state and metrics.")
+            tqdm.write(" -> [CACHE] Reusing previous WPE & Single-Mic DTLN state.")
         
         # ---------------------------------------------------------
         # NODE 5: SIGNAL PROCESSING AND EVALUATION
@@ -289,49 +296,71 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             y_processed, weights = processor.process(mic_signals_ready, scene_base_config)
             proc_time = time.time() - t0
             
-            # Evaluate the processed signal
             proc_metrics = evaluate_full_pipeline(
-                ref_sig=target_anechoic[0],
-                deg_sig=y_processed,
-                fs=scene_base_config['fs'],
-                interf_sig=scene_data["interference_early"][0],
-                compute_pesq=True,
-                compute_cd=True,
-                eval_start_s=eval_start_s,
-                inspection_name=f"Proc_{proc_name}_Exp_{i}"
+                ref_sig=target_reference[0], deg_sig=y_processed, fs=scene_base_config['fs'],
+                interf_early=scene_data["interference_early"][0],
+                interf_late=scene_data["interference_late"][0],
+                target_late=scene_data["target_late"][0],
+                compute_pesq=True, compute_cd=True,
+                eval_start_s=eval_start_s, inspection_name=f"Proc_{proc_name}_Exp_{i}"
             )
             
-            # Calculate 3-stage Deltas
-            delta_wpe_metrics = {f"Delta_wpe_{k}": (wpe_metrics.get(k, np.nan) - baseline_metrics.get(k, np.nan)) for k in proc_metrics.keys()}
-            delta_bf_metrics  = {f"Delta_bf_{k}": (proc_metrics.get(k, np.nan) - wpe_metrics.get(k, np.nan)) for k in proc_metrics.keys()}
-            delta_tot_metrics = {f"Delta_tot_{k}": (proc_metrics.get(k, np.nan) - baseline_metrics.get(k, np.nan)) for k in proc_metrics.keys()}
-            
+            # ---------------------------------------------------------
+            # NODE 6: POST-BEAMFORMING DTLN
+            # ---------------------------------------------------------
+            y_post_dtln = None
+            dtln_post_metrics = {}
+            if use_dtln:
+                tqdm.write(f"   -> [NODE 6] Applying DTLN post {proc_name}...")
+                y_post_dtln = apply_dtln_post_tflite_realtime(
+                    interpreter_1=interpreter_1, interpreter_2=interpreter_2, 
+                    audio_mono=y_processed
+                )
+                dtln_post_metrics = evaluate_full_pipeline(
+                    ref_sig=target_reference[0], deg_sig=y_post_dtln, fs=scene_base_config['fs'],
+                    interf_early=scene_data["interference_early"][0],
+                    interf_late=scene_data["interference_late"][0],
+                    target_late=scene_data["target_late"][0],
+                    compute_pesq=True, compute_cd=True,
+                    eval_start_s=eval_start_s, inspection_name=f"DTLN_Post_{proc_name}_Exp_{i}"
+                )
+
             # Compile Dataset Row
             row_data = {
                 "processor": proc_name,
                 "rt60": exp['rt60'], "M": exp['M'], "N_interferences": exp['N_interferences'], 
                 "mismatch_pos": exp['mismatch_pos'], "isir_db": exp['isir_db'],
                 "mismatch_gain": exp['mismatch_gain'], "mismatch_phase": exp['mismatch_phase'],
-                "use_wpe": exp['use_wpe'], "exec_time_s": proc_time,
+                "use_wpe": exp['use_wpe'], "t_early_s": t_early_dynamic, "exec_time_s": proc_time,
             }
-            # Append dynamic metrics to row
+            
+            # Append absolute metrics
             row_data.update({f"base_{k}": v for k, v in baseline_metrics.items()})
             row_data.update({f"wpe_{k}": v for k, v in wpe_metrics.items()})
             row_data.update({f"proc_{k}": v for k, v in proc_metrics.items()})
-            row_data.update(delta_wpe_metrics)
-            row_data.update(delta_bf_metrics)
+            
+            # Calculate and append standard 3-stage Deltas
+            delta_tot_metrics = {f"Delta_tot_{k}": (proc_metrics.get(k, np.nan) - baseline_metrics.get(k, np.nan)) for k in proc_metrics.keys()}
+            row_data.update({f"Delta_wpe_{k}": (wpe_metrics.get(k, np.nan) - baseline_metrics.get(k, np.nan)) for k in proc_metrics.keys()})
+            row_data.update({f"Delta_bf_{k}": (proc_metrics.get(k, np.nan) - wpe_metrics.get(k, np.nan)) for k in proc_metrics.keys()})
             row_data.update(delta_tot_metrics)
+            
+            # Calculate and append DTLN Deltas if active
+            if use_dtln:
+                row_data.update({f"dtln_alone_{k}": v for k, v in dtln_alone_metrics.items()})
+                row_data.update({f"dtln_post_{k}": v for k, v in dtln_post_metrics.items()})
+                
+                row_data.update({f"Delta_dtln_alone_{k}": (dtln_alone_metrics.get(k, np.nan) - wpe_metrics.get(k, np.nan)) for k in proc_metrics.keys()})
+                row_data.update({f"Delta_dtln_post_{k}": (dtln_post_metrics.get(k, np.nan) - proc_metrics.get(k, np.nan)) for k in proc_metrics.keys()})
+                row_data.update({f"Delta_tot_pipeline_{k}": (dtln_post_metrics.get(k, np.nan) - baseline_metrics.get(k, np.nan)) for k in proc_metrics.keys()})
             
             all_metrics_results.append(row_data)
 
-           # --- TOP-K / BOTTOM-K CHECKPOINTING ---
+            # --- TOP-K / BOTTOM-K CHECKPOINTING ---
             for m_name in tracked_metrics:
-                # Obtenemos el delta correspondiente (usando delta_tot_metrics)
                 current_val = delta_tot_metrics.get(m_name, np.nan)
-
                 if np.isnan(current_val): continue
                 
-                # Lógica para determinar si es récord (CD es menor=mejor, el resto mayor=mejor)
                 is_best = current_val > leaderboard[proc_name][m_name]["best_val"] if m_name != "Delta_tot_CD" else current_val < leaderboard[proc_name][m_name]["best_val"]
                 is_worst = current_val < leaderboard[proc_name][m_name]["worst_val"] if m_name != "Delta_tot_CD" else current_val > leaderboard[proc_name][m_name]["worst_val"]
                 
@@ -339,17 +368,18 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                     leaderboard[proc_name][m_name]["best_val"] = current_val
                     save_extreme_case_to_master(master_h5, proc_name, m_name, "best_case", 
                                                 processor, mic_signals_ready, y_processed, 
-                                                target_anechoic, weights, exp, row_data, 
-                                                scene_base_config, current_room_dims)
+                                                target_reference, weights, exp, row_data, 
+                                                scene_base_config, current_room_dims,
+                                                audio_dtln_alone, y_post_dtln)
                 
                 if is_worst:
                     leaderboard[proc_name][m_name]["worst_val"] = current_val
                     save_extreme_case_to_master(master_h5, proc_name, m_name, "worst_case", 
                                                 processor, mic_signals_ready, y_processed, 
-                                                target_anechoic, weights, exp, row_data, 
-                                                scene_base_config, current_room_dims)
+                                                target_reference, weights, exp, row_data, 
+                                                scene_base_config, current_room_dims,
+                                                audio_dtln_alone, y_post_dtln)
 
-    # Finalization
     tqdm.write(f"\n=== BATCH COMPLETED IN {(time.time() - start_total_time)/60:.2f} MINUTES ===")
     df_results = pd.DataFrame(all_metrics_results)
     parquet_path = os.path.join(output_dir, "benchmark_metrics.parquet")
@@ -359,16 +389,26 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
 
 
 if __name__ == "__main__":
-    # 1. Perfil de sala reducido a una sola opción
+    
+    try:
+        interpreter_1 = tf.lite.Interpreter(model_path="data/dnn_models/model_1.tflite")
+        interpreter_1.allocate_tensors()
+        
+        interpreter_2 = tf.lite.Interpreter(model_path="data/dnn_models/model_2.tflite")
+        interpreter_2.allocate_tensors()
+        print("[*] DTLN TF-Lite interpreters successfully allocated.")
+    except Exception as e:
+        print(f"[!] Warning: Could not initialize DTLN models automatically. Running without neural enhancement. Details: {e}")
+        interpreter_1, interpreter_2 = None, None
+
     ROOM_PROFILES = {
         0.3: np.array([3.0, 4.0, 2.5])
     }
 
-    # 2. Configuración base optimizada para velocidad (solo 6 segundos)
     base_config = {
         'fs': 16000,
-        'duration': 10, # Reducido para acelerar el test
-        'd_min': 0.04,
+        'duration': 15, 
+        'd_min': 0.02,
         'd_max': 0.30,
         'radius_source': .6,    
         'radius_interf': 1.2,    
@@ -378,45 +418,46 @@ if __name__ == "__main__":
         'interf_paths': [
             "data/audio/input/hairdryer_07_SH_MKH800.wav"
         ],
-        # Fixed WPE Parameters
-        'wpe_taps': 12,
-        'wpe_delay': 1,
+        'wpe_taps': 7,
+        'wpe_delay': 3,
         'wpe_alpha': 0.9999,
         'wpe_stft_size': 512,
         'wpe_stft_shift': 128
     }
 
-    # 3. Grid de parámetros minimizado a solo 2 combinaciones
     param_grid = {
         'rt60': [0.3], 
-        'M': [4],                
+        'M': [6],                
         'N_interferences': [1],      
         'mismatch_pos': [0.0],       
         'isir_db': [0],         
         'mismatch_gain': [0],     
         'mismatch_phase': [0],    
-        'use_wpe': [False, True]  # Evaluar con y sin WPE
+        'use_wpe': [False] 
     }
 
-    # 4. Instanciar el Delay-and-Sum y el MVDR
     processors_dict = {
         "DS": DS_Processor(),
-        "MVDR": MVDR_Recursive_Processor(min_loading=1e-6)
+        "MVDR": MVDR_Recursive_Processor(min_loading=1e-6),
+        "SPP-MVDR": SPP_MVDR_Recursive_Processor(min_loading=1e-6)
     }
 
-    # 5. Ejecutar la búsqueda y guardar en una carpeta separada
     df_final = run_grid_search(
         grid_params=param_grid, 
         room_profiles=ROOM_PROFILES, 
         processors=processors_dict, 
         scene_base_config=base_config, 
-        output_dir="tests/dataset_out/quick_test"
+        output_dir="tests/dataset_out/quick_test",
+        interpreter_1=interpreter_1, 
+        interpreter_2=interpreter_2  
     )
     
-    # 6. Mostrar el resumen para verificar la lógica de los 3 Deltas
     print("\n[Preview] Quick Test Results:")
-    cols_to_show = ["processor", "use_wpe", "Delta_wpe_PESQ", "Delta_bf_PESQ", "Delta_tot_PESQ", "Delta_tot_SDR"]
     
-    # Evitar errores si alguna columna no se generó
+    cols_to_show = [
+        "processor", "use_wpe", "t_early_s",
+        "Delta_tot_PESQ", "Delta_tot_SIR", "Delta_tot_SINR"
+    ]
+    
     cols_exist = [c for c in cols_to_show if c in df_final.columns]
     print(df_final[cols_exist].to_string(index=False))

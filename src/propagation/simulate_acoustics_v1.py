@@ -5,7 +5,6 @@ from utils.audio import load_audio_source, save_wav
 from propagation.free_field import space_delay
 import pyroomacoustics as pra
 from scipy.spatial.distance import pdist
-import numpy as np
 
 
 def split_rir_early_late(rir_vector, fs, t_early=0.050):
@@ -151,83 +150,154 @@ class SimAcoustic():
 
 
     def compute_rirs(self, room_dimensions, desire_RT=0.0, ray_tracing=False):
-            """
-            Generates the acoustic environment and computes the Room Impulse Responses (RIRs).
-            If desire_RT is 0.0 or less, it simulates an anechoic chamber (free field) 
-            by forcing the maximum image source order to 0.
-            """
-            # Determine absorption and maximum order based on the desired reverberation time
-            if desire_RT <= 0.0:
-                # Anechoic setup (Free Field)
-                alpha = 1.0
-                max_order = 0
-                material = pra.Material(alpha)
-                
-                # Disable ray tracing for pure anechoic conditions to save processing time
+        """
+        Generates the acoustic environment and computes the Room Impulse Responses (RIRs).
+        If desire_RT is 0.0 or less, it simulates an anechoic chamber (free field) 
+        by forcing the maximum image source order to 0.
+        """
+        # Determine absorption and maximum order based on the desired reverberation time
+        if desire_RT <= 0.0:
+            # Anechoic setup (Free Field)
+            alpha = 1.0
+            max_order = 0
+            material = pra.Material(alpha)
+            
+            # Disable ray tracing for pure anechoic conditions to save processing time
+            room = pra.ShoeBox(
+                room_dimensions, 
+                self.fs, 
+                materials=material, 
+                max_order=max_order,
+                ray_tracing=False
+            )
+            print("[SimAcoustic] Mode: Anechoic Chamber (Free Field)")
+            
+        else:
+            # Reverberant setup using Sabine's formula
+            alpha, max_order = pra.inverse_sabine(desire_RT, room_dimensions)
+            
+            if ray_tracing:
+                # Obtain minimum distance between sensors to optimize ray tracing radius
+                distances = pdist(self.real_array)
+                min_spacing = np.min(distances[distances > 0])
+
+                # Get optimal settings for hybrid simulation
+                params_dic = get_hybrid_sim_params(room_dimensions, min_spacing, t_mix=0.06)
+                max_order = params_dic["max_order"]
+
+                material = pra.Material(alpha, scattering=0.2)        
+                room = pra.ShoeBox(
+                    room_dimensions, 
+                    self.fs, 
+                    materials=material,
+                    max_order=max_order,
+                    ray_tracing=True,
+                )
+                room.set_ray_tracing(**params_dic["ray_tracing"])
+                print(f"[SimAcoustic] Mode: Hybrid ISM+RT (RT60 = {desire_RT}s)")
+            else:
+                # Pure ISM simulation
+                material = pra.Material(alpha)        
                 room = pra.ShoeBox(
                     room_dimensions, 
                     self.fs, 
                     materials=material, 
-                    max_order=max_order,
-                    ray_tracing=False
+                    max_order=max_order
                 )
-                print("[SimAcoustic] Mode: Anechoic Chamber (Free Field)")
-                
-            else:
-                # Reverberant setup using Sabine's formula
-                alpha, max_order = pra.inverse_sabine(desire_RT, room_dimensions)
-                
-                if ray_tracing:
-                    # Obtain minimum distance between sensors to optimize ray tracing radius
-                    distances = pdist(self.real_array)
-                    min_spacing = np.min(distances[distances > 0])
+                print(f"[SimAcoustic] Mode: Pure ISM (RT60 = {desire_RT}s)")
 
-                    # Get optimal settings for hybrid simulation
-                    params_dic = get_hybrid_sim_params(room_dimensions, min_spacing, t_mix=0.06)
-                    max_order = params_dic["max_order"]
+        # Add target source to the room
+        source_pos = self.audio_sources[0]["position"] 
+        room.add_source(source_pos.T)
+        
+        # Add all interference sources to the room
+        for interference in self.audio_interferences:
+            room.add_source(interference["position"].T)
 
-                    material = pra.Material(alpha, scattering=0.2)        
-                    room = pra.ShoeBox(
-                        room_dimensions, 
-                        self.fs, 
-                        materials=material,
-                        max_order=max_order,
-                        ray_tracing=True,
-                    )
-                    room.set_ray_tracing(**params_dic["ray_tracing"])
-                    print(f"[SimAcoustic] Mode: Hybrid ISM+RT (RT60 = {desire_RT}s)")
+        # Add microphone array 
+        # Note: We use the real array geometry to capture spatial mismatches accurately
+        room.add_microphone_array(self.real_array.T)
+
+        # Compute and extract the Room Impulse Responses
+        room.compute_rir()
+        
+        # Store the RIRs as a class attribute for later convolution and mixing stages
+        # room.rir structure: list of lists -> room.rir[mic_index][source_index]
+        self.rirs = room.rir
+        
+        print("[SimAcoustic] RIRs successfully computed and stored in 'self.rirs'.")
+            
+    def import_rirs(self, dataset_provider, target_t60, array_center=[3.0, 3.0, 1.2], spacing_cfg="4-4-4-8-4-4-4"):
+        """
+        Imports real measured Room Impulse Responses from the MIRD dataset.
+        Applies strict native polyphase resampling to perfectly map the physical 
+        acoustic propagation delays to the target simulation sampling frequency.
+        """
+        import scipy.signal as signal
+        
+        center_vec = np.array(array_center, dtype=float).squeeze()
+        
+        def resolve_grid_mapping(abs_pos):
+            # Compute relative translation vector from array center to target source
+            rel_vec = np.array(abs_pos, dtype=float).squeeze() - center_vec
+            
+            # Derive relative distance in the horizontal plane
+            r_calc = np.linalg.norm(rel_vec[:2])
+            dist_key = 1.0 if r_calc < 1.5 else 2.0
+            
+            # Derive logical incidence azimuth angle and snap to nearest 15-degree step
+            az_deg = np.rad2deg(np.arctan2(rel_vec[1], rel_vec[0]))
+            angle_key = int(round(az_deg / 15.0) * 15)
+            
+            return dist_key, angle_key
+
+        extracted_matrices = []
+        
+        # Process Target Source (Index 0)
+        t_dist, t_angle = resolve_grid_mapping(self.audio_sources[0]["position"])
+        print(f"[SimAcoustic: MIRD] Mapping Target Source -> Snapped to Grid: Dist={t_dist}m, Angle={t_angle}°")
+        extracted_matrices.append(dataset_provider.load_rir(target_t60, spacing_cfg, t_dist, t_angle))
+
+        # Process sequential Interference Sources
+        for idx, interf in enumerate(self.audio_interferences):
+            i_dist, i_angle = resolve_grid_mapping(interf["position"])
+            print(f"[SimAcoustic: MIRD] Mapping Interf #{idx+1} -> Snapped to Grid: Dist={i_dist}m, Angle={i_angle}°")
+            extracted_matrices.append(dataset_provider.load_rir(target_t60, spacing_cfg, i_dist, i_angle))
+
+        # Retrieve native dataset physical sampling rate securely cached by the loader
+        native_fs = dataset_provider.get_current_fs()
+        
+        # Determine multi-rate polyphase resampling integer ratios
+        if native_fs != self.fs:
+            print(f"[SimAcoustic] Triggering high-fidelity RIR resampling: {native_fs} Hz -> {self.fs} Hz")
+            gcd_val = np.gcd(self.fs, native_fs)
+            up_factor = self.fs // gcd_val
+            down_factor = native_fs // gcd_val
+        else:
+            up_factor, down_factor = 1, 1
+
+        # CÓDIGO CORREGIDO EN import_rirs
+        self.rirs = []
+        for m in range(self.M):
+            sensor_responses = []
+            for mat in extracted_matrices:
+                # Aseguramos que la matriz RIR tenga forma (M, N_samples)
+                mat_arr = np.atleast_2d(mat) 
+                
+                # Extraemos estrictamente la fila correspondiente al micrófono actual 'm'
+                raw_rir_channel = mat_arr[m, :].flatten()
+                
+                if native_fs != self.fs:
+                    resampled_rir = signal.resample_poly(raw_rir_channel, up_factor, down_factor)
                 else:
-                    # Pure ISM simulation
-                    material = pra.Material(alpha)        
-                    room = pra.ShoeBox(
-                        room_dimensions, 
-                        self.fs, 
-                        materials=material, 
-                        max_order=max_order
-                    )
-                    print(f"[SimAcoustic] Mode: Pure ISM (RT60 = {desire_RT}s)")
+                    resampled_rir = raw_rir_channel
+                    
+                sensor_responses.append(resampled_rir)
+            self.rirs.append(sensor_responses)
 
-            # Add target source to the room
-            source_pos = self.audio_sources[0]["position"] 
-            room.add_source(source_pos.T)
-            
-            # Add all interference sources to the room
-            for interference in self.audio_interferences:
-                room.add_source(interference["position"].T)
-
-            # Add microphone array 
-            # Note: We use the real array geometry to capture spatial mismatches accurately
-            room.add_microphone_array(self.real_array.T)
-
-            # Compute and extract the Room Impulse Responses
-            room.compute_rir()
-            
-            # Store the RIRs as a class attribute for later convolution and mixing stages
-            # room.rir structure: list of lists -> room.rir[mic_index][source_index]
-            self.rirs = room.rir
-            
-            print("[SimAcoustic] RIRs successfully computed and stored in 'self.rirs'.")
-
+        print(f"[SimAcoustic] Successfully loaded and synchronized real dataset environment spanning {self.M} sensor channels.")
+        
+    
     def _split_rir(self, rir_vector, t_early=0.050):
         # Find the index of the direct path arrival
         peak_idx = np.argmax(np.abs(rir_vector))
@@ -394,8 +464,6 @@ class SimAcoustic():
             "interference_late": interf_late,      
             "VAD": vad_oracle
         }
-
-
 
 if __name__ == "__main__":
 

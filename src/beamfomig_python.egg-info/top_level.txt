@@ -1,4 +1,6 @@
 beamforming
+dereverberation
+dnn_denoise
 evaluation
 propagation
 utils

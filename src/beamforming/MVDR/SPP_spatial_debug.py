@@ -16,7 +16,7 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
     frecs = np.linspace(0, fs/2, K)
 
     # Get steering vectors, expected shape (K, M)
-    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="near_field", squeeze=True)
+    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="far_field", squeeze=True)
     
     # Initialize output complex STFT matrices
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -31,54 +31,43 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
     R_ss_init = phi_s * np.einsum("fm,fn->fmn", sv, sv.conj())
     R_xx = R_ss_init + R_nn
 
+
     # Initialize the inverse of R_nn for the first frame's SPP calculation
-    # We use min_loading here to prevent singularities at t=0
     initial_diag_load = np.tile(np.eye(M, dtype=np.complex128) * min_loading, (K, 1, 1))
     R_nn_inv = np.linalg.inv(R_nn + initial_diag_load)
 
-    # SPP Hyperparameters
-    # Threshold for spatial SNR (gamma). 3.0 linear is approx 4.7 dB
-    gamma_th = 8  # Set to 3
-    spp_slope = 5 # Set to 2
+    # SPP Hyperparameters (May need slight tuning for spectral energy)
+    gamma_th = 6
+    spp_slope = 6
 
-    # Weights recording initialization
     weights_rec = np.zeros((K, T, M), dtype=np.complex128)
 
     for m in range(T):
-        # Extract the current frame across all frequencies, shape (K, M)
         X_frame = X_stft[:, m, :]
 
-        # --- 1. Calculate A Posteriori Spatial SNR (gamma) ---
-        # Evaluate the current frame against the prior noise spatial structure
-        
-        # Numerator: |v^H * R_nn_inv * x|^2
-        R_nn_inv_x = np.einsum("fmn,fn->fm", R_nn_inv, X_frame)
-        num_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_x)
+        # --- 1. Calculate Robust A Posteriori Spatial SNR (gamma) ---
+        # Numerator: output power of a conventional matched filter (Delay-and-Sum)
+        num_complex = np.einsum("fm,fm->f", sv.conj(), X_frame)
         num = np.abs(num_complex)**2
         
-        # Denominator: v^H * R_nn_inv * v (represents noise power at output)
-        R_nn_inv_v = np.einsum("fmn,fn->fm", R_nn_inv, sv)
-        den_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_v)
-        den = np.real(den_complex) # Guaranteed to be real 
+        # Denominator: array gain times instantaneous average frame power
+        v_norm = np.real(np.einsum("fm,fm->f", sv.conj(), sv))
+        frame_power = np.real(np.einsum("fm,fm->f", X_frame.conj(), X_frame)) / M
+        den = v_norm * frame_power
         
-        # Calculate gamma for all frequencies
+        # Calculate decoupled gamma
         gamma = num / (den + 1e-10)
 
-        # --- 2. Map Gamma to Spatial Presence Probability (SPP) ---
-        # Using a sigmoid function to map SNR to a probability [0, 1]
+        # --- 2. Map Gamma to Speech Presence Probability (SPP) ---
         P = 1.0 / (1.0 + np.exp(-spp_slope * (gamma - gamma_th)))
         
-        # Clip probabilities to prevent matrices from completely freezing
-        P = np.clip(P, 0.05, 0.95)
         P_expand = P[:, np.newaxis, np.newaxis]
-
-        # Apply the SPP mask directly to the reference microphone (mic index 0)
         Y_spp_stft[:, m] = P * X_frame[:, 0]
 
-        # --- 3. Update Covariance Matrices ---
-        # Calculate instantaneous covariance of the observation
+        # --- 3. Update Covariance Matrices (Remains unchanged) ---
         R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
-        
+
+        # ... (Rest of your loop remains exactly the same) ...
         # Update R_xx weighted by the probability of target speech presence
         R_xx = lamda * R_xx + (1 - lamda) * P_expand * R_instant
         
@@ -176,7 +165,7 @@ if __name__ == "__main__":
     
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
     
-    output_folder = "tests/data/mvdr_SPP_spatial_debug_output"
+    output_folder = "tests/data/mvdr_SPP_mono_debug_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Create logarithmic spacing for the microphone array
@@ -203,13 +192,12 @@ if __name__ == "__main__":
     interf_pos2 = array_center + np.array([r * np.cos(ang_interf2), r * np.sin(ang_interf2), 0.0])
     source_pos_2d = source_pos.reshape(1, 3)
 
-    print(" -> Initializing acoustic scene...")
+    print(" -> Initializing 16kHz acoustic scene...")
     acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=15, fs=FS)
-    acoustic_scene.set_source(r"tools\data\signals\p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
-    acoustic_scene.set_interference(r"tools\data\signals\p011_emo_anger_sentences.wav", gain=1, position=interf_pos1.reshape(1,3))
-    acoustic_scene.set_interference(r"tools\data\signals\hairdryer_07_SH_MKH800.wav", gain=1, position=interf_pos1.reshape(1,3))
+    acoustic_scene.set_source(r"data/audio/input/p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
+    acoustic_scene.set_interference(r"data/audio/input/hairdryer_07_SH_MKH800.wav", gain=1, position=interf_pos1.reshape(1,3))
     
-    # -------------------------------------------------------------------
+    # ------------------# -------------------------------------------------------------------
     # PHASE 1: FREE FIELD SIMULATION (Anechoic)
     # -------------------------------------------------------------------
     cache_ff_path = os.path.join(output_folder, "cache_free_field.npz")

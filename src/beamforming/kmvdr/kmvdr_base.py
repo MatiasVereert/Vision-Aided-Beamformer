@@ -14,7 +14,7 @@ import scipy.signal as signal
 from beamforming.signal_model import compute_rtf_steering_vector
 
 def KMVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, M1, M2, P=2, 
-                    alpha=0.95, ALS_iterations=2, beta=1e-3, min_loading=1e-6, 
+                    alpha=0.95, ALS_iterations=2, beta=1e-2, min_loading=1e-6, 
                     length_fft=512, hop_length_fft=256, save_weights=False):
     """
     Functional implementation of the Kronecker MVDR beamformer.

@@ -140,6 +140,9 @@ def near_field_steering_vector(f, Rs, fs, mic_array, K=1, c=speed_of_sound, norm
 
     return steering_vector_flat
 
+import numpy as np
+
+
 def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="near_field", squeeze=True):
     """
     Computes the Relative Transfer Function (RTF) steering vector in the frequency domain.
@@ -185,5 +188,3 @@ def compute_rtf_steering_vector(f, Rs, mic_array, ref_mic_idx=0, c=343.0, mode="
         rtf_vector = np.squeeze(rtf_vector)
 
     return rtf_vector
-
-

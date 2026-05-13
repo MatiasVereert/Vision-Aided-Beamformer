@@ -6,17 +6,45 @@ src/beamfomig_python.egg-info/dependency_links.txt
 src/beamfomig_python.egg-info/requires.txt
 src/beamfomig_python.egg-info/top_level.txt
 src/beamforming/__init__.py
-src/beamforming/processors.py
 src/beamforming/signal_model.py
-src/beamforming/MPDRxWPE/MPDRxWPE copy 2.py
-src/beamforming/MPDRxWPE/MPDRxWPE copy 3.py
+src/beamforming/GEV/SPP.py
 src/beamforming/MPDRxWPE/MPDRxWPE.py
-src/beamforming/MPDRxWPE/MPDRxWPE_1.py
 src/beamforming/MPDRxWPE/WPE-MPDRxWPE copy.py
 src/beamforming/MPDRxWPE/WPE-MPDRxWPE.py
 src/beamforming/MPDRxWPE/WPE-MPDRxWPE_vs_MWF.py
 src/beamforming/MPDRxWPE/__init__.py
+src/beamforming/MPDRxWPE/mpdr.py
 src/beamforming/MPDRxWPE/signal_model.py
+src/beamforming/MVDR/RTF_and_VAD_estimation.py
+src/beamforming/MVDR/RTF_estimation copy.py
+src/beamforming/MVDR/RTF_estimation.py
+src/beamforming/MVDR/RTF_estimation_and_spatial_reg.py
+src/beamforming/MVDR/SPP CGMM.py
+src/beamforming/MVDR/SPP RTF.py
+src/beamforming/MVDR/SPP RTF_noise copy.py
+src/beamforming/MVDR/SPP RTF_noise.py
+src/beamforming/MVDR/SPP RTG copy.py
+src/beamforming/MVDR/SPP copy.py
+src/beamforming/MVDR/SPP.py
+src/beamforming/MVDR/SPP_debug.py
+src/beamforming/MVDR/SPP_dnn copy.py
+src/beamforming/MVDR/SPP_dnn.py
+src/beamforming/MVDR/SPP_spatial_debug with_post.py
+src/beamforming/MVDR/SPP_spatial_debug with_post_over_sampling difuse.py
+src/beamforming/MVDR/SPP_spatial_debug with_post_over_sampling.py
+src/beamforming/MVDR/SPP_spatial_debug.py
+src/beamforming/MVDR/TF-MVDR_SPP.py
+src/beamforming/MVDR/__init__.py
+src/beamforming/MVDR/base SPP RTF noise.py
+src/beamforming/MVDR/base SPP RTF.py
+src/beamforming/MVDR/base SPP copy.py
+src/beamforming/MVDR/base.py
+src/beamforming/MWF/SP_SDW_MWF_base.py
+src/beamforming/MWF/WPE_SP_SDW_MWF copy.py
+src/beamforming/MWF/__init__.py
+src/beamforming/MWF/onlineMWF.py
+src/beamforming/PMWF/__init__.py
+src/beamforming/PMWF/pmwf.py
 src/beamforming/WPE-IVE/WPExSRIVE copy 2.py
 src/beamforming/WPE-IVE/WPExSRIVE copy.py
 src/beamforming/WPE-IVE/WPExSRIVE.py
@@ -25,33 +53,42 @@ src/beamforming/WPE-IVE/ive_anechoic.py
 src/beamforming/WPE-IVE/ive_pipeline.py
 src/beamforming/WPE-IVE/semi_ive_anechoic copy.py
 src/beamforming/WPE-IVE/semi_ive_anechoic.py
+src/beamforming/array/geometry.py
 src/beamforming/array/mic_array.py
 src/beamforming/array/microphone.py
-src/beamforming/dereverberation/__init__.py
-src/beamforming/dereverberation/gwpe.py
-src/beamforming/dereverberation/kwpe.py
-src/beamforming/dereverberation/wpe.py
+src/beamforming/cgmm/__init__.py
+src/beamforming/cgmm/cgmm.py
+src/beamforming/cgmm/test.py
 src/beamforming/evaluation/__init__.py
 src/beamforming/evaluation/array_sensitivity_gain.py
 src/beamforming/evaluation/gain.py
 src/beamforming/kmvdr/__init__.py
-src/beamforming/kmvdr/system copy 2.py
-src/beamforming/kmvdr/system copy.py
-src/beamforming/kmvdr/system.py
-src/beamforming/kmvdr/dev_tests/MVDR.py
-src/beamforming/kmvdr/dev_tests/adaptive_far_field.py
-src/beamforming/kmvdr/dev_tests/adaptive_near_field.py
-src/beamforming/kmvdr/dev_tests/adaptive_nearfield_voice.py
-src/beamforming/kmvdr/dev_tests/narrow_adaptive.py
-src/beamforming/kmvdr/dev_tests/narrow_adaptive_v1.py
-src/beamforming/kmvdr/dev_tests/narrow_fix.py
+src/beamforming/kmvdr/kmvdr_base.py
+src/beamforming/mask/NSNet2 blind.py
+src/beamforming/mask/NSNet2 copy.py
+src/beamforming/mask/NSNet2.py
+src/beamforming/mask/__init__.py
+src/beamforming/mask/deep_filt_MVDR.py
+src/beamforming/mask/neural_MVDR.py
+src/dereverberation/__init__.py
+src/dereverberation/nara_wrappers.py
+src/dnn_denoise/deepfilternet.py
+src/dnn_denoise/dtln_lite.py
+src/dnn_denoise/real_time_processing_tf_lite (1).py
 src/evaluation/__init__.py
-src/evaluation/evalualuate.py
+src/evaluation/bf_wrappers.py
+src/evaluation/dashboard copy.py
+src/evaluation/dashboard.py
+src/evaluation/evaluate.py
+src/evaluation/full_benchmark.py
+src/evaluation/full_benchmark_test_1.py
+src/evaluation/full_benchmark_test_2.py
 src/evaluation/metrics.py
+src/evaluation/polar_plots.py
 src/propagation/__init__.py
 src/propagation/free_field.py
-src/propagation/room_convolution.py
 src/propagation/simulate_acoustics.py
+src/propagation/simulate_acoustics_v1.py
 src/utils/__init__.py
 src/utils/audio.py
 src/utils/data_loader.py

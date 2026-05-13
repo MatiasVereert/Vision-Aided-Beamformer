@@ -8,181 +8,182 @@ from utils.audio import normalize_signal, save_wav
 from propagation.simulate_acoustics import SimAcoustic
 from dereverberation.nara_wrappers import process_wpe_online
 
-
-# Note: On the Kria KV260, you will likely replace the above with:
-# import tflite_runtime.interpreter as tflite
-import numpy as np
+# Import standard DeepFilterNet enhance function
 import tensorflow as tf
+from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
 
+import numpy as np
+import os
+import numpy as np 
+import scipy.signal as signal
 
-def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono, blend_alpha=0.95):
+# Assuming the imports work correctly in your local environment
+from beamforming.signal_model import compute_rtf_steering_vector
+from utils.audio import normalize_signal, save_wav
+from propagation.simulate_acoustics import SimAcoustic
+from dereverberation.nara_wrappers import process_wpe_online
+
+# Import standard DeepFilterNet enhance function
+import tensorflow as tf
+from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
+
+import numpy as np
+import scipy.signal as signal
+
+# Assuming imports from your environment exist
+from beamforming.signal_model import compute_rtf_steering_vector
+from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
+
+def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, interpreter_1, interpreter_2, 
+                       beta=1e-3, min_loading=1e-6, save_weights=False, save_mask=True, ref_mic_idx=3,
+                       th_high=0.5, th_low=0.25):
     """
-    Applies the quantized DTLN TF-Lite models using a strict real-time 
-    frame-by-frame loop. Model 1 processes the STFT magnitude, and 
-    Model 2 refines the time-domain signal.
-    
-    Args:
-        interpreter_1: Initialized tf.lite.Interpreter for model 1.
-        interpreter_2: Initialized tf.lite.Interpreter for model 2.
-        audio_mono: 1D numpy array of the audio signal (must be 16kHz).
-        blend_alpha: Wet/Dry mix ratio (0.0 = only input, 1.0 = Max DTLN).
-        
-    Returns:
-        out_audio: 1D numpy array containing the enhanced signal.
+    Recursive MVDR utilizing a strictly binary VAD derived from DTLN spectral masks 
+    via Schmitt Trigger hysteresis. Replaces continuous update probability with a robust 
+    Freeze & Update scheme, extracting the RTF vector purely from the subtracted matrix R_ss.
     """
-    audio_mono = np.asarray(audio_mono, dtype=np.float32)
+    # Forgetting factors for covariance smoothing
+    lamda_x = 0.99
+    lamda_n = 0.99
     
-    # DTLN specific frame parameters
-    block_len = 512
-    block_shift = 128
-    
-    # Initialize buffers for overlap-and-add
-    out_audio = np.zeros_like(audio_mono)
-    in_buffer = np.zeros(block_len, dtype=np.float32)
-    out_buffer = np.zeros(block_len, dtype=np.float32)
-    
-    # Get input/output indices and expected shapes
-    input_details_1 = interpreter_1.get_input_details()
-    output_details_1 = interpreter_1.get_output_details()
-    expected_shape_1 = input_details_1[0]['shape']  # Expected: (1, 1, 257)
-    
-    input_details_2 = interpreter_2.get_input_details()
-    output_details_2 = interpreter_2.get_output_details()
-    expected_shape_2 = input_details_2[0]['shape']  # Expected: (1, 1, 512)
-
-    # Calculate number of frames
-    num_blocks = (len(audio_mono) - (block_len - block_shift)) // block_shift
-    
-    for idx in range(num_blocks):
-        # 1. Shift input buffer and load new samples
-        in_buffer[:-block_shift] = in_buffer[block_shift:]
-        start_idx = idx * block_shift
-        in_buffer[-block_shift:] = audio_mono[start_idx : start_idx + block_shift]
-        
-        # 2. Compute rFFT and extract magnitude (Model 1 input)
-        fft_in = np.fft.rfft(in_buffer)
-        mag_in = np.abs(fft_in)
-        
-        # 3. Prepare magnitude input for Model 1 dynamically
-        in_mag = np.reshape(mag_in, expected_shape_1).astype(np.float32)
-        interpreter_1.set_tensor(input_details_1[0]['index'], in_mag)
-        interpreter_1.invoke()
-        
-        # 4. Retrieve mask from Model 1 and apply to the complex STFT
-        out_mask = interpreter_1.get_tensor(output_details_1[0]['index'])
-        out_mask = np.squeeze(out_mask)
-        estimated_stft = fft_in * out_mask
-        
-        # 5. Inverse rFFT back to time domain
-        estimated_block_time = np.fft.irfft(estimated_stft, n=block_len)
-        
-        # 6. Prepare time-domain input for Model 2
-        in_time = np.reshape(estimated_block_time, expected_shape_2).astype(np.float32)
-        interpreter_2.set_tensor(input_details_2[0]['index'], in_time)
-        interpreter_2.invoke()
-        
-        # 7. Get final output block from Model 2
-        out_block = interpreter_2.get_tensor(output_details_2[0]['index'])
-        out_block = np.squeeze(out_block)
-        
-        # 8. Shift output buffer and perform overlap-add
-        out_buffer[:-block_shift] = out_buffer[block_shift:]
-        out_buffer[-block_shift:] = np.zeros(block_shift)
-        out_buffer += out_block
-        
-        # 9. Extract the processed valid shift to the output array
-        out_audio[start_idx : start_idx + block_shift] = out_buffer[:block_shift]
-
-    # Apply Wet/Dry blending
-    if blend_alpha < 1.0:
-        out_audio = (blend_alpha * out_audio) + ((1.0 - blend_alpha) * audio_mono)
-
-    return out_audio
-
-def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
-    # Forgetting factor for covariance matrix smoothing
-    lamda = 0.99
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
 
-    # Get steering vectors, expected shape (K, M)
-    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="far_field", squeeze=True)
+    # Obtain initial geometric steering vectors to act as a stable prior/initialization
+    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=ref_mic_idx, mode="near_field", squeeze=True)
     
-    # Initialize output complex STFT matrices
+    # Initialize complex STFT output matrices
     Y_stft = np.zeros((K, T), dtype=np.complex128)
-    Y_spp_stft = np.zeros((K, T), dtype=np.complex128) 
+    Y_spp_stft = np.zeros((K, T), dtype=np.complex128) # Output filtered by continuous DTLN mask
     
+    # =========================================================================
+    # --- OFFLINE DTLN STAGE & SPECTRAL MASK ESTIMATION ---
+    # =========================================================================
+    # 1. Reconstruct noisy time-domain signal of the reference/center channel (mic 0)
+    _, x_mic0_time = signal.istft(X_stft[:, :, 0], fs=fs, nperseg=512, noverlap=256)
+    
+    # 2. Process complete signal offline through TFLite interpreters
+    x_clean_time = apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, x_mic0_time.astype(np.float32))
+    
+    # 3. Transform clean estimation back to STFT domain to align with X_stft
+    _, _, Zxx_clean = signal.stft(x_clean_time, fs=fs, nperseg=512, noverlap=256)
+    
+    # Adjust dimensions safely for trailing frames
+    T_clean = min(T, Zxx_clean.shape[1])
+    X_clean_stft = np.zeros((K, T), dtype=np.complex128)
+    X_clean_stft[:, :T_clean] = Zxx_clean[:, :T_clean]
+    
+    # 4. Derive Spectral Gain Mask bounded to [0, 1]
+    mag_noisy = np.abs(X_stft[:, :, 0])
+    mag_clean = np.abs(X_clean_stft)
+    dtln_mask = np.clip(mag_clean / (mag_noisy + 1e-10), 0.0, 1.0)
+    
+    # =========================================================================
+    # --- BINARY VAD CONSTRUCTION VIA SCHMITT TRIGGER HYSTERESIS ---
+    # =========================================================================
+    # Identify frequency bins matching the primary speech bandwidth (300 Hz - 4 kHz)
+    speech_band = (frecs >= 300) & (frecs <= 4000)
+    
+    frame_vad = np.zeros(T, dtype=bool)
+    voice_active = False
+    
+    for m in range(T):
+        # Average DNN mask energy strictly inside the voice band
+        mean_prob = np.mean(dtln_mask[speech_band, m])
+        
+        # Apply binary transition criteria with temporal hysteresis
+        if not voice_active and mean_prob > th_high:
+            voice_active = True
+        elif voice_active and mean_prob < th_low:
+            voice_active = False
+            
+        frame_vad[m] = voice_active
+
+    # =========================================================================
+    # --- INITIALIZATION OF SPATIAL TRACKERS ---
+    # =========================================================================
     # Initialize noise covariance matrix R_nn
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
     
-    # Initialize noisy signal covariance matrix R_xx using the steering vector
+    # Initialize noisy signal covariance matrix R_xx using the geometric steering vector prior
     phi_s = 1e-3 
     R_ss_init = phi_s * np.einsum("fm,fn->fmn", sv, sv.conj())
     R_xx = R_ss_init + R_nn
 
-    # Initialize the inverse of R_nn for the first frame's SPP calculation
-    initial_diag_load = np.tile(np.eye(M, dtype=np.complex128) * min_loading, (K, 1, 1))
-    R_nn_inv = np.linalg.inv(R_nn + initial_diag_load)
-
-    # SPP Hyperparameters
-    gamma_th = 15 
-    spp_slope = 15
-
+    # Initialize current RTF estimation buffer
+    rtf_est = sv.copy()
     weights_rec = np.zeros((K, T, M), dtype=np.complex128)
 
+    # =========================================================================
+    # --- FREEZE & UPDATE RECURSIVE BEAMFORMING ---
+    # =========================================================================
     for m in range(T):
         X_frame = X_stft[:, m, :]
-
-        # --- 1. Calculate A Posteriori Spatial SNR (gamma) ---
-        R_nn_inv_x = np.einsum("fmn,fn->fm", R_nn_inv, X_frame)
-        num_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_x)
-        num = np.abs(num_complex)**2
         
-        R_nn_inv_v = np.einsum("fmn,fn->fm", R_nn_inv, sv)
-        den_complex = np.einsum("fm,fm->f", sv.conj(), R_nn_inv_v)
-        den = np.real(den_complex) 
+        # Save continuous masked channel for visualization/debugging tracking
+        Y_spp_stft[:, m] = dtln_mask[:, m] * X_frame[:, 0]
         
-        gamma = num / (den + 1e-10)
-
-        # --- 2. Map Gamma to Spatial Presence Probability (SPP) ---
-        P = 1.0 / (1.0 + np.exp(-spp_slope * (gamma - gamma_th)))
-        P = np.clip(P, 0.05, 0.95)
-        P_expand = P[:, np.newaxis, np.newaxis]
-
-        Y_spp_stft[:, m] = P * X_frame[:, 0]
-
-        # --- 3. Update Covariance Matrices ---
+        # Compute instantaneous outer product matrix
         R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
-        
-        R_xx = lamda * R_xx + (1 - lamda) * P_expand * R_instant
-        R_nn = lamda * R_nn + (1 - lamda) * (1 - P_expand) * R_instant
 
-        # --- 4. Compute MVDR Weights with Dynamic Diagonal Loading ---
+        # Apply strict state machine switching based on binary VAD decision
+        if frame_vad[m]:
+            # --- SPEECH PRESENT: Update R_xx, freeze R_nn, extract RTF ---
+            R_xx = lamda_x * R_xx + (1.0 - lamda_x) * R_instant
+            
+            # Subtraction isolates the pure spatial speech covariance
+            R_ss = R_xx - R_nn
+            
+            # Extract dominant spatial signature independently per frequency bin
+            for f in range(K):
+                # Enforce strict Hermitian symmetry to prevent complex numeric drift
+                R_ss_sym = 0.5 * (R_ss[f] + R_ss[f].conj().T)
+                evals, evecs = np.linalg.eigh(R_ss_sym)
+                
+                dominant_evec = evecs[:, -1]
+                
+                # Normalize relative to the chosen reference microphone channel safely
+                ref_val = dominant_evec[ref_mic_idx]
+                if np.abs(ref_val) > 1e-12:
+                    rtf_est[f, :] = dominant_evec / ref_val
+        else:
+            # --- SPEECH ABSENT: Update R_nn, freeze R_xx and RTF vectors ---
+            R_nn = lamda_n * R_nn + (1.0 - lamda_n) * R_instant
+            # rtf_est remains unchanged from previous speech frame
+
+        # --- Dynamic Diagonal Loading & Weight Calculation ---
         tr_R = np.real(np.trace(R_nn, axis1=1, axis2=2))
         adaptive_load = beta * (tr_R[:, None, None] / M)
         
         loading = np.maximum(adaptive_load, min_loading)
         R_nn_stable = R_nn + np.eye(M)[None, :, :] * loading
+
+        # Safely invert stabilized noise covariance matrix
         R_nn_inv = np.linalg.inv(R_nn_stable)
 
-        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, sv)
-        weights_den = np.einsum("fm,fm->f", sv.conj(), weights_nom)
+        # Numerator: R_nn_inv * rtf_est
+        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, rtf_est)
         
+        # Denominator: rtf_est^H * numerator (force real output to clear residual phase errors)
+        weights_den = np.real(np.einsum("fm,fm->f", rtf_est.conj(), weights_nom))
+        
+        # Final spatial filter weights
         weights = weights_nom / (weights_den[:, np.newaxis] + 1e-10)
         weights_rec[:, m, :] = weights
         
-        # --- 5. Apply Filter ---
+        # Apply filter to extract target signal
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
     if save_weights:
-        return Y_stft, Y_spp_stft, weights_rec
+        return (Y_stft, Y_spp_stft, weights_rec) if save_mask else (Y_stft, weights_rec)
     else:
-        return Y_stft, Y_spp_stft
-    
+        return (Y_stft, Y_spp_stft) if save_mask else Y_stft
 
-def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256):
+
+def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, 
+                           interpreter_1, interpreter_2, length_fft=512, hop_length_fft=256):
     """
-    Helper function to wrap the STFT -> MVDR -> ISTFT process.
+    Updated bridge function to receive and propagate TFLite interpreters to the beamformer.
     """
     freqs, times, Zxx = signal.stft(
         time_domain_input, 
@@ -192,13 +193,15 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     )
     
     X_stft = np.transpose(Zxx, (1, 2, 0))
-    vad_padded = np.pad(vad_oracle, (0, length_fft + hop_length_fft), mode='constant')
 
+    # Explicitly pass the interpreters to the recursive function
     Y_stft, Y_spp_stft = SPP_MVDR_recursive(
         X_stft=X_stft, 
         fs=fs, 
         array_geometry=mic_coords, 
-        source_pos=source_pos_2d, 
+        source_pos=source_pos_2d,
+        interpreter_1=interpreter_1,
+        interpreter_2=interpreter_2
     )
     
     _, y_time = signal.istft(
@@ -217,7 +220,6 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
     
     original_length = time_domain_input.shape[1]
     return y_time[:original_length], y_spp_time[:original_length]
-
 
 
 if __name__ == "__main__":
@@ -294,20 +296,21 @@ if __name__ == "__main__":
         np.savez(cache_ff_path, input=free_field_input, vad=vad_oracle_ff)
         
     print(" -> Applying SPP-guided MVDR (at 16kHz)...")
-    output_ff_mvdr, output_ff_spp = apply_mvdr_stft_bridge(free_field_input, vad_oracle_ff, mic_coords, source_pos_2d, FS)
+    output_ff_mvdr, output_ff_spp = apply_mvdr_stft_bridge(free_field_input, vad_oracle_ff, mic_coords, source_pos_2d, FS,
+                                                           interpreter_1=interpreter_1,
+                                                           interpreter_2=interpreter_2)
     
     print(" -> Applying DTLN TF-Lite Post-Processing...")
     output_ff_dtln_only = apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, free_field_input[0])
-    
     output_ff_dtln = apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, output_ff_mvdr)
     
     # Output saves
     save_wav("1A_FF_output_dtln_only_16k.wav", FS, output_ff_dtln_only, output_folder)
-    save_wav("1A_FF_input_mic0_16k.wav", FS, free_field_input[0], output_folder)
-
+    save_wav("1B_FF_input_mic0_16k.wav", FS, free_field_input[0], output_folder)
     save_wav("1C_FF_MVDR_output_16k.wav", FS, normalize_signal(output_ff_mvdr), output_folder)
     save_wav("1D_FF_DTLN_Post_16k.wav", FS, normalize_signal(output_ff_dtln), output_folder)
-    save_wav("1A_FF_mask.wav", FS, output_ff_spp, output_folder)
+    save_wav("1E_mask.wav", FS, normalize_signal(output_ff_spp), output_folder)
+
     # -------------------------------------------------------------------
     # PHASE 2: ROOM SIMULATION (Reverberant)
     # -------------------------------------------------------------------
@@ -329,7 +332,9 @@ if __name__ == "__main__":
         np.savez(cache_room_path, input=room_input, vad=vad_oracle_room)
     
     print(" -> Applying SPP-guided MVDR (at 16kHz)...")
-    output_rm_mvdr, output_rm_spp = apply_mvdr_stft_bridge(room_input, vad_oracle_room, mic_coords, source_pos_2d, FS)
+    output_rm_mvdr, output_rm_spp = apply_mvdr_stft_bridge(room_input, vad_oracle_room, mic_coords, source_pos_2d, FS,
+                                                           interpreter_1=interpreter_1,
+                                                           interpreter_2=interpreter_2)
     
     print(" -> Applying DTLN TF-Lite Post-Processing...")
     output_rm_dtln_only = apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, room_input[0])
@@ -337,10 +342,10 @@ if __name__ == "__main__":
 
     # Output saves
     save_wav("2A_RM_input_mic0_16k.wav", FS, room_input[0], output_folder)
-    save_wav("2A_RM_output_dtln_only_16k.wav", FS, output_rm_dtln, output_folder)
+    save_wav("2B_RM_output_dtln_only_16k.wav", FS, output_rm_dtln_only, output_folder)
     save_wav("2C_RM_MVDR_output_16k.wav", FS, normalize_signal(output_rm_mvdr), output_folder)
     save_wav("2D_RM_DTLN_Post_16k.wav", FS, normalize_signal(output_rm_dtln), output_folder)
-    save_wav("2D_RM_mask.wav", FS, normalize_signal(output_rm_spp), output_folder)
+    save_wav("2E_RM_Mask.wav", FS, normalize_signal(output_rm_spp), output_folder)
 
     # -------------------------------------------------------------------
     # PHASE 3: WPE + MVDR + DTLN PIPELINE
@@ -350,7 +355,9 @@ if __name__ == "__main__":
     wpe_output = process_wpe_online(room_input, delay=3, taps=7, stft_size=1024, stft_shift=128)
     
     print(" -> Applying SPP-guided MVDR (at 16kHz)...")
-    mvdr_wpe, _ = apply_mvdr_stft_bridge(wpe_output, vad_oracle_room, mic_coords, source_pos_2d, FS)
+    mvdr_wpe, _ = apply_mvdr_stft_bridge(wpe_output, vad_oracle_room, mic_coords, source_pos_2d, FS,
+                                         interpreter_1=interpreter_1,
+                                         interpreter_2=interpreter_2)
     
     print(" -> Applying DTLN TF-Lite Post-Processing...")
     dtln_wpe = apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, mvdr_wpe)

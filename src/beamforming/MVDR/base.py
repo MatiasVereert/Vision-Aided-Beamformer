@@ -9,7 +9,7 @@ from beamforming.signal_model import compute_rtf_steering_vector
 
 def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, min_loading = 1e-6, save_weights=False):
     lamda = 0.99
-    beta = 1e-3 # relative loading
+    beta = 1e-2 # relative loading
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
 
@@ -22,6 +22,7 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
     # Initialize noise covariance matrix R_nn for all frequencies (K, M, M)
     # We use a small diagonal loading to prevent singularities from the start
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    count = 0
     
 
     #save weights
@@ -32,7 +33,7 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
 
         # Define VAD frame state (mapping STFT frame to time-domain VAD)
         vad_frame = vad[m * hop_length_fft : length_fft + m * hop_length_fft]
-        vad_status = np.mean(vad_frame) > 0.1
+        vad_status = np.mean(vad_frame) > 0.3
 
         # Update noise covariance ONLY when target speech is absent
         if not vad_status:
@@ -72,8 +73,6 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
         return Y_stft
 
 # Normalize signals to range [-0.99, 0.99] to prevent clipping when saving as WAV
-
-
 import numpy as np
 import scipy.signal as signal
 
@@ -137,10 +136,6 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
 
 
 
-
-
-
-
 if __name__ == "__main__":
     from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
 
@@ -181,9 +176,8 @@ if __name__ == "__main__":
 
     print(" -> Initializing acoustic scene...")
     acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=20, fs=FS)
-    acoustic_scene.set_source("tools/data/signals/FA01_09.wav", gain=1, position=source_pos_2d)
-    acoustic_scene.set_interference("tools/data/signals/MC15_03.wav", gain=1, position=interf_pos1.reshape(1,3))
-
+    acoustic_scene.set_source(r"data/audio/input/p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
+    acoustic_scene.set_interference(r"data/audio/input/hairdryer_07_SH_MKH800.wav", gain=1, position=interf_pos1.reshape(1,3))
     # -------------------------------------------------------------------
     # PHASE 1: FREE FIELD SIMULATION (Anechoic)
     # -------------------------------------------------------------------

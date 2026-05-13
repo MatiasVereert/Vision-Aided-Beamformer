@@ -1,22 +1,12 @@
 import numpy as np
 import tensorflow as tf
 
-
-
-
-def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono, blend_alpha=1):
+def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono):
     """
     Applies the Float32 DTLN TF-Lite models using a strict real-time 
     frame-by-frame loop. Handles LSTM hidden states properly to prevent 
     signal degradation. Compensates for algorithmic delay during blending.
     """
-    # 1. Normalize input to prevent LSTM saturation
-    max_val = np.max(np.abs(audio_mono))
-    if max_val > 0.0:
-        # Scale to peak at 0.9 to give the network optimal headroom
-        audio_mono = audio_mono * (0.9 / max_val)
-
-    audio_mono = np.asarray(audio_mono, dtype=np.float32)
     
     block_len = 512
     block_shift = 128
@@ -82,14 +72,57 @@ def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono, bl
         
         out_audio[start_idx : start_idx + block_shift] = out_buffer[:block_shift]
 
-    # 2. Apply Wet/Dry blending with precise delay compensation
-    if blend_alpha < 1.0:
-        delay = block_len - block_shift # 384 samples algorithmic delay
-        
-        # Shift the dry audio to align perfectly with the processed output
-        audio_mono_delayed = np.zeros_like(audio_mono)
-        audio_mono_delayed[delay:] = audio_mono[:-delay]
-        
-        out_audio = (blend_alpha * out_audio) + ((1.0 - blend_alpha) * audio_mono_delayed)
 
     return out_audio
+
+
+import numpy as np
+import soundfile as sf
+import tensorflow as tf
+
+# Place the apply_dtln_post_tflite_realtime function definition here
+
+
+def main():
+    # Define placeholder paths for models and audio files
+    model1_path = r"data/dnn_models/model_quant_1.tflite"
+    model2_path = r"data/dnn_models/model_quant_2.tflite"
+
+    input_path = r"tests/dataset_out/integration_test/test_mixture_ch1.wav"  # Replace with your input path
+    output_path = r"audio_limpio.wav"
+
+    # Initialize and allocate interpreters for Model 1 and Model 2
+    interpreter_1 = tf.lite.Interpreter(model_path=model1_path)
+    interpreter_1.allocate_tensors()
+
+    interpreter_2 = tf.lite.Interpreter(model_path=model2_path)
+    interpreter_2.allocate_tensors()
+
+    # Load the audio file in float32 format
+    print(f"Loading audio from: {input_path}")
+    audio, sample_rate = sf.read(input_path, dtype="float32")
+
+    # Convert to mono if the input audio has multiple channels
+    if len(audio.shape) > 1:
+        # Average the channels to create a single mono track
+        audio = np.mean(audio, axis=1)
+
+    #normalize 
+    max = np.max(audio)
+    print(f"max: {max}")
+    audio = audio /max
+
+    print("Processing audio frame-by-frame...")
+
+    # Run the real-time DTLN noise suppression loop
+    clean_audio = apply_dtln_post_tflite_realtime(
+        interpreter_1, interpreter_2, audio
+    )
+
+    # Export the processed audio back to a WAV file
+    sf.write(output_path, clean_audio, sample_rate)
+    print(f"Processed audio successfully saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
