@@ -415,9 +415,9 @@ if __name__ == "__main__":
         'radius_interf': 1.2,    
         'delta_ang_deg': 30.0,   
         'snr_db': 60.0,          
-        'source_path': "data/audio/input/FA01_09.wav",
+        'source_path': "tools\data\signals\p002_emo_adoration_sentences.wav",
         'interf_paths': [
-            "data/audio/input/hairdryer_07_SH_MKH800.wav"
+            "tools\data\signals\hairdryer_07_SH_MKH800.wav"
         ],
         'wpe_taps': 7,
         'wpe_delay': 3,
@@ -432,7 +432,7 @@ if __name__ == "__main__":
         'N_interferences': [1],      
         'mismatch_pos': [0.0],       
         'isir_db': [0],         
-        'mismatch_gain': [0.0],     
+        'mismatch_gain': [1],     
         'mismatch_phase': [0],    
         'use_wpe': [False] 
     }

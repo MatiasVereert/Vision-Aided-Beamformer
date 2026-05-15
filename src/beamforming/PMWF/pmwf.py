@@ -5,10 +5,7 @@ import matplotlib.pyplot as plt
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 import numpy as np
-import numpy as np
-import numpy as np
 
-import numpy as np
 
 def pmwf_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.98):
     K, T, M = X_stft.shape  
@@ -162,7 +159,7 @@ def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos
 
 
 
-from beamforming.MWF.WPE_SP_SDW_MWF import process_wpe_online
+from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
 
 
 

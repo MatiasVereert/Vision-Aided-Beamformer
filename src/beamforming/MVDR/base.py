@@ -7,6 +7,85 @@ from utils.audio import  normalize_signal
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 
+def MVDR_recursive_rtf_subtraction(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, min_loading=1e-6, save_weights=False):
+    lamda = 0.99
+    beta = 1e-3 # Relative loading
+    K, T, M = X_stft.shape  
+    
+    # Initialize output complex STFT matrix
+    Y_stft = np.zeros((K, T), dtype=np.complex128)
+    
+    # Initialize covariance matrices
+    # R_xx is initialized slightly larger to avoid negative subtraction at the very beginning
+    R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    R_xx = np.tile(np.eye(M, dtype=np.complex128) * 1e-5, (K, 1, 1))
+    
+    # Save weights array
+    weights_rec = np.zeros((K, T, M), dtype=np.complex128)
+    
+    for m in range(T):
+        # Extract the current frame across all frequencies, shape (K, M)
+        X_frame = X_stft[:, m, :]
+
+        # Define VAD frame state (mapping STFT frame to time-domain VAD)
+        vad_frame = vad[m * hop_length_fft : length_fft + m * hop_length_fft]
+        vad_status = np.mean(vad_frame) > 0.1
+
+        # Calculate instantaneous covariance of the current frame
+        R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
+
+        # Update matrices based on VAD oracle
+        if vad_status:
+            # Update noisy mixture covariance when speech is present
+            R_xx = lamda * R_xx + (1 - lamda) * R_instant
+        else:
+            # Update noise covariance when speech is absent
+            R_nn = lamda * R_nn + (1 - lamda) * R_instant
+
+        # --- RTF Estimation via Covariance Subtraction ---
+        # Estimate the pure speech covariance matrix
+        R_ss = R_xx - R_nn
+        
+        # Extract the column corresponding to the reference microphone (index 0)
+        # R_ss has shape (K, M, M), taking slice [:, :, 0] yields (K, M)
+        h_raw = R_ss[:, :, 0]
+        
+        # Normalize with respect to the reference microphone to obtain the RTF (h)
+        # We add a small epsilon to the denominator to prevent division by zero
+        h = h_raw / (h_raw[:, 0:1] + 1e-10)
+
+        # --- Dynamic Loading ---
+        tr_R = np.real(np.trace(R_nn, axis1=1, axis2=2))
+        adaptive_load = beta * (tr_R[:, None, None] / M)
+        loading = np.maximum(adaptive_load, min_loading)
+        
+        R_nn_stable = R_nn + np.eye(M)[None, :, :] * loading
+        
+        # Invert the covariance matrices for all frequencies simultaneously
+        R_nn_inv = np.linalg.inv(R_nn_stable)
+
+        # --- Calculate MVDR Weights ---
+        # Numerator: R_nn_inv * h -> (K, M, M) * (K, M) -> (K, M)
+        weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, h)
+        
+        # Denominator: h^H * numerator -> (K, M) * (K, M) -> (K,)
+        weights_den = np.einsum("fm,fm->f", h.conj(), weights_nom)
+        
+        # Divide numerator by denominator
+        # Expand dims of denominator to allow broadcasting from (K,) to (K, M)
+        weights = weights_nom / (weights_den[:, np.newaxis] + 1e-10)
+
+        weights_rec[:, m, :] = weights
+        
+        # Apply weights to the current observation to get the clean output
+        Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
+
+    if save_weights:
+        return Y_stft, weights_rec
+    else:
+        return Y_stft
+    
+
 def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, min_loading = 1e-6, save_weights=False):
     lamda = 0.99
     beta = 1e-2 # relative loading

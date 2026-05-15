@@ -3,97 +3,130 @@ import h5py
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
+
 # Configure page to maximize screen space
 st.set_page_config(page_title="Acoustic Benchmark", layout="wide")
 
 @st.cache_data
-def load_benchmark_data(h5_filepath: str) -> dict:
+def get_h5_structure(h5_filepath: str) -> dict:
     """
-    Reads the HDF5 file and extracts all relevant data into a nested dictionary.
+    Scans the HDF5 file to build a nested dictionary of available paths:
+    { Processor : { Metric : [Cases] } }
+    This drives the cascaded dropdown menus in the sidebar.
+    """
+    structure = {}
+    with h5py.File(h5_filepath, 'r') as f:
+        for proc in f.keys():
+            structure[proc] = {}
+            for metric in f[proc].keys():
+                structure[proc][metric] = list(f[proc][metric].keys())
+    return structure
+
+@st.cache_data
+def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case_type: str) -> dict:
+    """
+    Reads a specific case path from the HDF5 file and extracts the data.
     Cached by Streamlit to prevent disk reads on every UI interaction. 
     """
-    data = {"audio": {}, "metadata": {}, "geometry": {}, "metrics": {}, "spatial": {}, "weights": {}}
+    data = {"audio": {}, "metadata": {}, "geometry": {}, "metrics": {}, "spatial": {}}
+    case_path = f"{proc_name}/{metric_name}/{case_type}"
     
     with h5py.File(h5_filepath, 'r') as f:
-        # Load standard structured sections
-        for section in ["audio", "metadata", "geometry", "metrics", "weights"]:
-            if section in f:
-                for key in f[section].keys():
-                    data[section][key] = f[section][key][()]
-                for attr_key, attr_val in f[section].attrs.items():
-                    data[section][attr_key] = attr_val
+        if case_path not in f:
+            return data
+            
+        grp = f[case_path]
         
-        # Discover and load all precomputed spatial groups
-        for key in f.keys():
-            if key.startswith("spatial_"):
-                proc_name = key.replace("spatial_", "")
-                data["spatial"][proc_name] = {}
-                for dset_key in f[key].keys():
-                    data["spatial"][proc_name][dset_key] = f[key][dset_key][()]
-                for attr_key, attr_val in f[key].attrs.items():
-                    data["spatial"][proc_name][attr_key] = attr_val
+        # Load standard structured groups
+        for section in ["audio", "metadata", "geometry"]:
+            if section in grp:
+                for key in grp[section].keys():
+                    data[section][key] = grp[section][key][()]
+                for attr_key, attr_val in grp[section].attrs.items():
+                    data[section][attr_key] = attr_val
+                    
+        # Load metrics from attributes
+        if "metrics" in grp:
+            for k, v in grp["metrics"].attrs.items():
+                # Handle NaN strings saved by the benchmark script
+                if isinstance(v, str) and v == "NaN":
+                    data["metrics"][k] = np.nan
+                else:
+                    data["metrics"][k] = v
+                    
+        # Load spatial group for the specific processor
+        spat_key = f"spatial_{proc_name}"
+        if spat_key in grp:
+            data["spatial"][proc_name] = {}
+            for dset_key in grp[spat_key].keys():
+                data["spatial"][proc_name][dset_key] = grp[spat_key][dset_key][()]
+            for attr_key, attr_val in grp[spat_key].attrs.items():
+                data["spatial"][proc_name][attr_key] = attr_val
                     
     return data
 
-def display_metrics_row(metrics_dict: dict, processor_name: str):
+def display_metrics_row(metrics_dict: dict):
     """
-    Displays metrics using Streamlit native metric columns for a cleaner UI.
-    Injects CSS to reduce font sizes for a more compact view.
+    Displays metrics dynamically, adapting to the new prefix-based naming 
+    convention from the benchmark script (base_, proc_, dtln_, etc.).
     """
     st.markdown("""
     <style>
     /* Reduce font size and padding for Streamlit's metric widget */
-    [data-testid="stMetricValue"] {
-        font-size: 1.5rem;
-    }
-    [data-testid="stMetricLabel"] {
-        font-size: 0.8rem;
-        padding-bottom: 0.1rem;
-    }
-    [data-testid="stMetricDelta"] {
-        font-size: 0.8rem;
-    }
+    [data-testid="stMetricValue"] { font-size: 1.5rem; }
+    [data-testid="stMetricLabel"] { font-size: 0.8rem; padding-bottom: 0.1rem; }
+    [data-testid="stMetricDelta"] { font-size: 0.8rem; }
     </style>
     """, unsafe_allow_html=True)
     
-    base = {k.replace("baseline_", ""): v for k, v in metrics_dict.items() if "baseline" in k}
-    proc = {k.replace(f"{processor_name}_", ""): v for k, v in metrics_dict.items() if processor_name in k and "Delta" not in k}
-    delta = {k.replace(f"{processor_name}_Delta_", ""): v for k, v in metrics_dict.items() if "Delta" in k}
+    # Extract unique metric names (e.g., 'PESQ', 'STOI') by stripping the 'base_' prefix
+    base_keys = [k for k in metrics_dict.keys() if k.startswith("base_")]
+    metric_names = [k.replace("base_", "") for k in base_keys]
     
-    keys = list(base.keys())
-    if not keys: return
-    
-    cols = st.columns(len(keys))
-    for idx, key in enumerate(keys):
-        with cols[idx]:
-            val = proc.get(key, np.nan)
-            d_val = delta.get(key, np.nan)
-            st.metric(label=key, value=f"{val:.3f}", delta=f"{d_val:.3f}")
+    if not metric_names: return
+
+    # Row 1: Beamformer Performance vs Baseline
+    st.markdown("### Spatial Processing Performance")
+    cols_bf = st.columns(len(metric_names))
+    for idx, m in enumerate(metric_names):
+        with cols_bf[idx]:
+            val = metrics_dict.get(f"proc_{m}", np.nan)
+            delta = metrics_dict.get(f"Delta_tot_{m}", np.nan)
+            st.metric(label=f"{m} (BF)", value=f"{val:.3f}", delta=f"{delta:.3f}")
+
+    # Row 2: Full Pipeline (including DTLN) vs Baseline, if available
+    has_dtln = any(k.startswith("dtln_post_") for k in metrics_dict.keys())
+    if has_dtln:
+        st.markdown("### Full Pipeline Performance (BF + DTLN)")
+        cols_dnn = st.columns(len(metric_names))
+        for idx, m in enumerate(metric_names):
+            with cols_dnn[idx]:
+                val = metrics_dict.get(f"dtln_post_{m}", np.nan)
+                delta = metrics_dict.get(f"Delta_tot_pipeline_{m}", np.nan)
+                st.metric(label=f"{m} (Pipeline)", value=f"{val:.3f}", delta=f"{delta:.3f}")
+
 
 def get_room_wireframe_traces(room_dims: list, **kwargs) -> list:
     """
     Generates a list of Plotly Scatter3d traces to draw a correct wireframe box.
-    Defines 8 vertices and connects them with 12 edge lines.
     """
     lx, ly, lz = room_dims
-    # Define the 8 vertices of the cube
     vertices = np.array([
         [0, 0, 0], [lx, 0, 0], [lx, ly, 0], [0, ly, 0],
         [0, 0, lz], [lx, 0, lz], [lx, ly, lz], [0, ly, lz]
     ])
     
-    # Define the 12 edges connecting the vertices
     edges = [
-        (0, 1), (1, 2), (2, 3), (3, 0), # Bottom face
-        (4, 5), (5, 6), (6, 7), (7, 4), # Top face
-        (0, 4), (1, 5), (2, 6), (3, 7)  # Vertical edges
+        (0, 1), (1, 2), (2, 3), (3, 0), 
+        (4, 5), (5, 6), (6, 7), (7, 4), 
+        (0, 4), (1, 5), (2, 6), (3, 7)  
     ]
 
     x_coords, y_coords, z_coords = [], [], []
     for p1_idx, p2_idx in edges:
         p1 = vertices[p1_idx]
         p2 = vertices[p2_idx]
-        x_coords.extend([p1[0], p2[0], None]) # 'None' creates a break in the line
+        x_coords.extend([p1[0], p2[0], None]) 
         y_coords.extend([p1[1], p2[1], None])
         z_coords.extend([p1[2], p2[2], None])
 
@@ -110,25 +143,14 @@ def get_room_wireframe_traces(room_dims: list, **kwargs) -> list:
 def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_scale: float, decimator: int) -> go.Figure:
     """
     Constructs a Plotly figure with native JavaScript animation frames.
-    This entirely offloads the playback loop to the client's WebGL browser engine,
-    bypassing Streamlit's st.rerun() bottleneck and preserving camera state.
     """
     spatial_data = data["spatial"][proc_name]
     q_gain = spatial_data["quantized_gain"]
     points = spatial_data["points"]
-    # Use per-frame max dB if available, otherwise fall back to the old global max_dB attribute
     max_db_per_frame = spatial_data.get("max_db_per_frame")
-    if max_db_per_frame is None:
-        # Legacy fallback
-        # Legacy fallback: Create a compatible 2D array from the global max_dB attribute
-        num_freqs = q_gain.shape[0]
-        num_frames = q_gain.shape[2]
-        global_max_db = spatial_data.get("max_dB", 0)
-        max_db_per_frame = np.full((num_freqs, num_frames), global_max_db)
-        
     min_dB = spatial_data.get("min_dB", -30.0)
     n_azimuth = spatial_data.get("N_azimuth", 90)
-    target_fps = spatial_data.get("target_fps", 24) # Fallback to 24 if not in H5
+    target_fps = spatial_data.get("target_fps", 24) 
 
     # Geometry extraction
     geom = data["geometry"]
@@ -147,19 +169,11 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
     T = q_gain.shape[2]
     time_indices = range(0, T, decimator)
 
-    # Helper to generate mesh data for a specific time step
     def get_frame_mesh(t_idx, max_db_for_frame):
         q_slice = q_gain[f_idx, :, t_idx]
-        
-        # This formula reverses the PER-FRAME quantization process
-        # 1. De-quantize from uint8 to a normalized float [0, 1]
         normalized_gain = q_slice / 255.0
-        # 2. Rescale back to the original clipped dB range FOR THIS FRAME
         db_gain_recovered = normalized_gain * (max_db_for_frame - min_dB) + min_dB
-        # 3. Re-normalize the dB gain to a [0, 1] linear scale for coloring and sizing the lobe.
-        #    Because we use the frame's own max_db, the peak will always be 1.0.
         linear_magnitude = np.clip((db_gain_recovered - min_dB) / (max_db_for_frame - min_dB + 1e-9), 0.0, 1.0)
-
         lobe_radii = linear_magnitude * lobe_scale
         vertices = (unit_vectors * lobe_radii[:, np.newaxis]) + array_center
 
@@ -169,98 +183,59 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
         C = linear_magnitude.reshape((n_elevation, n_azimuth))
         return X, Y, Z, C
 
-    # 1. Base Figure (Time Step 0)
     fig = go.Figure()
     X0, Y0, Z0, C0 = get_frame_mesh(0, max_db_per_frame[f_idx, 0])
 
-    # Trace 0: Room Wireframe (static)
     for trace in get_room_wireframe_traces(room_dims):
         fig.add_trace(trace)
 
-    # Trace 1: The dynamic polar pattern surface (Optimized for animation)
     fig.add_trace(go.Surface(
-        uid='dynamic-surface', # Add a unique ID for object constancy
+        uid='dynamic-surface', 
         x=X0, y=Y0, z=Z0, surfacecolor=C0,
         colorscale='Viridis', cmin=0, cmax=1, showscale=False, opacity=1.0,
-        contours=dict(
-            # Disable dynamic contours to prevent CPU bottleneck and visual lag
-            x=dict(show=False),
-            y=dict(show=False),
-            z=dict(show=False)
-        ),
-        # Enhance lighting parameters to define the 3D volume without needing wireframes
+        contours=dict(x=dict(show=False), y=dict(show=False), z=dict(show=False)),
         lighting=dict(ambient=0.7, diffuse=0.5, roughness=0.9, specular=0.2, fresnel=0.2),
         name="Polar Pattern"
     ))
 
-    # Static Traces: Mics and targets
     fig.add_trace(go.Scatter3d(x=mic_coords[:, 0], y=mic_coords[:, 1], z=mic_coords[:, 2], mode='markers', marker=dict(size=4, color='black'), name='Mics'))
     fig.add_trace(go.Scatter3d(x=source_pos[:, 0], y=source_pos[:, 1], z=source_pos[:, 2], mode='markers', marker=dict(size=8, color='green', symbol='diamond'), name='Target'))
     if interf_pos is not None:
         fig.add_trace(go.Scatter3d(x=interf_pos[:, 0], y=interf_pos[:, 1], z=interf_pos[:, 2], mode='markers', marker=dict(size=6, color='red', symbol='x'), name='Interf'))
 
-    # 2. Build precomputed frames for JS engine
     frames = []
-    # Create an explicit list of frame names to handle decimation correctly
     frame_names = [str(t) for t in time_indices]
     for t_idx, frame_name in zip(time_indices, frame_names):
         Xt, Yt, Zt, Ct = get_frame_mesh(t_idx, max_db_per_frame[f_idx, t_idx])
-        # By passing a dict instead of a full go.Surface object, we only update the
-        # data arrays, which is much faster and compatible with redraw=False. We must
-        # explicitly provide the 'type' for Plotly to correctly interpret the dict.
         frames.append(go.Frame(
             data=[{'uid': 'dynamic-surface', 'type': 'surface', 'x': Xt, 'y': Yt, 'z': Zt, 'surfacecolor': Ct}],
-            traces=[1], # This MUST match the index of the dynamic surface trace
+            traces=[1], 
             name=frame_name
         ))
     fig.frames = frames
 
-    # 3. Configure Animation Controls (Play/Pause/Slider)
-    # Create slider steps based on time in seconds, not frame indices
     slider_steps = []
-    time_step_s = 0.5 # Show a mark every half second
+    time_step_s = 0.5 
     
     for t_idx in time_indices:
         time_sec = t_idx / target_fps
-        # Add a label only for major time steps
         label = f"{time_sec:.2f}s" if (time_sec % time_step_s < (1/target_fps)) else ""
-        
         slider_steps.append(dict(
             method='animate',
-            # Force WebGL redraw to update the 3D surface.
             args=[[str(t_idx)], dict(mode='immediate', frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
             label=label
         ))
 
     sliders = [dict(
-        steps=slider_steps,
-        active=0, 
-        transition=dict(duration=0),
-        x=0.05, y=0, len=0.9, 
-        currentvalue=dict(font=dict(size=14), prefix='Time: ', visible=True, xanchor='right')
+        steps=slider_steps, active=0, transition=dict(duration=0),
+        x=0.05, y=0, len=0.9, currentvalue=dict(font=dict(size=14), prefix='Time: ', visible=True, xanchor='right')
     )]
 
-    # 4. Configure Play and Pause buttons
-    # The 'fromcurrent=True' argument ensures playback starts from the active slider position.
-    # The 'redraw=True' parameter in the Play button is mandatory for WebGL surfaces.
     updatemenus = [dict(
-        type='buttons',
-        showactive=False,
-        y=0,
-        x=-0.05,
-        xanchor='right',
-        yanchor='top',
+        type='buttons', showactive=False, y=0, x=-0.05, xanchor='right', yanchor='top',
         buttons=[
-            dict(
-                label='Play',
-                method='animate',
-                args=[None, dict(frame=dict(duration=100, redraw=True), transition=dict(duration=0), fromcurrent=True, mode='immediate')]
-            ),
-            dict(
-                label='Pause',
-                method='animate',
-                args=[[None], dict(frame=dict(duration=0, redraw=False), mode='immediate', transition=dict(duration=0))]
-            )
+            dict(label='Play', method='animate', args=[None, dict(frame=dict(duration=100, redraw=True), transition=dict(duration=0), fromcurrent=True, mode='immediate')]),
+            dict(label='Pause', method='animate', args=[[None], dict(frame=dict(duration=0, redraw=False), mode='immediate', transition=dict(duration=0))])
         ]
     )]
 
@@ -271,21 +246,16 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
             zaxis=dict(title='Z (m)', range=[0, room_dims[2]], showgrid=False, zeroline=False, backgroundcolor="rgba(0,0,0,0)"),
             aspectmode='data'
         ),
-        margin=dict(l=0, r=0, b=0, t=0),
-        height=700,
-        sliders=sliders,
-        updatemenus=updatemenus, # Inject the play/pause buttons into the layout
-        uirevision='constant_view' # This preserves UI state (like camera) during data updates, fixing the animation.
+        margin=dict(l=0, r=0, b=0, t=0), height=700, sliders=sliders, updatemenus=updatemenus, uirevision='constant_view' 
     )
 
     return fig
 
 def main():
-    # --- SIDEBAR ---
     st.sidebar.title("Acoustic Benchmark")
     st.sidebar.markdown("---")
     
-    results_dir = r"tests/data/benchmark_results" 
+    results_dir = r"tests\dataset_out\quick_test" 
     if not os.path.exists(results_dir):
         st.sidebar.error(f"Directory not found: {results_dir}")
         return
@@ -295,15 +265,32 @@ def main():
         st.sidebar.warning("No HDF5 files found.")
         return
         
-    selected_file = st.sidebar.selectbox("Select File", h5_files)
-    data = load_benchmark_data(os.path.join(results_dir, selected_file))
+    selected_file = st.sidebar.selectbox("Select Benchmark File", h5_files)
+    h5_path = os.path.join(results_dir, selected_file)
     
-    available_processors = list(data["spatial"].keys())
-    if not available_processors:
-        st.sidebar.warning("No spatial data found.")
+    # 1. Parse H5 Structure dynamically
+    h5_structure = get_h5_structure(h5_path)
+    if not h5_structure:
+        st.sidebar.warning("File is empty or not in the expected nested format.")
         return
-        
-    selected_proc = st.sidebar.selectbox("Processor", available_processors)
+
+    # 2. Cascaded Dropdowns for Navigation
+    st.sidebar.subheader("Select Evaluation Case")
+    selected_proc = st.sidebar.selectbox("Processor", list(h5_structure.keys()))
+    
+    available_metrics = list(h5_structure[selected_proc].keys())
+    selected_metric = st.sidebar.selectbox("Optimized Metric", available_metrics)
+    
+    available_cases = h5_structure[selected_proc][selected_metric]
+    selected_case = st.sidebar.selectbox("Scenario", available_cases)
+
+    # 3. Load specific data chunk
+    data = load_benchmark_case(h5_path, selected_proc, selected_metric, selected_case)
+    
+    if not data["spatial"]:
+        st.error(f"Could not load spatial data for path: {selected_proc}/{selected_metric}/{selected_case}")
+        return
+
     spatial_data = data["spatial"][selected_proc]
     fs = data["metadata"].get("fs", 16000)
     total_frames = spatial_data["quantized_gain"].shape[2]
@@ -311,24 +298,51 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("Animation Controls")
     scale_factor = st.sidebar.slider("Visual Scale", 0.1, 2.0, 1.0)
-    frame_decimator = st.sidebar.slider("Frame Decimator", min_value=1, max_value=max(1, total_frames // 10), value=1, help="Higher values skip more frames to improve performance. '1' means no skipping.")
+    frame_decimator = st.sidebar.slider("Frame Decimator", min_value=1, max_value=max(1, total_frames // 10), value=1)
 
-    if "audio" in data:
+    # 4. Comprehensive Audio Playback matching new H5 structure
+    if "audio" in data and data["audio"]:
         st.sidebar.markdown("---")
-        st.sidebar.subheader("Playback")
-        st.sidebar.caption("Reference Mic (Mix):")
-        mic_mix = data["audio"].get("mic_signals", np.zeros((1, 100)))[0]
-        st.sidebar.audio(np.int16(mic_mix / np.max(np.abs(mic_mix)) * 32767), sample_rate=fs)
+        st.sidebar.subheader("Audio Comparison")
         
+        # Audio normalization helper
+        def prep_audio(sig):
+            return np.int16(sig / np.max(np.abs(sig)) * 32767)
+
+        audio_dict = data["audio"]
+        
+        # Target Reference
+        if "target_reference" in audio_dict:
+            st.sidebar.caption("🎯 Target Reference (Anechoic Early):")
+            st.sidebar.audio(prep_audio(audio_dict["target_reference"][0]), sample_rate=fs)
+
+        # Baseline Mic
+        if "mic_signals" in audio_dict:
+            st.sidebar.caption("🎙️ Reference Mic (Degraded Mixture):")
+            st.sidebar.audio(prep_audio(audio_dict["mic_signals"][0]), sample_rate=fs)
+        
+        # Beamformer Output
         proc_key = f"processed_{selected_proc}"
-        if proc_key in data["audio"]:
-            st.sidebar.caption(f"Processed ({selected_proc}):")
-            y_proc = data["audio"][proc_key]
-            st.sidebar.audio(np.int16(y_proc / np.max(np.abs(y_proc)) * 32767), sample_rate=fs)
+        if proc_key in audio_dict:
+            st.sidebar.caption(f"⚙️ Processed ({selected_proc}):")
+            st.sidebar.audio(prep_audio(audio_dict[proc_key]), sample_rate=fs)
+            
+        # DTLN Outputs (if neural enhancement was active)
+        if "processed_dtln_alone" in audio_dict:
+            st.sidebar.caption("🧠 Single-Mic DTLN (No Beamforming):")
+            st.sidebar.audio(prep_audio(audio_dict["processed_dtln_alone"]), sample_rate=fs)
+            
+        dtln_post_key = f"processed_{selected_proc}_dtln"
+        if dtln_post_key in audio_dict:
+            st.sidebar.caption(f"🚀 Full Pipeline ({selected_proc} + DTLN):")
+            st.sidebar.audio(prep_audio(audio_dict[dtln_post_key]), sample_rate=fs)
 
     # --- MAIN PANEL ---
+    st.title(f"Visualizing: {selected_proc} ({selected_case.replace('_', ' ').title()})")
+    st.caption(f"Optimized for extreme variance in: **{selected_metric}**")
+    
     if data["metrics"]:
-        display_metrics_row(data["metrics"], selected_proc)
+        display_metrics_row(data["metrics"])
         
     st.markdown("---")
 
@@ -338,7 +352,6 @@ def main():
     # --- FREQUENCY CONTROL ---
     col_freq, _ = st.columns([1, 3])
     with col_freq:
-        # Default to a mid-range frequency
         default_f_idx = len(freqs) // 2
         sel_label = st.selectbox("Frequency Band", freq_labels, index=default_f_idx)
         f_idx = freq_labels.index(sel_label)
@@ -348,4 +361,4 @@ def main():
     st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
-    main()  
+    main()

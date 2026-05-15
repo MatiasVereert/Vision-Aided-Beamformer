@@ -9,7 +9,7 @@ from propagation.simulate_acoustics import SimAcoustic
 from dereverberation.nara_wrappers import process_wpe_online
 
 
-def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
+def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False, output_SPP = False):
     # Forgetting factor for covariance matrix smoothing
     lamda = 0.99
     K, T, M = X_stft.shape  
@@ -105,11 +105,20 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
         # --- 5. Apply Filter ---
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
+<<<<<<< Updated upstream:src/beamforming/MVDR/SPP_spatial_debug blind_OK.py
     if save_weights:
         return Y_stft, weights_rec
     else:
         return Y_stft
     
+=======
+    if save_weights and output_SPP:
+        return Y_stft, Y_spp_stft, weights_rec
+    if save_weigths:
+        return Y_stft,  weights_rec
+    else:
+        return Y_stft
+>>>>>>> Stashed changes:src/beamforming/MVDR/SPP_spatial_debug.py
     
 
 def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256):

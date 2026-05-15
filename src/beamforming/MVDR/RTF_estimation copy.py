@@ -83,7 +83,7 @@ def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, 
 
         #save weights
         weights_rec[:,m,:] = weights
-
+        
         # Apply weights to the current observation to get the clean output
         # Output is shape (K,) for the current frame
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
