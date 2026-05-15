@@ -56,6 +56,7 @@ def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, 
             
         grp_geom = grp.create_group("geometry")
         grp_geom.create_dataset("mic_coords", data=scene_base_config['mic_coords'])
+        # Store the true source position to accurately reflect the real acoustic scene
         grp_geom.create_dataset("source_pos", data=scene_base_config['source_pos'])
         grp_geom.create_dataset("room_dims", data=current_room_dims)
         
@@ -107,11 +108,13 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
     experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
     
     # 2. STRATEGIC SORTING (Crucial for cascaded caching)
+    # The spatial errors (angle and distance) are placed at the end to prevent acoustic recalculations
     experiments.sort(key=lambda x: (
         x['rt60'], x['M'], x['N_interferences'], x['mismatch_pos'], # Node 1
         x['isir_db'],                                               # Node 2
         x['mismatch_gain'], x['mismatch_phase'],                    # Node 3
-        x['use_wpe']                                                # Node 4
+        x['use_wpe'],                                               # Node 4
+        x.get('error_angle_deg', 0.0), x.get('error_distance_m', 0.0) # Node 5 (Positioning error injection)
     ))
     
     # --- DERIVE DYNAMIC t_early FROM WPE CONFIG ---
@@ -287,14 +290,47 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
         else:
             tqdm.write(" -> [CACHE] Reusing previous WPE & Single-Mic DTLN state.")
         
-        # ---------------------------------------------------------
+# ---------------------------------------------------------
         # NODE 5: SIGNAL PROCESSING AND EVALUATION
         # ---------------------------------------------------------
+        
+        # Calculate spatial transformation for DOA error
+        err_ang = exp.get('error_angle_deg', 0.0)
+        err_dist = exp.get('error_distance_m', 0.0)
+        
+        array_center = np.mean(scene_base_config['mic_coords'], axis=0)
+        
+        # Flatten the true source position to safely handle both (3,) and (1, 3) shapes
+        true_src_pos = np.array(scene_base_config['source_pos']).flatten()
+        
+        # Relative vector in the XY plane
+        rel_vec = true_src_pos - array_center
+        r_xy = np.hypot(rel_vec[0], rel_vec[1])
+        theta = np.arctan2(rel_vec[1], rel_vec[0])
+        
+        # Apply intentional positioning errors
+        r_prime = max(0.01, r_xy + err_dist)
+        theta_prime = theta + np.deg2rad(err_ang)
+        
+        # Reconstruct the assumed 3D position as a flat array first
+        assumed_pos_flat = np.array([
+            array_center[0] + r_prime * np.cos(theta_prime),
+            array_center[1] + r_prime * np.sin(theta_prime),
+            true_src_pos[2]  # Z height remains unmodified
+        ])
+        
+        # Reshape to match the original source_pos shape dynamically
+        assumed_source_pos = assumed_pos_flat.reshape(np.array(scene_base_config['source_pos']).shape)
+        
+        # Inject the modified configuration to trick the processors
+        proc_config = scene_base_config.copy()
+        proc_config['source_pos'] = assumed_source_pos
+        
         for proc_name, processor in processors.items():
-            tqdm.write(f"   -> Processing with: {proc_name}...")
+            tqdm.write(f"   -> Processing with: {proc_name} (ErrAng: {err_ang}deg, ErrDist: {err_dist}m)...")
             
             t0 = time.time()
-            y_processed, weights = processor.process(mic_signals_ready, scene_base_config)
+            y_processed, weights = processor.process(mic_signals_ready, proc_config)
             proc_time = time.time() - t0
             
             proc_metrics = evaluate_full_pipeline(
@@ -332,7 +368,8 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                 "rt60": exp['rt60'], "M": exp['M'], "N_interferences": exp['N_interferences'], 
                 "mismatch_pos": exp['mismatch_pos'], "isir_db": exp['isir_db'],
                 "mismatch_gain": exp['mismatch_gain'], "mismatch_phase": exp['mismatch_phase'],
-                "use_wpe": exp['use_wpe'], "t_early_s": t_early_dynamic, "exec_time_s": proc_time,
+                "use_wpe": exp['use_wpe'], "error_angle_deg": err_ang, "error_distance_m": err_dist,
+                "t_early_s": t_early_dynamic, "exec_time_s": proc_time,
             }
             
             # Append absolute metrics
@@ -415,9 +452,9 @@ if __name__ == "__main__":
         'radius_interf': 1.2,    
         'delta_ang_deg': 30.0,   
         'snr_db': 60.0,          
-        'source_path': "tools\data\signals\p002_emo_adoration_sentences.wav",
+        'source_path': r"tools\data\signals\p002_emo_adoration_sentences.wav",
         'interf_paths': [
-            "tools\data\signals\hairdryer_07_SH_MKH800.wav"
+            r"tools\data\signals\hairdryer_07_SH_MKH800.wav"
         ],
         'wpe_taps': 7,
         'wpe_delay': 3,
@@ -426,6 +463,7 @@ if __name__ == "__main__":
         'wpe_stft_shift': 128
     }
 
+    # Added error_angle_deg and error_distance_m to the search grid
     param_grid = {
         'rt60': [0.3], 
         'M': [6],                
@@ -434,7 +472,9 @@ if __name__ == "__main__":
         'isir_db': [0],         
         'mismatch_gain': [1],     
         'mismatch_phase': [0],    
-        'use_wpe': [False] 
+        'use_wpe': [False],
+        'error_angle_deg': [0.0, 5.0],   # Added to test angular error
+        'error_distance_m': [0.0, 0.2]   # Added to test distance error
     }
 
     processors_dict = {
@@ -456,7 +496,7 @@ if __name__ == "__main__":
     print("\n[Preview] Quick Test Results:")
     
     cols_to_show = [
-        "processor", "use_wpe", "t_early_s",
+        "processor", "use_wpe", "error_angle_deg", "error_distance_m",
         "Delta_tot_PESQ", "Delta_tot_SIR", "Delta_tot_SINR"
     ]
     
