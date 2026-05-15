@@ -23,7 +23,8 @@ from evaluation.bf_wrappers import (
     SDW_MWF_Processor,
     MPDR_Recursive_Processor,
     RTF_MVDR_Recursive_Processor,
-    SPP_MVDR_Recursive_Processor
+    SPP_MVDR_Recursive_Processor,
+    SPP_mono_MVDR_Recursive_Processor
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -431,7 +432,7 @@ if __name__ == "__main__":
         'N_interferences': [1],      
         'mismatch_pos': [0.0],       
         'isir_db': [0],         
-        'mismatch_gain': [0],     
+        'mismatch_gain': [0.0],     
         'mismatch_phase': [0],    
         'use_wpe': [False] 
     }
@@ -439,7 +440,7 @@ if __name__ == "__main__":
     processors_dict = {
         "DS": DS_Processor(),
         "MVDR": MVDR_Recursive_Processor(min_loading=1e-6),
-        "SPP-MVDR": SPP_MVDR_Recursive_Processor(min_loading=1e-6)
+        "SPP-MVDR": SPP_mono_MVDR_Recursive_Processor(min_loading=1e-6)
     }
 
     df_final = run_grid_search(

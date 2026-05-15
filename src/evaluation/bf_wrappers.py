@@ -8,6 +8,8 @@ from beamforming.MWF.SP_SDW_MWF_base import sdw_mwf
 from beamforming.MPDRxWPE.mpdr import MPDR_recursive
 from beamforming.MVDR.RTF_estimation import RTF_MVDR_recursive
 from beamforming.MVDR.SPP import SPP_MVDR_recursive
+from beamforming.MVDR.SPP_mono import SPP_mono_MVDR_recursive
+
 
 
 class DS_Processor:
@@ -254,6 +256,67 @@ class SPP_MVDR_Recursive_Processor:
         y_time = y_time[:original_length]
 
         return y_time, weights_rec
+    
+
+class SPP_mono_MVDR_Recursive_Processor:
+    """
+    Wrapper for the isolated MVDR_recursive algorithm.
+    Handles STFT/ISTFT transformations, parameter extraction from the 
+    pipeline config, and ensures the expected output format.
+    """
+    def __init__(self, nperseg=512, noverlap=256, min_loading=1e-6):
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        """
+        Executes the spatial filtering process by acting as a bridge 
+        between the orchestration pipeline and the core mathematical function.
+        """
+        # 1. Extract configurations
+        fs = scene_config['fs']
+        source_pos = scene_config['source_pos'].reshape(1, 3)
+        mic_coords = scene_config['mic_coords']
+        vad = scene_config['VAD']
+        
+        # 2. Forward STFT
+        # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
+        freqs, times, Zxx = sig.stft(
+            mic_signals, fs=fs, window='hamming', 
+            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+        )
+        
+        # Transpose to shape (K, T, M) for spatial processing
+        X_stft = np.transpose(Zxx, (1, 2, 0))
+        
+        # 3. Pad VAD to avoid index out of bounds during the last STFT frames
+        vad_padded = np.pad(vad, (0, self.nperseg + self.hop_length), mode='constant')
+
+        # 4. Call the isolated core function
+        # CRITICAL: We pass save_weights=True to get the matrix for the benchmark H5 files
+        Y_stft, weights_rec = SPP_MVDR_recursive(
+            X_stft=X_stft, 
+            fs=fs, 
+            array_geometry=mic_coords, 
+            source_pos=source_pos, 
+            save_weights=True 
+        )
+        
+        # 5. Inverse STFT to return to time domain
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming', 
+            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+        )
+        
+        # Ensure the output length exactly matches the original input signal
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights_rec
+    
     
     
 

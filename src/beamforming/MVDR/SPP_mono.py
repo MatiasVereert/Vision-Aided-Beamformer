@@ -9,7 +9,7 @@ from propagation.simulate_acoustics import SimAcoustic
 from dereverberation.nara_wrappers import process_wpe_online
 
 
-def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
+def SPP_mono_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False, save_mask = False):
     # Forgetting factor for covariance matrix smoothing
     lamda = 0.99
     K, T, M = X_stft.shape  
@@ -37,7 +37,7 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
     R_nn_inv = np.linalg.inv(R_nn + initial_diag_load)
 
     # SPP Hyperparameters (May need slight tuning for spectral energy)
-    gamma_th = 6
+    gamma_th = 5
     spp_slope = 6
 
     weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -101,11 +101,14 @@ def SPP_MVDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_lo
         # --- 5. Apply Filter ---
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
-    if save_weights:
+    if save_weights and save_mask:
         return Y_stft, Y_spp_stft, weights_rec
-    else:
+    if save_weights and not save_mask:
+        return Y_stft, weights_rec
+    if not save_weights and save_mask:  
         return Y_stft, Y_spp_stft
-    
+    if not save_weights and not save_mask:
+         return Y_stft
 
 def apply_mvdr_stft_bridge(time_domain_input, vad_oracle, mic_coords, source_pos_2d, fs, length_fft=512, hop_length_fft=256):
     """
