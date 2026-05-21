@@ -255,7 +255,7 @@ def main():
     st.sidebar.title("Acoustic Benchmark")
     st.sidebar.markdown("---")
     
-    results_dir = r"tests\dataset_out\quick_test" 
+    results_dir = r"d:\Windows\Descargas" 
     if not os.path.exists(results_dir):
         st.sidebar.error(f"Directory not found: {results_dir}")
         return

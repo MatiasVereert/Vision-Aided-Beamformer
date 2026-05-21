@@ -1,0 +1,66 @@
+import sys
+import os
+import tensorflow as tf
+
+# --- MONKEY PATCH FOR OBSOLETE KERAS ARGUMENTS ---
+# The cloned repo uses old Keras 2 arguments ('lr' and 'decay') which crash in Keras 3.
+# We intercept RMSprop globally to translate these arguments on the fly.
+original_rmsprop = tf.keras.optimizers.RMSprop
+
+def patched_rmsprop(*args, **kwargs):
+    if 'lr' in kwargs:
+        kwargs['learning_rate'] = kwargs.pop('lr')  # Rename 'lr' to 'learning_rate'
+    if 'decay' in kwargs:
+        kwargs.pop('decay')  # Remove unsupported 'decay' argument
+    return original_rmsprop(*args, **kwargs)
+
+# Apply the patch to TensorFlow before importing the repository modules
+tf.keras.optimizers.RMSprop = patched_rmsprop
+# -------------------------------------------------
+
+# Setup paths to find the cloned repository locally
+current_script_path = os.path.abspath(__file__)
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_script_path))))
+repo_path = os.path.join(project_root, "Neural-mask-estimation")
+
+if repo_path not in sys.path:
+    sys.path.append(repo_path)
+
+# Now it is safe to import the maskestimator model
+from maskestimator import model
+
+def load_akojima_model(weights_prefix_path):
+    """
+    Builds the model architecture and loads the pre-trained weights locally.
+    """
+    FFTL = 1024
+    TRUNCATE_GRAD = 7
+    LEFT_CONTEXT = 0
+    RIGHT_CONTEXT = 0
+    NUMBER_OF_STACK = LEFT_CONTEXT + RIGHT_CONTEXT + 1
+    LR = 0.001 
+    RECURRENT_INIT = 0.04
+
+    mask_estimator_generator = model.NeuralMaskEstimation(
+        TRUNCATE_GRAD,
+        NUMBER_OF_STACK,
+        LR, 
+        FFTL // 2 + 1,
+        recurrent_init=RECURRENT_INIT
+    )
+    
+    keras_model = mask_estimator_generator.get_model(
+        is_stateful=False,
+        is_show_detail=False,
+        is_adapt=False  # Must be False to prevent legacy compilation crashes
+    )
+    
+    keras_model.load_weights(weights_prefix_path)
+    return keras_model
+
+if __name__ == "__main__":
+    weights_path = r"C:\Users\Matias\Documents\Tesis\Vision-Aided-Beamformer\Neural-mask-estimation\model\194sequence_false_e1.hdf5"
+    
+    print("Cargando modelo de estimación de máscaras con parches de compatibilidad...")
+    mask_model = load_akojima_model(weights_path)
+    print("¡Modelo cargado exitosamente sin alterar los archivos del repositorio!")
