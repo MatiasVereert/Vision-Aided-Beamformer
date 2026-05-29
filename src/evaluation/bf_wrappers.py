@@ -28,11 +28,16 @@ class DS_Processor:
         source_pos = scene_config['source_pos'].reshape(1, 3)
         mic_coords = scene_config['mic_coords']
         
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        
         # Compute STFT
         # Input shape: (M, N_samples). Output shape X_stft: (M, K, T)
         freqs, times, X_stft = sig.stft(
             mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Transpose to (K, T, M) for spatial frequency-domain processing
@@ -62,7 +67,7 @@ class DS_Processor:
         # Compute ISTFT to return to the time domain
         _, y_time = sig.istft(
             X_hat_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Return both the processed 1D signal and the weights matrix
@@ -86,25 +91,31 @@ class DTLN_MB_MVDR_Processor:
         
         # Dynamically extract DTLN model path from the benchmark config
         # Defaults to a standard path if not provided in the dictionary
-        model_path = scene_config.get('dtln_model_path', r'src\dnn_denoise\models\model_quant_1.tflite')
+        model_path = scene_config.get('dtln_model_path', r'dnn_denoise\models\model_quant_1.tflite')
+
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
 
         # Warning to use the same windows as the DTLN model was trained on
-        if self.nperseg != 512 or self.hop_length != 128:
-            print(f"[Warning]: Window length ({self.nperseg}) and hop length ({self.hop_length}) should ideally match DTLN training (512/128).")
+        if nperseg_dyn != 512 or hop_length_dyn != 128:
+            print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
 
         # 2. Extract masks using block_shift (hop_length)
         mask_s, mask_n = get_dtln_masks(
             mic_signals, 
             model_path, 
-            block_len=self.nperseg, 
-            block_shift=self.hop_length
+            block_len=nperseg_dyn, 
+            block_shift=hop_length_dyn
         )
 
         # 3. Compute STFT
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
             mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Transpose to (K, T, M) for spatial frequency-domain processing
@@ -127,7 +138,7 @@ class DTLN_MB_MVDR_Processor:
         # 6. Compute ISTFT to return to the time domain
         _, y_time = sig.istft(
             Y_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # 7. Ensure the output length exactly matches the original input signal
@@ -135,8 +146,7 @@ class DTLN_MB_MVDR_Processor:
         y_time = y_time[:original_length]
         
         return y_time, weights
-# Assuming the isolated core function is imported from your module
-# from your_module.base import MVDR_recursive
+
 
 class MVDR_Recursive_Processor:
     """
@@ -147,8 +157,6 @@ class MVDR_Recursive_Processor:
     def __init__(self, nperseg=512, noverlap=256, min_loading=1e-6):
         self.nperseg = nperseg
         self.noverlap = noverlap
-        self.nfft = nperseg
-        self.hop_length = nperseg - noverlap
         self.min_loading = min_loading
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
@@ -162,18 +170,24 @@ class MVDR_Recursive_Processor:
         mic_coords = scene_config['mic_coords']
         vad = scene_config['VAD']
         
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
         # 2. Forward STFT
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
             mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Transpose to shape (K, T, M) for spatial processing
         X_stft = np.transpose(Zxx, (1, 2, 0))
         
         # 3. Pad VAD to avoid index out of bounds during the last STFT frames
-        vad_padded = np.pad(vad, (0, self.nperseg + self.hop_length), mode='constant')
+        vad_padded = np.pad(vad, (0, nperseg_dyn + hop_length_dyn), mode='constant')
 
         # 4. Call the isolated core function
         # CRITICAL: We pass save_weights=True to get the matrix for the benchmark H5 files
@@ -183,8 +197,8 @@ class MVDR_Recursive_Processor:
             fs=fs, 
             array_geometry=mic_coords, 
             source_pos=source_pos, 
-            length_fft=self.nperseg, 
-            hop_length_fft=self.hop_length,
+            length_fft=nperseg_dyn, 
+            hop_length_fft=hop_length_dyn,
             min_loading=self.min_loading,
             save_weights=True 
         )
@@ -192,7 +206,7 @@ class MVDR_Recursive_Processor:
         # 5. Inverse STFT to return to time domain
         _, y_time = sig.istft(
             Y_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Ensure the output length exactly matches the original input signal
@@ -210,8 +224,6 @@ class RTF_MVDR_Recursive_Processor:
     def __init__(self, nperseg=512, noverlap=256, min_loading=1e-6):
         self.nperseg = nperseg
         self.noverlap = noverlap
-        self.nfft = nperseg
-        self.hop_length = nperseg - noverlap
         self.min_loading = min_loading
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
@@ -225,18 +237,24 @@ class RTF_MVDR_Recursive_Processor:
         mic_coords = scene_config['mic_coords']
         vad = scene_config['VAD']
         
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
         # 2. Forward STFT
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
             mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Transpose to shape (K, T, M) for spatial processing
         X_stft = np.transpose(Zxx, (1, 2, 0))
         
         # 3. Pad VAD to avoid index out of bounds during the last STFT frames
-        vad_padded = np.pad(vad, (0, self.nperseg + self.hop_length), mode='constant')
+        vad_padded = np.pad(vad, (0, nperseg_dyn + hop_length_dyn), mode='constant')
 
         # 4. Call the isolated core function
         # CRITICAL: We pass save_weights=True to get the matrix for the benchmark H5 files
@@ -246,15 +264,15 @@ class RTF_MVDR_Recursive_Processor:
             fs=fs, 
             array_geometry=mic_coords, 
             source_pos=source_pos, 
-            length_fft=self.nperseg, 
-            hop_length_fft=self.hop_length,
+            length_fft=nperseg_dyn, 
+            hop_length_fft=hop_length_dyn,
             save_weights=True 
         )
         
         # 5. Inverse STFT to return to time domain
         _, y_time = sig.istft(
             Y_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Ensure the output length exactly matches the original input signal
@@ -273,8 +291,6 @@ class SPP_MVDR_Recursive_Processor:
     def __init__(self, nperseg=512, noverlap=256, min_loading=1e-6):
         self.nperseg = nperseg
         self.noverlap = noverlap
-        self.nfft = nperseg
-        self.hop_length = nperseg - noverlap
         self.min_loading = min_loading
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
@@ -288,18 +304,24 @@ class SPP_MVDR_Recursive_Processor:
         mic_coords = scene_config['mic_coords']
         vad = scene_config['VAD']
         
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
         # 2. Forward STFT
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
             mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Transpose to shape (K, T, M) for spatial processing
         X_stft = np.transpose(Zxx, (1, 2, 0))
         
         # 3. Pad VAD to avoid index out of bounds during the last STFT frames
-        vad_padded = np.pad(vad, (0, self.nperseg + self.hop_length), mode='constant')
+        vad_padded = np.pad(vad, (0, nperseg_dyn + hop_length_dyn), mode='constant')
 
         # 4. Call the isolated core function
         # CRITICAL: We pass save_weights=True to get the matrix for the benchmark H5 files
@@ -314,7 +336,7 @@ class SPP_MVDR_Recursive_Processor:
         # 5. Inverse STFT to return to time domain
         _, y_time = sig.istft(
             Y_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Ensure the output length exactly matches the original input signal
@@ -333,8 +355,6 @@ class SPP_mono_MVDR_Recursive_Processor:
     def __init__(self, nperseg=512, noverlap=256, min_loading=1e-6):
         self.nperseg = nperseg
         self.noverlap = noverlap
-        self.nfft = nperseg
-        self.hop_length = nperseg - noverlap
         self.min_loading = min_loading
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
@@ -348,22 +368,28 @@ class SPP_mono_MVDR_Recursive_Processor:
         mic_coords = scene_config['mic_coords']
         vad = scene_config['VAD']
         
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
         # 2. Forward STFT
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
             mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Transpose to shape (K, T, M) for spatial processing
         X_stft = np.transpose(Zxx, (1, 2, 0))
         
         # 3. Pad VAD to avoid index out of bounds during the last STFT frames
-        vad_padded = np.pad(vad, (0, self.nperseg + self.hop_length), mode='constant')
+        vad_padded = np.pad(vad, (0, nperseg_dyn + hop_length_dyn), mode='constant')
 
         # 4. Call the isolated core function
         # CRITICAL: We pass save_weights=True to get the matrix for the benchmark H5 files
-        Y_stft, weights_rec = SPP_MVDR_recursive(
+        Y_stft, weights_rec = SPP_mono_MVDR_recursive(
             X_stft=X_stft, 
             fs=fs, 
             array_geometry=mic_coords, 
@@ -374,7 +400,7 @@ class SPP_mono_MVDR_Recursive_Processor:
         # 5. Inverse STFT to return to time domain
         _, y_time = sig.istft(
             Y_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Ensure the output length exactly matches the original input signal
@@ -384,13 +410,6 @@ class SPP_mono_MVDR_Recursive_Processor:
         return y_time, weights_rec
     
     
-    
-
-
-
-# Assuming KMVDR_recursive is imported from your module
-# from your_module.kmvdr_base import KMVDR_recursive
-
 class KMVDR_Recursive_Processor:
     """
     Wrapper for the Kronecker MVDR beamformer.
@@ -400,8 +419,6 @@ class KMVDR_Recursive_Processor:
     def __init__(self, nperseg=512, noverlap=256, target_P=2, alpha=0.95, ALS_iterations=2, beta=1e-3, min_loading=1e-6):
         self.nperseg = nperseg
         self.noverlap = noverlap
-        self.nfft = nperseg
-        self.hop_length = nperseg - noverlap
         
         # KMVDR specific parameters
         self.target_P = target_P
@@ -436,6 +453,12 @@ class KMVDR_Recursive_Processor:
         
         M = mic_signals.shape[0]
         
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
         # 2. Intelligent factorization for Kronecker Sub-arrays
         M1, M2 = self._get_optimal_factors(M)
         
@@ -446,14 +469,14 @@ class KMVDR_Recursive_Processor:
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
             mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Transpose to shape (K, T, M) for the core function
         X_stft = np.transpose(Zxx, (1, 2, 0))
         
         # Pad VAD to avoid out-of-bounds indexing in the final STFT frames
-        vad_padded = np.pad(vad, (0, self.nperseg + self.hop_length), mode='constant')
+        vad_padded = np.pad(vad, (0, nperseg_dyn + hop_length_dyn), mode='constant')
 
         # 4. Execute the core mathematical function
         Y_stft, weights_rec = KMVDR_recursive(
@@ -469,15 +492,15 @@ class KMVDR_Recursive_Processor:
             ALS_iterations=self.ALS_iterations,
             beta=self.beta,
             min_loading=self.min_loading,
-            length_fft=self.nperseg, 
-            hop_length_fft=self.hop_length,
+            length_fft=nperseg_dyn, 
+            hop_length_fft=hop_length_dyn,
             save_weights=True
         )
         
         # 5. Inverse STFT to return to the time domain
         _, y_time = sig.istft(
             Y_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Ensure exact length match
@@ -486,11 +509,6 @@ class KMVDR_Recursive_Processor:
 
         return y_time, weights_rec
 
-
-import numpy as np
-
-# Assuming the isolated core function is imported from your module
-# from your_module.WPE_SP_SDW_MWF import sdw_mwf
 
 class SDW_MWF_Processor:
     """
@@ -539,11 +557,6 @@ class SDW_MWF_Processor:
         # Return strictly the 1D processed audio and the 3D weights tensor
         return y_time, weights_rec
 
-import numpy as np
-import scipy.signal as sig
-
-# Assuming MPDR_recursive is imported from your module
-# from your_module.mpdr import MPDR_recursive
 
 class MPDR_Recursive_Processor:
     """
@@ -555,8 +568,6 @@ class MPDR_Recursive_Processor:
         # STFT configuration
         self.nperseg = nperseg
         self.noverlap = noverlap
-        self.nfft = nperseg
-        self.hop_length = nperseg - noverlap
         
         # Algorithm hyper-parameters
         self.beta = beta
@@ -571,11 +582,16 @@ class MPDR_Recursive_Processor:
         source_pos = scene_config['source_pos'].reshape(1, 3)
         mic_coords = scene_config['mic_coords']
         
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+
         # 2. Forward STFT
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
             mic_signals, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # Transpose to shape (K, T, M) to match the core function expectations
@@ -596,7 +612,7 @@ class MPDR_Recursive_Processor:
         # 4. Inverse STFT to return to the time domain
         _, y_time = sig.istft(
             Y_stft, fs=fs, window='hamming', 
-            nperseg=self.nperseg, noverlap=self.noverlap, nfft=self.nfft
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
         
         # 5. Ensure exact length match with input signal
