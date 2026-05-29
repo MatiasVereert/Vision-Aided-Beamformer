@@ -44,7 +44,7 @@ if __name__ == "__main__":
     # Configuration parameters
     # Define your custom output directory path here
     TARGET_DIRECTORY = r"data/audio/input" 
-    OUTPUT_FILENAME = "ruido_rosa_16k.wav"
+    OUTPUT_FILENAME = "ruido_rosa_16k_4.wav"
     DURATION = 10  # Audio duration in seconds
     SAMPLE_RATE = 16000  # Target sample rate (16 kHz)
     

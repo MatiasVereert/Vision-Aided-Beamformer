@@ -24,7 +24,8 @@ from evaluation.bf_wrappers import (
     MPDR_Recursive_Processor,
     RTF_MVDR_Recursive_Processor,
     SPP_MVDR_Recursive_Processor,
-    SPP_mono_MVDR_Recursive_Processor
+    SPP_mono_MVDR_Recursive_Processor,
+    DTLN_MB_MVDR_Processor
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -429,10 +430,10 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
 if __name__ == "__main__":
     
     try:
-        interpreter_1 = tf.lite.Interpreter(model_path="data/dnn_models/model_1.tflite")
+        interpreter_1 = tf.lite.Interpreter(model_path="src\dnn_denoise\models\model_quant_1.tflite")
         interpreter_1.allocate_tensors()
         
-        interpreter_2 = tf.lite.Interpreter(model_path="data/dnn_models/model_2.tflite")
+        interpreter_2 = tf.lite.Interpreter(model_path="src\dnn_denoise\models\model_quant_2.tflite")
         interpreter_2.allocate_tensors()
         print("[*] DTLN TF-Lite interpreters successfully allocated.")
     except Exception as e:
@@ -480,7 +481,8 @@ if __name__ == "__main__":
     processors_dict = {
         "DS": DS_Processor(),
         "MVDR": MVDR_Recursive_Processor(min_loading=1e-6),
-        "SPP-MVDR": SPP_mono_MVDR_Recursive_Processor(min_loading=1e-6)
+        "SPP-MVDR": SPP_mono_MVDR_Recursive_Processor(min_loading=1e-6),
+        "DTLN-MVDR": DTLN_MB_MVDR_Processor()
     }
 
     df_final = run_grid_search(

@@ -253,11 +253,11 @@ if __name__ == "__main__":
     
     # Use a raw string 'r' to prevent Windows backslash issues
     # Point directly to the first DTLN model
-    MODEL_1_PATH = r'tools\data\redes\model_1.tflite'
+    MODEL_1_PATH = r'tools\data\models\model_quant_1.tflite'
     
     print("=== HYBRID TEST: DTLN MASK-BASED ONLINE MVDR ===")
     
-    output_folder = "tests/data/hybrid_v2_mvdr_output"
+    output_folder = "tests/data/hybrid_v0_mvdr_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Array geometry (logarithmic spacing)

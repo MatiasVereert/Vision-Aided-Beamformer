@@ -300,7 +300,7 @@ if __name__ == "__main__":
     
     # Use a raw string 'r' to prevent Windows backslash issues
     # Point directly to the first DTLN model
-    MODEL_1_PATH = r'tools\data\redes\model_1.tflite'
+    MODEL_1_PATH = r'tools\data\models\model_quant_1.tflite'
     
     print("=== HYBRID TEST: DTLN MASK-BASED ONLINE MVDR ===")
     

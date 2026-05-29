@@ -15,24 +15,22 @@ src/beamforming/MPDRxWPE/WPE-MPDRxWPE_vs_MWF.py
 src/beamforming/MPDRxWPE/__init__.py
 src/beamforming/MPDRxWPE/mpdr.py
 src/beamforming/MPDRxWPE/signal_model.py
+src/beamforming/MVDR/DNN_RTF.py
 src/beamforming/MVDR/RTF_and_VAD_estimation.py
 src/beamforming/MVDR/RTF_estimation copy.py
 src/beamforming/MVDR/RTF_estimation.py
 src/beamforming/MVDR/RTF_estimation_and_spatial_reg.py
 src/beamforming/MVDR/SPP CGMM.py
-src/beamforming/MVDR/SPP RTF.py
-src/beamforming/MVDR/SPP RTF_noise copy.py
-src/beamforming/MVDR/SPP RTF_noise.py
-src/beamforming/MVDR/SPP RTG copy.py
-src/beamforming/MVDR/SPP copy.py
+src/beamforming/MVDR/SPP _full_blind.py
+src/beamforming/MVDR/SPP copy 2.py
 src/beamforming/MVDR/SPP.py
-src/beamforming/MVDR/SPP_debug.py
-src/beamforming/MVDR/SPP_dnn copy.py
+src/beamforming/MVDR/SPP_RTF.py
 src/beamforming/MVDR/SPP_dnn.py
-src/beamforming/MVDR/SPP_spatial_debug with_post.py
-src/beamforming/MVDR/SPP_spatial_debug with_post_over_sampling difuse.py
-src/beamforming/MVDR/SPP_spatial_debug with_post_over_sampling.py
-src/beamforming/MVDR/SPP_spatial_debug.py
+src/beamforming/MVDR/SPP_mono.py
+src/beamforming/MVDR/SPP_semi_blind.py
+src/beamforming/MVDR/SPP_spatial_debug blind_OK.py
+src/beamforming/MVDR/SPP_spatial_debug mono_SPP.py
+src/beamforming/MVDR/SPP_spatial_dfn.py
 src/beamforming/MVDR/TF-MVDR_SPP.py
 src/beamforming/MVDR/__init__.py
 src/beamforming/MVDR/base SPP RTF noise.py
@@ -64,11 +62,17 @@ src/beamforming/evaluation/array_sensitivity_gain.py
 src/beamforming/evaluation/gain.py
 src/beamforming/kmvdr/__init__.py
 src/beamforming/kmvdr/kmvdr_base.py
+src/beamforming/mask/MB_MVDR.py
 src/beamforming/mask/NSNet2 blind.py
 src/beamforming/mask/NSNet2 copy.py
 src/beamforming/mask/NSNet2.py
+src/beamforming/mask/SPP_dnn_copy.py
 src/beamforming/mask/__init__.py
 src/beamforming/mask/deep_filt_MVDR.py
+src/beamforming/mask/dtln_gev.py
+src/beamforming/mask/dtln_mvdr.py
+src/beamforming/mask/dtln_mvdr_v1 copy.py
+src/beamforming/mask/dtln_mvdr_v1.py
 src/beamforming/mask/neural_MVDR.py
 src/dereverberation/__init__.py
 src/dereverberation/nara_wrappers.py
@@ -77,16 +81,18 @@ src/dnn_denoise/dtln_lite.py
 src/dnn_denoise/real_time_processing_tf_lite (1).py
 src/evaluation/__init__.py
 src/evaluation/bf_wrappers.py
-src/evaluation/dashboard copy.py
 src/evaluation/dashboard.py
 src/evaluation/evaluate.py
 src/evaluation/full_benchmark.py
 src/evaluation/full_benchmark_test_1.py
 src/evaluation/full_benchmark_test_2.py
+src/evaluation/full_benchmark_test_dtln copy.py
+src/evaluation/full_benchmark_test_dtln.py
 src/evaluation/metrics.py
 src/evaluation/polar_plots.py
 src/propagation/__init__.py
 src/propagation/free_field.py
+src/propagation/mird_loader.py
 src/propagation/simulate_acoustics.py
 src/propagation/simulate_acoustics_v1.py
 src/utils/__init__.py

@@ -1,27 +1,37 @@
 [build-system]
-# Indica a Python cómo construir el paquete.
+# Tells Python how to build the package.
 requires = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "beamfomig-python" # El nombre que tendrá tu paquete.
-version = "0.1.0" # La versión inicial.
+name = "beamfomig-python" # The name your package will have.
+version = "0.1.0" # The initial version.
 description = "Proyecto de Beamforming en Python"
 readme = "README.md"
 authors = [{name = "Tu Nombre", email = "tu.email@ejemplo.com"}]
-license = {file = "LICENSE"} # Si tienes un archivo de licencia.
+license = {file = "LICENSE"} # If you have a license file.
 keywords = ["beamforming", "mems", "array", "audio"]
 
-# Las dependencias de tu proyecto. Asegúrate de incluir las librerías que usas.
+# Your project's dependencies. Make sure to include the libraries you use.
 dependencies = [
     "numpy",
     "scipy",
-    "matplotlib", # Si usas plot_utils
-    "pyroomacoustics"
+    "matplotlib",
+    "pyroomacoustics",
+    "h5py",
+    "streamlit",
+    "plotly",
+    "pandas",
+    "tqdm",
+    "tensorflow",
+    "mir_eval",
+    "pysepm",
+    "numba",
+    "pb_bss"
 ]
 
 [tool.setuptools.packages]
-# Esta sección es CRUCIAL. Indica dónde están los módulos.
-# En tu caso, 'src' contiene los paquetes 'beamforming' y 'propagation'.
-# La siguiente línea le dice a setuptools que busque los paquetes dentro de la carpeta 'src'.
+# This section is CRUCIAL. It indicates where the modules are located.
+# In your case, 'src' contains the 'beamforming' and 'propagation' packages.
+# The following line tells setuptools to look for packages inside the 'src' folder.
 find = {where = ["src"]}

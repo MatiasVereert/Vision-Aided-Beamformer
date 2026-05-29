@@ -10,7 +10,7 @@ from utils.audio import save_wav, normalize_signal
 # =====================================================================
 # 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
 # =====================================================================
-def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-10, lamda=0.99):
+def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-10, lamda=0.99, save_weights = False):
     K, T, M = X_stft.shape  
     
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -21,6 +21,9 @@ def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-10, lamda=0
     # Memory for the directional vector
     d_prev = np.ones((K, M), dtype=np.complex128) 
     d_prev[:, 0] = 1.0 # Reference at mic 0
+
+    if save_weights:
+        weights_rec = np.zeros((K, T, M), dtype=np.complex128)
     
     for m in range(T):
         print(f"\rProcessing frame {m} of {T}", end="")
@@ -39,7 +42,7 @@ def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-10, lamda=0
         # d = eigenvectors[:, :, -1]  
         # =========================================================
         
-        # Power Iteration: Matrix-vector multiplication using the previous RTF
+        # Power Iteration: Matrix-vector multiplication using the previous 0
         d_unnorm = np.einsum("fmn,fn->fm", Phi_XX, d_prev)
         
         # L2 Normalization to prevent numerical overflow during iterations
@@ -79,9 +82,16 @@ def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-10, lamda=0
         # Force np.real to prevent numerical imaginary residuals.
         weights = weights_nom / (np.real(weights_den[:, np.newaxis]) + 1e-10)
 
+        if save_weights:
+            weights_rec[:, m, :] = weights
+
+
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
-    return Y_stft
+    if save_weights:
+        return Y_stft, weights_rec 
+    else:
+        return Y_stft
 
 # =====================================================================
 # 2. OFFLINE MASK ESTIMATION WRAPPER (DTLN)
@@ -270,11 +280,11 @@ if __name__ == "__main__":
     
     # Use a raw string 'r' to prevent Windows backslash issues
     # Point directly to the first DTLN model
-    MODEL_1_PATH = r'tools\data\redes\model_1.tflite'
+    MODEL_1_PATH = r'tools\data\models\model_quant_1.tflite'
     
     print("=== HYBRID TEST: DTLN MASK-BASED ONLINE MVDR ===")
     
-    output_folder = "tests/data/hybrid_v2_mvdr_output"
+    output_folder = "tests/data/hybrid_v1_mvdr_output"
     os.makedirs(output_folder, exist_ok=True)
     
     # Array geometry (logarithmic spacing)
