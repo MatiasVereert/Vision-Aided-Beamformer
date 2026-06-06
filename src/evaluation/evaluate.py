@@ -6,8 +6,7 @@ import pandas as pd
 import scipy.signal as sig
 import hashlib
 import pickle
-import noisereduce as nr
-
+ç
 
 # Import the Numba function and steering vector helper from your module
 from beamforming.MPDRxWPE.MPDRxWPE import MPDRxWPE_numba

@@ -85,10 +85,10 @@ import tensorflow as tf
 
 def main():
     # Define placeholder paths for models and audio files
-    model1_path = r"data/dnn_models/model_quant_1.tflite"
-    model2_path = r"data/dnn_models/model_quant_2.tflite"
+    model1_path = r"tools\data\models\model_quant_1.tflite"
+    model2_path = r"tools\data\models\model_quant_2.tflite"
 
-    input_path = r"tests/dataset_out/integration_test/test_mixture_ch1.wav"  # Replace with your input path
+    input_path = r"tests\dataset_out\mird_mvdr_final\2_MIRD_degraded_input_mic0.wav"
     output_path = r"audio_limpio.wav"
 
     # Initialize and allocate interpreters for Model 1 and Model 2

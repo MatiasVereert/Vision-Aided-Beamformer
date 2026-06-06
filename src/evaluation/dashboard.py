@@ -64,7 +64,6 @@ def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case
                 data["spatial"][proc_name][attr_key] = attr_val
                     
     return data
-
 def display_metrics_row(metrics_dict: dict):
     """
     Displays metrics dynamically, adapting to the new prefix-based naming 
@@ -94,7 +93,27 @@ def display_metrics_row(metrics_dict: dict):
             delta = metrics_dict.get(f"Delta_tot_{m}", np.nan)
             st.metric(label=f"{m} (BF)", value=f"{val:.3f}", delta=f"{delta:.3f}")
 
-    # Row 2: Full Pipeline (including DTLN) vs Baseline, if available
+    # Row 2: Standalone Neural Performance (DTLN Alone) vs Baseline
+    # This row was missing from the initial layout rendering loop
+    has_dtln_alone = any(k.startswith("dtln_alone_") for k in metrics_dict.keys())
+    if has_dtln_alone:
+        st.markdown("### Standalone DTLN Performance (Single-Mic)")
+        cols_alone = st.columns(len(metric_names))
+        for idx, m in enumerate(metric_names):
+            with cols_alone[idx]:
+                val = metrics_dict.get(f"dtln_alone_{m}", np.nan)
+                base_val = metrics_dict.get(f"base_{m}", np.nan)
+                
+                # Compute total absolute delta improvement against raw baseline on the fly
+                delta_tot_alone = val - base_val if not np.isnan(val) and not np.isnan(base_val) else np.nan
+                
+                # Invert delta direction visual color for Cepstral Distance (lower is better)
+                if m == "CD":
+                    delta_tot_alone = -delta_tot_alone if not np.isnan(delta_tot_alone) else np.nan
+                    
+                st.metric(label=f"{m} (DTLN Alone)", value=f"{val:.3f}", delta=f"{delta_tot_alone:.3f}" if not np.isnan(delta_tot_alone) else None)
+
+    # Row 3: Full Pipeline (including DTLN) vs Baseline, if available
     has_dtln = any(k.startswith("dtln_post_") for k in metrics_dict.keys())
     if has_dtln:
         st.markdown("### Full Pipeline Performance (BF + DTLN)")
@@ -104,8 +123,7 @@ def display_metrics_row(metrics_dict: dict):
                 val = metrics_dict.get(f"dtln_post_{m}", np.nan)
                 delta = metrics_dict.get(f"Delta_tot_pipeline_{m}", np.nan)
                 st.metric(label=f"{m} (Pipeline)", value=f"{val:.3f}", delta=f"{delta:.3f}")
-
-
+                
 def get_room_wireframe_traces(room_dims: list, **kwargs) -> list:
     """
     Generates a list of Plotly Scatter3d traces to draw a correct wireframe box.

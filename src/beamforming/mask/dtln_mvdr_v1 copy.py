@@ -6,6 +6,7 @@ import tensorflow as tf
 # Imports for data simulation 
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav, normalize_signal
+from ai_edge_litert.interpreter import Interpreter
 
 # =====================================================================
 # 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
@@ -126,7 +127,7 @@ def get_dtln_masks(time_domain_input, model1_path, block_len=512, block_shift=12
     M, samples = time_domain_input.shape
     num_blocks = (samples - (block_len - block_shift)) // block_shift
     
-    interpreter_1 = tf.lite.Interpreter(model_path=model1_path)
+    interpreter_1 = Interpreter(model_path=model1_path)
     interpreter_1.allocate_tensors()
     
     input_details_1 = interpreter_1.get_input_details()
@@ -300,15 +301,15 @@ if __name__ == "__main__":
     
     # Use a raw string 'r' to prevent Windows backslash issues
     # Point directly to the first DTLN model
-    MODEL_1_PATH = r'tools\data\models\model_quant_1.tflite'
+    MODEL_1_PATH = r'tools\data\models\model_1.tflite'
     
     print("=== HYBRID TEST: DTLN MASK-BASED ONLINE MVDR ===")
     
     output_folder = "tests/data/hybrid_v2_mvdr_output"
     os.makedirs(output_folder, exist_ok=True)
     
-    M = 6
-    d_min = 0.02  # Minimum distance between mic 0 and mic 1 (e.g., 2 cm)
+    M = 12
+    d_min = 0.002  # Minimum distance between mic 0 and mic 1 (e.g., 2 cm)
     d_max = 0.30  # Maximum distance between mic 0 and mic M-1 (e.g., 30 cm)
 
     if M <= 1:

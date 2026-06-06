@@ -10,7 +10,7 @@ from utils.audio import save_wav, normalize_signal
 # =====================================================================
 # 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
 # =====================================================================
-def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-10, lamda=0.99, save_weights = False):
+def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-3, lamda=0.99, save_weights = False):
     K, T, M = X_stft.shape  
     
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -286,18 +286,34 @@ if __name__ == "__main__":
     
     output_folder = "tests/data/hybrid_v1_mvdr_output"
     os.makedirs(output_folder, exist_ok=True)
+    # =================================================================
+    # 3D LOGARITHMIC FIBONACCI SPHERE GEOMETRY
+    # =================================================================
+    r_min = 0.04  # Minimum radius (e.g., 4 cm for high frequencies)
+    r_max = 0.30  # Maximum radius (e.g., 30 cm for low frequencies)
     
-    # Array geometry (logarithmic spacing)
-    max_length = 0.30
     if M > 1:
-        base = 2.0
         indices = np.arange(M)
-        x_norm = (base**indices - 1) / (base**(M - 1) - 1)
-        x = x_norm * max_length
+        
+        # Logarithmic radial expansion
+        r = r_min * (r_max / r_min)**(indices / (M - 1))
+        
+        # Golden ratio for uniform angular distribution
+        golden_ratio = (1.0 + np.sqrt(5.0)) / 2.0
+        
+        # Fibonacci sphere angles
+        theta = 2.0 * np.pi * indices / golden_ratio
+        phi = np.arccos(1.0 - 2.0 * (indices / (M - 1)))
+        
+        # Convert spherical to Cartesian coordinates (x, y, z)
+        x = r * np.sin(phi) * np.cos(theta)
+        y = r * np.sin(phi) * np.sin(theta)
+        z = r * np.cos(phi)
     else:
-        x = np.array([0.0])
+        x, y, z = np.array([0.0]), np.array([0.0]), np.array([0.0])
 
-    mic_coords = np.column_stack([x, np.zeros(M), np.zeros(M)])
+    # Assemble coordinates and align with the array center
+    mic_coords = np.column_stack([x, y, z])
     array_center = np.array([1.25, 2.0, 1.25])
     mic_coords = mic_coords - np.mean(mic_coords, axis=0) + array_center
     

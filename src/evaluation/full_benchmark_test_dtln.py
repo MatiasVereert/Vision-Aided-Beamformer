@@ -461,7 +461,11 @@ if __name__ == "__main__":
         'wpe_delay': 3,
         'wpe_alpha': 0.9999,
         'wpe_stft_size': 512,
-        'wpe_stft_shift': 128
+        'wpe_stft_shift': 128,
+        # Parámetros STFT globales para todos los beamformers
+        'stft_window': 512,
+        'stft_overlap': 384  # 512 - 128 (salto de DTLN)
+
     }
 
     # Added error_angle_deg and error_distance_m to the search grid

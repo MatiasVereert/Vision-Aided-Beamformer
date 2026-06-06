@@ -5,12 +5,8 @@ import scipy.signal as signal
 # Ensure import paths strictly align with your localized package repository layout
 from propagation.simulate_acoustics_v1 import SimAcoustic
 from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array
-from beamforming.MVDR.DNN_RTF import apply_mvdr_stft_bridge  # Importing your existing STFT bridge core
+from beamforming.mask.dtln_mvdr_v1 import apply_hybrid_pipeline
 from utils.audio import save_wav, normalize_signal
-import os
-import numpy as np
-import scipy.signal as signal
-import tensorflow as tf  # Added import to load TFLite models natively
 
 def run_mird_mvdr_evaluation():
     print("\n==================================================")
@@ -20,7 +16,7 @@ def run_mird_mvdr_evaluation():
     # --- 1. CONFIGURATION & PATHS ---
     # Downsample target physical sampling rate to wideband speech processing standard
     FS = 16000
-    sim_duration = 15
+    sim_duration = 25
     target_isir_db = 0
     
     # Establish dynamic paths mapping structural evaluation roots safely
@@ -29,7 +25,7 @@ def run_mird_mvdr_evaluation():
     os.makedirs(output_dir, exist_ok=True)
     
     source_audio_path = r"tools\data\signals\p002_emo_adoration_sentences.wav"
-    interf_audio_path = r"tools\data\signals\hairdryer_07_SH_MKH800.wav"
+    interf_audio_path = r"tools\data\signals\ruido_rosa_16k.wav"
 
     # --- 2. INDEX DATASET PROVIDER ---
     print("[*] Bootstrapping physical multi-channel MIRD registry provider...")
@@ -41,9 +37,9 @@ def run_mird_mvdr_evaluation():
         return
         
     # Evaluate targeted physical reverberation profile fallback logic safely
-    chosen_t60_ms = 160 if 160 in available_t60s else available_t60s[0]
+    chosen_t60_ms = 610 if 610 in available_t60s else available_t60s[0]
     chosen_t60 = chosen_t60_ms / 1000.0
-    chosen_spacing = "4-4-4-8-4-4-4"
+    chosen_spacing = "3-3-3-8-3-3-3"
     target_radius = 1.0  # Radial distance mapping target source placement
 
     print(f"[*] Extracting physical scenario targeted at environment T60={chosen_t60_ms}ms...")
@@ -103,27 +99,19 @@ def run_mird_mvdr_evaluation():
     scene_mix = scene.mix_and_normalize(iSIR_dB=target_isir_db)
     
     mic_signals = scene_mix["mic_signals"]
-    vad_oracle = scene_mix["VAD"]
+    # Note: VAD oracle is no longer needed directly for the Mask-based MVDR
 
-    # --- 6.5 INITIALIZE DNN INTERPRETERS ---
-    print("\n[*] Loading and allocating quantized DTLN TF-Lite interpreters in memory...")
-    interpreter_1 = tf.lite.Interpreter(model_path=r"tools\data\models\model_quant_1.tflite")
-    interpreter_1.allocate_tensors()
+    # --- 7. APPLY DTLN MASK-BASED MVDR FILTERING ---
+    print("\n[*] Triggering adaptive DTLN Mask-Based MVDR spatial beamforming algorithms...")
+    model_1_path = r"tools\data\models\model_quant_1.tflite"
 
-    interpreter_2 = tf.lite.Interpreter(model_path=r"tools\data\models\model_quant_2.tflite")
-    interpreter_2.allocate_tensors()
-
-    # --- 7. APPLY RECURSIVE MVDR SPATIAL FILTERING ---
-    print("\n[*] Triggering adaptive Recursive MVDR spatial beamforming algorithms...")
-    # Pass physical array geometry, absolute target position, and instantiated interpreter objects
-    clean_output_time, mask = apply_mvdr_stft_bridge(
-        time_domain_input=mic_signals,
-        vad_oracle=vad_oracle,
-        mic_coords=    base_array ,
-        source_pos_2d= rel_pos_target.reshape(1, 3),
-        fs=FS,
-        interpreter_1=interpreter_1,  # Passing live object instance instead of string path
-        interpreter_2=interpreter_2,  # Passing live object instance instead of string path
+    # Execute Hybrid Pipeline utilizing neural mask extraction
+    clean_output_time, mask = apply_hybrid_pipeline(
+        time_domain_input=mic_signals, 
+        fs=FS, 
+        model1_path=model_1_path, 
+        length_fft=512, 
+        hop_length_fft=128
     )
 
     # --- 8. EXPORT VALIDATED AUDIO ARTIFACTS ---
@@ -137,7 +125,6 @@ def run_mird_mvdr_evaluation():
     
     # Save final MVDR adaptive spatial reconstruction output normalized preventing numerical integer clipping
     save_wav("3_MIRD_MVDR_enhanced_output.wav", FS, normalize_signal(clean_output_time), output_dir)
-    save_wav("3_MIRD_mask_enhanced_output.wav", FS, normalize_signal(mask), output_dir)
 
     print("\n[+] Physical dataset evaluation framework validation successfully executed.")
     print("==================================================")
