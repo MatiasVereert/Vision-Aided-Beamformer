@@ -97,10 +97,13 @@ def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-3, lamda=0.
 # =====================================================================
 # 2. OFFLINE MASK ESTIMATION WRAPPER (DTLN)
 # =====================================================================
-def get_dtln_masks(time_domain_input, model1_path, block_len=512, block_shift=128):
+# =====================================================================
+# 2. OFFLINE MASK ESTIMATION WRAPPER (DTLN) - SINGLE MIC OPTIMIZED
+# =====================================================================
+def get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=512, block_shift=128):
     """
-    Processes the entire signal offline to extract median-pooled neural masks 
-    using the DTLN STFT-based model.
+    Processes a single reference channel offline to extract neural masks 
+    using the DTLN STFT-based model. This avoids computing masks for all M channels.
     """
     M, samples = time_domain_input.shape
     num_blocks = (samples - (block_len - block_shift)) // block_shift
@@ -111,51 +114,47 @@ def get_dtln_masks(time_domain_input, model1_path, block_len=512, block_shift=12
     input_details_1 = interpreter_1.get_input_details()
     output_details_1 = interpreter_1.get_output_details()
     
-    sp_masks_list = []
+    # Isolate the audio from the selected reference microphone
+    audio_mono = time_domain_input[ref_mic, :]
     
-    for ch in range(M):
-        audio_mono = time_domain_input[ch, :]
+    # Normalize channel audio to prevent DTLN saturation
+    max_val = np.max(np.abs(audio_mono))
+    if max_val > 0:
+        audio_mono = audio_mono / max_val
         
-        # Normalize channel audio to prevent DTLN saturation
-        max_val = np.max(np.abs(audio_mono))
-        if max_val > 0:
-            audio_mono = audio_mono / max_val
-            
-        # Initialize LSTM states for the current channel
-        states_1 = np.zeros(input_details_1[1]['shape'], dtype=np.float32)
-        in_buffer = np.zeros((block_len), dtype=np.float32)
+    # Initialize LSTM states for the reference channel
+    states_1 = np.zeros(input_details_1[1]['shape'], dtype=np.float32)
+    in_buffer = np.zeros((block_len), dtype=np.float32)
+    
+    ch_mask = np.zeros((block_len // 2 + 1, num_blocks), dtype=np.float32)
+    
+    print(f"\r -> Computing DTLN mask ONLY for reference channel {ref_mic}...", end="")
+    
+    for idx in range(num_blocks):
+        # Shift buffer and load new audio samples
+        in_buffer[:-block_shift] = in_buffer[block_shift:]
+        start_idx = idx * block_shift
+        in_buffer[-block_shift:] = audio_mono[start_idx : start_idx + block_shift]
         
-        ch_mask = np.zeros((block_len // 2 + 1, num_blocks), dtype=np.float32)
+        # Compute FFT and magnitude
+        in_block_fft = np.fft.rfft(in_buffer)
+        in_mag = np.abs(in_block_fft)
+        in_mag = np.reshape(in_mag, (1, 1, -1)).astype(np.float32)
         
-        print(f"\rComputing DTLN mask for channel {ch+1}/{M}...", end="")
+        # Predict mask
+        interpreter_1.set_tensor(input_details_1[1]['index'], states_1)
+        interpreter_1.set_tensor(input_details_1[0]['index'], in_mag)
+        interpreter_1.invoke()
         
-        for idx in range(num_blocks):
-            # Shift buffer and load new audio samples
-            in_buffer[:-block_shift] = in_buffer[block_shift:]
-            start_idx = idx * block_shift
-            in_buffer[-block_shift:] = audio_mono[start_idx : start_idx + block_shift]
-            
-            # Compute FFT and magnitude
-            in_block_fft = np.fft.rfft(in_buffer)
-            in_mag = np.abs(in_block_fft)
-            in_mag = np.reshape(in_mag, (1, 1, -1)).astype(np.float32)
-            
-            # Predict mask
-            interpreter_1.set_tensor(input_details_1[1]['index'], states_1)
-            interpreter_1.set_tensor(input_details_1[0]['index'], in_mag)
-            interpreter_1.invoke()
-            
-            out_mask = interpreter_1.get_tensor(output_details_1[0]['index'])
-            states_1 = interpreter_1.get_tensor(output_details_1[1]['index'])
-            
-            ch_mask[:, idx] = np.squeeze(out_mask)
+        out_mask = interpreter_1.get_tensor(output_details_1[0]['index'])
+        states_1 = interpreter_1.get_tensor(output_details_1[1]['index'])
         
-        sp_masks_list.append(ch_mask)
+        ch_mask[:, idx] = np.squeeze(out_mask)
         
-    print() # New line after processing channels
+    print() # New line after processing
 
-    # Pool masks across all microphones using median operation
-    sp_mask_condensed = np.median(np.stack(sp_masks_list, axis=-1), axis=-1)
+    # Skip median pooling as we only have one channel mask now
+    sp_mask_condensed = ch_mask
     
     # Contrast patch: stretch values between 0 and 1
     def stretch_mask(m):
@@ -171,14 +170,20 @@ def get_dtln_masks(time_domain_input, model1_path, block_len=512, block_shift=12
     n_mask_condensed = n_mask_condensed ** 2
     
     return sp_mask_condensed, n_mask_condensed
+     
 
 # =====================================================================
 # 3. PIPELINE INTEGRATION
 # =====================================================================
-def apply_hybrid_pipeline(time_domain_input, fs, model1_path, length_fft=512, hop_length_fft=128):
+def apply_hybrid_pipeline(time_domain_input, fs, model1_path, ref_mic=None, length_fft=512, hop_length_fft=128):
     
-    print(" -> Computing offline neural masks with DTLN...")
-    mask_s, mask_n = get_dtln_masks(time_domain_input, model1_path, block_len=length_fft, block_shift=hop_length_fft)
+    # Calculate the middle microphone index if not explicitly provided
+    M_total = time_domain_input.shape[0]
+    if ref_mic is None:
+        ref_mic = M_total // 2
+        
+    print(f" -> Computing offline neural masks with DTLN (using reference mic {ref_mic})...")
+    mask_s, mask_n = get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=length_fft, block_shift=hop_length_fft)
     
     print(" -> Computing STFT of the mixture...")
     freqs, times, Zxx = signal.stft(
@@ -195,16 +200,15 @@ def apply_hybrid_pipeline(time_domain_input, fs, model1_path, length_fft=512, ho
     # ==============================================================
     # DEBUG DUMP: Masked reference signal
     # ==============================================================
-    print(" -> [DEBUG] Generating single-channel masked dump...")
-    X_ref = X_stft[:, :, 0] # Take microphone 0 (K, T)
-    Y_debug_stft = X_ref * mask_s # Multiply by the speech mask
+    print(f" -> [DEBUG] Generating single-channel masked dump for mic {ref_mic}...")
+    X_ref = X_stft[:, :, ref_mic] # Take the reference microphone instead of 0
+    Y_debug_stft = X_ref * mask_s 
     
     _, y_debug_time = signal.istft(
         Y_debug_stft, fs=fs, nperseg=length_fft, noverlap=length_fft - hop_length_fft
     )
     
-    # Save directly to the tests folder
-    save_wav("DEBUG_mask_only_mic0.wav", fs, normalize_signal(y_debug_time), "tests/data/hybrid_v2_mvdr_output")
+    save_wav(f"DEBUG_mask_only_mic{ref_mic}.wav", fs, normalize_signal(y_debug_time), "tests/data/hybrid_v2_mvdr_output")
     # ==============================================================
 
     print(" -> Running mask-based recursive MVDR...")
@@ -290,7 +294,7 @@ if __name__ == "__main__":
     # =================================================================
     # 3D LOGARITHMIC FIBONACCI SPHERE GEOMETRY
     # =================================================================
-    r_min = 0.04  # Minimum radius (e.g., 4 cm for high frequencies)
+    r_min = 0.003  # Minimum radius (e.g., 4 cm for high frequencies)
     r_max = 0.30  # Maximum radius (e.g., 30 cm for low frequencies)
     
     if M > 1:
