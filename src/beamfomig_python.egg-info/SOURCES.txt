@@ -63,17 +63,12 @@ src/beamforming/evaluation/gain.py
 src/beamforming/kmvdr/__init__.py
 src/beamforming/kmvdr/kmvdr_base.py
 src/beamforming/mask/MB_MVDR.py
-src/beamforming/mask/NSNet2 blind.py
-src/beamforming/mask/NSNet2 copy.py
-src/beamforming/mask/NSNet2.py
 src/beamforming/mask/SPP_dnn_copy.py
 src/beamforming/mask/__init__.py
-src/beamforming/mask/deep_filt_MVDR.py
-src/beamforming/mask/dtln_gev.py
 src/beamforming/mask/dtln_mvdr.py
+src/beamforming/mask/dtln_mvdr_single.py
 src/beamforming/mask/dtln_mvdr_v1 copy.py
 src/beamforming/mask/dtln_mvdr_v1.py
-src/beamforming/mask/neural_MVDR.py
 src/dereverberation/__init__.py
 src/dereverberation/nara_wrappers.py
 src/dnn_denoise/deepfilternet.py
@@ -84,8 +79,6 @@ src/evaluation/bf_wrappers.py
 src/evaluation/dashboard.py
 src/evaluation/evaluate.py
 src/evaluation/full_benchmark.py
-src/evaluation/full_benchmark_test_1.py
-src/evaluation/full_benchmark_test_2.py
 src/evaluation/full_benchmark_test_dtln copy.py
 src/evaluation/full_benchmark_test_dtln.py
 src/evaluation/metrics.py

@@ -1,0 +1,12 @@
+#This txt contains allt the unoficial academic packages
+
+# Force SRMRpy using the exact ZIP URL that pysepm expects to avoid conflicts
+https://github.com/jfsantos/SRMRpy/archive/master.zip#egg=SRMRpy
+
+# Install the rest of the unofficial academic packages
+git+https://github.com/schmiph2/pysepm.git
+git+https://github.com/fgnt/pb_bss.git
+git+https://github.com/fgnt/nara_wpe.git
+
+# Install the local project and all official dependencies
+-e .

@@ -9,5 +9,16 @@ Requires-Dist: numpy
 Requires-Dist: scipy
 Requires-Dist: matplotlib
 Requires-Dist: pyroomacoustics
+Requires-Dist: h5py
+Requires-Dist: pyarrow
+Requires-Dist: streamlit
+Requires-Dist: paderbox
+Requires-Dist: plotly
+Requires-Dist: pandas
+Requires-Dist: tqdm
+Requires-Dist: tensorflow
+Requires-Dist: mir_eval
+Requires-Dist: numba
+Requires-Dist: noisereduce
 
 # Vision-Aided-Beamformer
