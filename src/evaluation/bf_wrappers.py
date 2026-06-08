@@ -12,6 +12,7 @@ from beamforming.MVDR.SPP_mono import SPP_mono_MVDR_recursive
 
 from beamforming.mask.single_dtln_mvdr import get_dtln_masks, MVDR_recursive_mask_based
 
+
 class DS_Processor:
     """
     Standard Delay-and-Sum beamformer for baseline comparison.
@@ -103,9 +104,14 @@ class DTLN_MB_MVDR_Processor:
         if nperseg_dyn != 512 or hop_length_dyn != 128:
             print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
 
+        # Define Reference Microphone Index as middle index
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = M_tot // 2
+
         # 2. Extract masks using block_shift (hop_length)
         mask_s, mask_n = get_dtln_masks(
             mic_signals,
+            ref_mic_idx,
             model_path,
             block_len=nperseg_dyn,
             block_shift=hop_length_dyn

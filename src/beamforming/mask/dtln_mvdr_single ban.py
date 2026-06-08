@@ -12,9 +12,6 @@ from ai_edge_litert.interpreter import Interpreter
 # =====================================================================
 # 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
 # =====================================================================
-# =====================================================================
-# 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
-# =====================================================================
 def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-9, lamda=0.99, save_weights=False):
     K, T, M = X_stft.shape
 
