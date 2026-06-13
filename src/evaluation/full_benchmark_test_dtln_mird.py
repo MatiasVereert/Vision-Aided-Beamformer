@@ -523,7 +523,7 @@ if __name__ == "__main__":
         'snr_db': 60.0,
         'source_path': r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
         'interf_paths': [
-            r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/hairdryer_07_SH_MKH800.wav"
+            r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/all minor ab oz.wav"
         ],
 
         'wpe_taps': 7,

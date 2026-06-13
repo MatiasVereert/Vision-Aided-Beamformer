@@ -19,7 +19,7 @@ import numpy as np
 # Make sure to import this at the top of your file:
 # from beamforming.signal_model import compute_rtf_steering_vector
 
-def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, fs, array_geometry, source_pos, alpha=0.8, min_loading=1e-3, lamda=0.99, save_weights=False):
+def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, fs, array_geometry, source_pos, alpha=0.8, min_loading=1e-6, lamda=0.99, save_weights=False):
     # Extract dimensions
     K, T, M = X_stft.shape
 
