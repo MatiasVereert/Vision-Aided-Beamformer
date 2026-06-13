@@ -26,17 +26,17 @@ def get_h5_structure(h5_filepath: str) -> dict:
 def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case_type: str) -> dict:
     """
     Reads a specific case path from the HDF5 file and extracts the data.
-    Cached by Streamlit to prevent disk reads on every UI interaction. 
+    Cached by Streamlit to prevent disk reads on every UI interaction.
     """
     data = {"audio": {}, "metadata": {}, "geometry": {}, "metrics": {}, "spatial": {}}
     case_path = f"{proc_name}/{metric_name}/{case_type}"
-    
+
     with h5py.File(h5_filepath, 'r') as f:
         if case_path not in f:
             return data
-            
+
         grp = f[case_path]
-        
+
         # Load standard structured groups
         for section in ["audio", "metadata", "geometry"]:
             if section in grp:
@@ -44,7 +44,7 @@ def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case
                     data[section][key] = grp[section][key][()]
                 for attr_key, attr_val in grp[section].attrs.items():
                     data[section][attr_key] = attr_val
-                    
+
         # Load metrics from attributes
         if "metrics" in grp:
             for k, v in grp["metrics"].attrs.items():
@@ -53,7 +53,7 @@ def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case
                     data["metrics"][k] = np.nan
                 else:
                     data["metrics"][k] = v
-                    
+
         # Load spatial group for the specific processor
         spat_key = f"spatial_{proc_name}"
         if spat_key in grp:
@@ -62,12 +62,13 @@ def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case
                 data["spatial"][proc_name][dset_key] = grp[spat_key][dset_key][()]
             for attr_key, attr_val in grp[spat_key].attrs.items():
                 data["spatial"][proc_name][attr_key] = attr_val
-                    
+
     return data
+
 def display_metrics_row(metrics_dict: dict):
     """
-    Displays metrics dynamically, adapting to the new prefix-based naming 
-    convention from the benchmark script (base_, proc_, dtln_, etc.).
+    Displays metrics dynamically, adapting to the new prefix-based naming
+    convention and multiple ground truth references (e.g., anechoic, early).
     """
     st.markdown("""
     <style>
@@ -77,41 +78,52 @@ def display_metrics_row(metrics_dict: dict):
     [data-testid="stMetricDelta"] { font-size: 0.8rem; }
     </style>
     """, unsafe_allow_html=True)
-    
-    # Extract unique metric names (e.g., 'PESQ', 'STOI') by stripping the 'base_' prefix
+
+    # Extract unique metric names by stripping the 'base_' prefix
     base_keys = [k for k in metrics_dict.keys() if k.startswith("base_")]
-    metric_names = [k.replace("base_", "") for k in base_keys]
-    
-    if not metric_names: return
+    all_metric_names = [k.replace("base_", "") for k in base_keys]
+
+    if not all_metric_names: return
+
+    # Extract unique reference ground truths (e.g., 'early', 'anechoic')
+    references = list(set([m.split('_')[-1] for m in all_metric_names if '_' in m]))
+    selected_ref = ""
+    metric_names = all_metric_names
+
+    if references:
+        selected_ref = st.selectbox("Ground Truth Reference for Metrics", sorted(references))
+        # Filter metric names for the selected reference
+        metric_names = [m for m in all_metric_names if m.endswith(f"_{selected_ref}")]
 
     # Row 1: Beamformer Performance vs Baseline
     st.markdown("### Spatial Processing Performance")
     cols_bf = st.columns(len(metric_names))
     for idx, m in enumerate(metric_names):
         with cols_bf[idx]:
+            display_name = m.replace(f"_{selected_ref}", "") if selected_ref else m
             val = metrics_dict.get(f"proc_{m}", np.nan)
             delta = metrics_dict.get(f"Delta_tot_{m}", np.nan)
-            st.metric(label=f"{m} (BF)", value=f"{val:.3f}", delta=f"{delta:.3f}")
+            st.metric(label=f"{display_name} (BF)", value=f"{val:.3f}", delta=f"{delta:.3f}")
 
     # Row 2: Standalone Neural Performance (DTLN Alone) vs Baseline
-    # This row was missing from the initial layout rendering loop
     has_dtln_alone = any(k.startswith("dtln_alone_") for k in metrics_dict.keys())
     if has_dtln_alone:
         st.markdown("### Standalone DTLN Performance (Single-Mic)")
         cols_alone = st.columns(len(metric_names))
         for idx, m in enumerate(metric_names):
             with cols_alone[idx]:
+                display_name = m.replace(f"_{selected_ref}", "") if selected_ref else m
                 val = metrics_dict.get(f"dtln_alone_{m}", np.nan)
                 base_val = metrics_dict.get(f"base_{m}", np.nan)
-                
-                # Compute total absolute delta improvement against raw baseline on the fly
+
+                # Compute total absolute delta improvement against raw baseline
                 delta_tot_alone = val - base_val if not np.isnan(val) and not np.isnan(base_val) else np.nan
-                
+
                 # Invert delta direction visual color for Cepstral Distance (lower is better)
-                if m == "CD":
+                if "CD" in m:
                     delta_tot_alone = -delta_tot_alone if not np.isnan(delta_tot_alone) else np.nan
-                    
-                st.metric(label=f"{m} (DTLN Alone)", value=f"{val:.3f}", delta=f"{delta_tot_alone:.3f}" if not np.isnan(delta_tot_alone) else None)
+
+                st.metric(label=f"{display_name} (DTLN Alone)", value=f"{val:.3f}", delta=f"{delta_tot_alone:.3f}" if not np.isnan(delta_tot_alone) else None)
 
     # Row 3: Full Pipeline (including DTLN) vs Baseline, if available
     has_dtln = any(k.startswith("dtln_post_") for k in metrics_dict.keys())
@@ -120,10 +132,16 @@ def display_metrics_row(metrics_dict: dict):
         cols_dnn = st.columns(len(metric_names))
         for idx, m in enumerate(metric_names):
             with cols_dnn[idx]:
+                display_name = m.replace(f"_{selected_ref}", "") if selected_ref else m
                 val = metrics_dict.get(f"dtln_post_{m}", np.nan)
                 delta = metrics_dict.get(f"Delta_tot_pipeline_{m}", np.nan)
-                st.metric(label=f"{m} (Pipeline)", value=f"{val:.3f}", delta=f"{delta:.3f}")
-                
+
+                # Invert delta for CD metric
+                if "CD" in m:
+                    delta = -delta if not np.isnan(delta) else np.nan
+
+                st.metric(label=f"{display_name} (Pipeline)", value=f"{val:.3f}", delta=f"{delta:.3f}")
+
 def get_room_wireframe_traces(room_dims: list, **kwargs) -> list:
     """
     Generates a list of Plotly Scatter3d traces to draw a correct wireframe box.
@@ -133,18 +151,18 @@ def get_room_wireframe_traces(room_dims: list, **kwargs) -> list:
         [0, 0, 0], [lx, 0, 0], [lx, ly, 0], [0, ly, 0],
         [0, 0, lz], [lx, 0, lz], [lx, ly, lz], [0, ly, lz]
     ])
-    
+
     edges = [
-        (0, 1), (1, 2), (2, 3), (3, 0), 
-        (4, 5), (5, 6), (6, 7), (7, 4), 
-        (0, 4), (1, 5), (2, 6), (3, 7)  
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7)
     ]
 
     x_coords, y_coords, z_coords = [], [], []
     for p1_idx, p2_idx in edges:
         p1 = vertices[p1_idx]
         p2 = vertices[p2_idx]
-        x_coords.extend([p1[0], p2[0], None]) 
+        x_coords.extend([p1[0], p2[0], None])
         y_coords.extend([p1[1], p2[1], None])
         z_coords.extend([p1[2], p2[2], None])
 
@@ -168,7 +186,7 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
     max_db_per_frame = spatial_data.get("max_db_per_frame")
     min_dB = spatial_data.get("min_dB", -30.0)
     n_azimuth = spatial_data.get("N_azimuth", 90)
-    target_fps = spatial_data.get("target_fps", 24) 
+    target_fps = spatial_data.get("target_fps", 24)
 
     # Geometry extraction
     geom = data["geometry"]
@@ -182,7 +200,7 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
     max_allowed_radius = np.min(room_dims) / 2.0
     lobe_scale = min(dist_to_source, max_allowed_radius) * user_scale
 
-    unit_vectors = points / np.linalg.norm(points[0]) 
+    unit_vectors = points / np.linalg.norm(points[0])
     n_elevation = n_azimuth // 2 + 1
     T = q_gain.shape[2]
     time_indices = range(0, T, decimator)
@@ -208,7 +226,7 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
         fig.add_trace(trace)
 
     fig.add_trace(go.Surface(
-        uid='dynamic-surface', 
+        uid='dynamic-surface',
         x=X0, y=Y0, z=Z0, surfacecolor=C0,
         colorscale='Viridis', cmin=0, cmax=1, showscale=False, opacity=1.0,
         contours=dict(x=dict(show=False), y=dict(show=False), z=dict(show=False)),
@@ -227,14 +245,14 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
         Xt, Yt, Zt, Ct = get_frame_mesh(t_idx, max_db_per_frame[f_idx, t_idx])
         frames.append(go.Frame(
             data=[{'uid': 'dynamic-surface', 'type': 'surface', 'x': Xt, 'y': Yt, 'z': Zt, 'surfacecolor': Ct}],
-            traces=[1], 
+            traces=[1],
             name=frame_name
         ))
     fig.frames = frames
 
     slider_steps = []
-    time_step_s = 0.5 
-    
+    time_step_s = 0.5
+
     for t_idx in time_indices:
         time_sec = t_idx / target_fps
         label = f"{time_sec:.2f}s" if (time_sec % time_step_s < (1/target_fps)) else ""
@@ -258,13 +276,13 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
     )]
 
     fig.update_layout(
-        scene=dict( 
+        scene=dict(
             xaxis=dict(title='X (m)', range=[0, room_dims[0]], showgrid=False, zeroline=False, backgroundcolor="rgba(0,0,0,0)"),
             yaxis=dict(title='Y (m)', range=[0, room_dims[1]], showgrid=False, zeroline=False, backgroundcolor="rgba(0,0,0,0)"),
             zaxis=dict(title='Z (m)', range=[0, room_dims[2]], showgrid=False, zeroline=False, backgroundcolor="rgba(0,0,0,0)"),
             aspectmode='data'
         ),
-        margin=dict(l=0, r=0, b=0, t=0), height=700, sliders=sliders, updatemenus=updatemenus, uirevision='constant_view' 
+        margin=dict(l=0, r=0, b=0, t=0), height=700, sliders=sliders, updatemenus=updatemenus, uirevision='constant_view'
     )
 
     return fig
@@ -272,20 +290,20 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
 def main():
     st.sidebar.title("Acoustic Benchmark")
     st.sidebar.markdown("---")
-    
-    results_dir = r"C:\Users\matias\Downloads" 
+
+    results_dir = r"/home/matias/Downloads"
     if not os.path.exists(results_dir):
         st.sidebar.error(f"Directory not found: {results_dir}")
         return
-        
+
     h5_files = [f for f in os.listdir(results_dir) if f.endswith('.h5')]
     if not h5_files:
         st.sidebar.warning("No HDF5 files found.")
         return
-        
+
     selected_file = st.sidebar.selectbox("Select Benchmark File", h5_files)
     h5_path = os.path.join(results_dir, selected_file)
-    
+
     # 1. Parse H5 Structure dynamically
     h5_structure = get_h5_structure(h5_path)
     if not h5_structure:
@@ -295,16 +313,16 @@ def main():
     # 2. Cascaded Dropdowns for Navigation
     st.sidebar.subheader("Select Evaluation Case")
     selected_proc = st.sidebar.selectbox("Processor", list(h5_structure.keys()))
-    
+
     available_metrics = list(h5_structure[selected_proc].keys())
     selected_metric = st.sidebar.selectbox("Optimized Metric", available_metrics)
-    
+
     available_cases = h5_structure[selected_proc][selected_metric]
     selected_case = st.sidebar.selectbox("Scenario", available_cases)
 
     # 3. Load specific data chunk
     data = load_benchmark_case(h5_path, selected_proc, selected_metric, selected_case)
-    
+
     if not data["spatial"]:
         st.error(f"Could not load spatial data for path: {selected_proc}/{selected_metric}/{selected_case}")
         return
@@ -316,40 +334,52 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("Animation Controls")
     scale_factor = st.sidebar.slider("Visual Scale", 0.1, 2.0, 1.0)
-    frame_decimator = st.sidebar.slider("Frame Decimator", min_value=1, max_value=max(1, total_frames // 10), value=1)
+
+    # --- BUG FIX: Streamlit slider range restriction ---
+    # Enforce that max_decimator is strictly strictly greater than min_value
+    max_decimator = max(2, total_frames // 10)
+    if total_frames > 1:
+        frame_decimator = st.sidebar.slider("Frame Decimator", min_value=1, max_value=max_decimator, value=1)
+    else:
+        frame_decimator = 1
 
     # 4. Comprehensive Audio Playback matching new H5 structure
     if "audio" in data and data["audio"]:
         st.sidebar.markdown("---")
         st.sidebar.subheader("Audio Comparison")
-        
-        # Audio normalization helper
+
+        # --- BUG FIX: Robust Audio Normalization ---
+        # Handles both 1D and 2D arrays properly based on new H5 output
         def prep_audio(sig):
-            return np.int16(sig / np.max(np.abs(sig)) * 32767)
+            if isinstance(sig, np.ndarray) and len(sig.shape) > 1:
+                sig = sig[0]  # Take the first channel if it is a 2D array
+            max_val = np.max(np.abs(sig))
+            if max_val == 0: return np.int16(sig)
+            return np.int16(sig / max_val * 32767)
 
         audio_dict = data["audio"]
-        
+
         # Target Reference
         if "target_reference" in audio_dict:
-            st.sidebar.caption("🎯 Target Reference (Anechoic Early):")
-            st.sidebar.audio(prep_audio(audio_dict["target_reference"][0]), sample_rate=fs)
+            st.sidebar.caption("🎯 Target Reference:")
+            st.sidebar.audio(prep_audio(audio_dict["target_reference"]), sample_rate=fs)
 
         # Baseline Mic
         if "mic_signals" in audio_dict:
             st.sidebar.caption("🎙️ Reference Mic (Degraded Mixture):")
-            st.sidebar.audio(prep_audio(audio_dict["mic_signals"][0]), sample_rate=fs)
-        
+            st.sidebar.audio(prep_audio(audio_dict["mic_signals"]), sample_rate=fs)
+
         # Beamformer Output
         proc_key = f"processed_{selected_proc}"
         if proc_key in audio_dict:
             st.sidebar.caption(f"⚙️ Processed ({selected_proc}):")
             st.sidebar.audio(prep_audio(audio_dict[proc_key]), sample_rate=fs)
-            
+
         # DTLN Outputs (if neural enhancement was active)
         if "processed_dtln_alone" in audio_dict:
             st.sidebar.caption("🧠 Single-Mic DTLN (No Beamforming):")
             st.sidebar.audio(prep_audio(audio_dict["processed_dtln_alone"]), sample_rate=fs)
-            
+
         dtln_post_key = f"processed_{selected_proc}_dtln"
         if dtln_post_key in audio_dict:
             st.sidebar.caption(f"🚀 Full Pipeline ({selected_proc} + DTLN):")
@@ -358,10 +388,10 @@ def main():
     # --- MAIN PANEL ---
     st.title(f"Visualizing: {selected_proc} ({selected_case.replace('_', ' ').title()})")
     st.caption(f"Optimized for extreme variance in: **{selected_metric}**")
-    
+
     if data["metrics"]:
         display_metrics_row(data["metrics"])
-        
+
     st.markdown("---")
 
     freqs = spatial_data.get("freqs", [1000.0])

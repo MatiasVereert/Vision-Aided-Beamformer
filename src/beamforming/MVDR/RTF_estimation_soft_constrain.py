@@ -8,8 +8,53 @@ from utils.audio import  normalize_signal
 from beamforming.signal_model import compute_rtf_steering_vector
 import numpy as np
 
-def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.8, save_weights=False, min_loading = 1e-6):
+import numpy as np
+
+
+import numpy as np
+
+def compute_soft_constrained_mvdr_weights_batched(R_inv, h, v, gamma):
+    """
+    Computes soft-constrained MVDR weights for all K frequency bins
+    using the explicitly pre-inverted and regularized noise covariance matrix.
+
+    Args:
+        R_inv: Inverted stable covariance matrices, shape (K, M, M)
+        h: Empirical RTF vectors, shape (K, M)
+        v: Geometric steering vectors, shape (K, M)
+        gamma: Soft constraint penalty factor (scalar)
+
+    Returns:
+        w: Beamformer weights, shape (K, M)
+    """
+    # Add a dimension to make them column vectors per frequency bin
+    H = h[:, :, np.newaxis]
+    V = v[:, :, np.newaxis]
+
+    # Create conjugate transpose version for the empirical RTF
+    H_conj_T = h.conj()[:, np.newaxis, :]
+
+    # Compute intermediate vector products directly with the provided R_inv
+    R_inv_h = R_inv @ H
+    R_inv_v = R_inv @ V
+
+    # Resulting shapes will be (K, 1, 1)
+    h_H_R_inv_h = H_conj_T @ R_inv_h
+    h_H_R_inv_v = H_conj_T @ R_inv_v
+
+    # Compute lambda multiplier for all K bins
+    lam = (1.0 - gamma * h_H_R_inv_v) / h_H_R_inv_h
+
+    # Compute final beamformer weights
+    w = lam * R_inv_h + gamma * R_inv_v
+
+    # Squeeze the last dimension to return (K, M)
+    return w.squeeze(-1)
+
+def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, alpha=0.8, save_weights=False, min_loading = 1e-2):
     lamda = 0.99
+    gamma = 0.01
+
     K, T, M = X_stft.shape
 
     alpha = 1.0   # Convert to the complementary weight for geometric steering vector
@@ -75,14 +120,16 @@ def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, 
 
         # --- Calculate MVDR Weights using the MIXED RTF ---
         # Numerator: R_nn_inv * rtf_mixed -> (K, M, M) * (K, M) -> (K, M)
+
+
         weights_nom = np.einsum("fmn,fn->fm", R_nn_inv, rtf_empirical)
 
         # Denominator: rtf_mixed^H * numerator -> (K, M) * (K, M) -> (K,)
         weights_den = np.einsum("fm,fm->f", rtf_mixed.conj(), weights_nom)
 
         # Divide numerator by denominator. Add small epsilon to prevent NaNs
-        weights = weights_nom / (weights_den[:, np.newaxis] + 1e-10)
-
+        # Compute weights for all K frequencies at once
+        weights = compute_soft_constrained_mvdr_weights_batched(R_nn_inv, rtf_empirical, sv, gamma)
         #save weights
         weights_rec[:,m,:] = weights
 
@@ -181,7 +228,7 @@ if __name__ == "__main__":
 
     print("=== INTEGRATION TEST: PIPELINE (FREE-FIELD, ROOM, WPE+ROOM) ===")
 
-    output_folder = "tests/data/rtf_mvdr_output"
+    output_folder = "tests/data/rtf_soft_constrained_mvdr_output"
     os.makedirs(output_folder, exist_ok=True)
 
     # =================================================================

@@ -5,7 +5,7 @@ import scipy.signal as signal
 # Ensure import paths strictly align with your localized package repository layout
 from propagation.simulate_acoustics_v1 import SimAcoustic
 from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array
-from beamforming.mask.dtln_mvdr_multi import apply_hybrid_pipeline
+from beamforming.mask.single_dtln_mvdr import apply_hybrid_pipeline
 from utils.audio import save_wav, normalize_signal
 
 def run_mird_mvdr_evaluation():
@@ -24,8 +24,8 @@ def run_mird_mvdr_evaluation():
     output_dir = os.path.abspath("tests/dataset_out/mird_mvdr_final")
     os.makedirs(output_dir, exist_ok=True)
 
-    source_audio_path = r"tools\data\signals\p002_emo_adoration_sentences.wav"
-    interf_audio_path = r"tools\data\signals\ruido_rosa_16k.wav"
+    source_audio_path = r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav"
+    interf_audio_path = r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/hairdryer_07_SH_MKH800.wav"
 
     # --- 2. INDEX DATASET PROVIDER ---
     print("[*] Bootstrapping physical multi-channel MIRD registry provider...")
@@ -103,7 +103,7 @@ def run_mird_mvdr_evaluation():
 
     # --- 7. APPLY DTLN MASK-BASED MVDR FILTERING ---
     print("\n[*] Triggering adaptive DTLN Mask-Based MVDR spatial beamforming algorithms...")
-    model_1_path = r"tools\data\models\model_quant_1.tflite"
+    model_1_path = r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/models/model_quant_1.tflite"
 
     # Execute Hybrid Pipeline utilizing neural mask extraction
     clean_output_time, mask = apply_hybrid_pipeline(
