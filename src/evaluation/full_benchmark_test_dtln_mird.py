@@ -228,17 +228,27 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             acoustic_scene.set_source(scene_base_config['source_path'], gain=1.0, position=abs_pos_target.reshape(1,3))
 
             # Map Interference Positions
-            for idx, (i_ang, i_dist) in enumerate(exp['interf_configs']):
-                path_idx = idx % len(scene_base_config['interf_paths'])
+            for idx, interf_cfg in enumerate(exp['interf_configs']):
+
+                i_ang = interf_cfg[0]
+                i_dist = interf_cfg[1]
+
+                # Check if specific audio index is provided; otherwise, fallback to positional modulo logic
+                if len(interf_cfg) >= 3:
+                    audio_idx = interf_cfg[2]
+                else:
+                    audio_idx = idx % len(scene_base_config['interf_paths'])
+
+                # Fetch RIR data for the specified spatial coordinates
                 _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], i_dist, i_ang)
                 rel_pos_interf = dataset_provider.export_position('cartesian')
                 abs_pos_interf = array_center + rel_pos_interf.squeeze()
 
+                # Inject interference
                 acoustic_scene.set_interference(
-                    audio_path=scene_base_config['interf_paths'][path_idx],
+                    audio_path=scene_base_config['interf_paths'][audio_idx],
                     gain=1.0, position=abs_pos_interf.reshape(1,3)
                 )
-
             # Inject actual measurement matrices
             acoustic_scene.import_rirs(
                 dataset_provider=dataset_provider,
