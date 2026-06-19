@@ -168,12 +168,13 @@ class DTLN_MB_MVDR_SOUDEN_BAN_Processor:
     Wrapper for the DTLN mask-based MVDR beamformer.
     Integrates offline neural mask estimation with recursive spatial filtering.
     """
-    def __init__(self, nperseg=512, noverlap=384):
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6):
         # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
         self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
         # 1. Extract physical and operational configurations
@@ -227,6 +228,7 @@ class DTLN_MB_MVDR_SOUDEN_BAN_Processor:
             X_stft,
             mask_s,
             mask_n,
+            min_loading= self.min_loading,
             save_weights=True
         )
 
@@ -249,12 +251,13 @@ class DTLN_MB_MVDR_SOUDEN_Processor:
     Wrapper for the DTLN mask-based MVDR beamformer.
     Integrates offline neural mask estimation with recursive spatial filtering.
     """
-    def __init__(self, nperseg=512, noverlap=384):
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6):
         # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
         self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
         # 1. Extract physical and operational configurations
@@ -308,6 +311,7 @@ class DTLN_MB_MVDR_SOUDEN_Processor:
             X_stft,
             mask_s,
             mask_n,
+            min_loading= self.min_loading,
             save_weights=True
         )
 

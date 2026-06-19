@@ -566,7 +566,7 @@ if __name__ == "__main__":
             [(45, 1.0)],
         ],
 
-        'isir_db': [0],
+        'isir_db': [-5 ,0, 5],
         'mismatch_gain': [3],
         'mismatch_phase': [5],
         'use_wpe': [False],
@@ -576,10 +576,10 @@ if __name__ == "__main__":
 
     processors_dict = {
         "DS": DS_Processor(),
-        "DTLN-MVDR": DTLN_MB_MVDR_Processor(),
-        "MVDR-Recursive": MVDR_Recursive_Processor(),
-        "DTLN-MVDR-Souden" : DTLN_MB_MVDR_SOUDEN_Processor(),
-        "DTLN-MVDR-Souden-BAN": DTLN_MB_MVDR_SOUDEN_BAN_Processor()
+        "NM-MVDR_9" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-9),
+        "DTLN-MVDR-BAN_9": DTLN_MB_MVDR_SOUDEN_BAN_Processor(min_loading =1e-9),
+        "NM-MVDR_6" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6),
+        "DTLN-MVDR-BAN_6_": DTLN_MB_MVDR_SOUDEN_BAN_Processor(min_loading =1e-6)
     }
 
     df_final = run_mird_grid_search(
