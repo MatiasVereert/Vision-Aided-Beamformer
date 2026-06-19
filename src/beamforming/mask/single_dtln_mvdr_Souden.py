@@ -12,17 +12,26 @@ from ai_edge_litert.interpreter import Interpreter
 # =====================================================================
 # 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
 # =====================================================================
-def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-6, lamda=0.99, save_weights = False):
+
+# =====================================================================
+# 1. ONLINE MVDR BEAMFORMER (MASK-BASED) - PAPER ACCUMULATIVE VERSION
+# =====================================================================
+import numpy as np
+
+def MVDR_l_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False):
     K, T, M = X_stft.shape
 
     Y_stft = np.zeros((K, T), dtype=np.complex128)
 
-    Phi_NN = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
-    Phi_XX = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    # Accumulators for matrix estimation
+    Num_XX = np.zeros((K, M, M), dtype=np.complex128)
+    Num_NN = np.zeros((K, M, M), dtype=np.complex128)
 
-    # Memory for the directional vector
-    d_prev = np.ones((K, M), dtype=np.complex128)
-    d_prev[:, 0] = 1.0 # Reference at mic 0
+    Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
+    Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
+
+    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula)
+    ref_mic = 0
 
     if save_weights:
         weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -35,35 +44,18 @@ def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-6, lamda=0.
 
         R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
 
-        Phi_XX = lamda * Phi_XX + (1 - lamda) * (m_s_frame * R_instant)
-        Phi_NN = lamda * Phi_NN + (1 - lamda) * (m_n_frame * R_instant)
+        # Strict cumulative sum (Equation 4)
+        Num_XX += m_s_frame * R_instant
+        Den_XX += m_s_frame
 
-        # Power Iteration: Matrix-vector multiplication using the previous 0
-        d_unnorm = np.einsum("fmn,fn->fm", Phi_XX, d_prev)
+        Num_NN += m_n_frame * R_instant
+        Den_NN += m_n_frame
 
-        # L2 Normalization to prevent numerical overflow during iterations
-        norm = np.linalg.norm(d_unnorm, axis=1, keepdims=True)
-        d_norm = d_unnorm / (norm + 1e-15)
+        # Calculate matrices by dividing the accumulators
+        Phi_XX = Num_XX / (Den_XX + 1e-15)
+        Phi_NN = Num_NN / (Den_NN + 1e-15)
 
-        # Alignment relative to the reference microphone (mic 0)
-        d = d_norm / (d_norm[:, 0:1] + 1e-15 + 1j*1e-15)
-
-        # Stabilization logic:
-        # If the voice mask is too low, pause the iteration and keep the previous RTF.
-        mask_s_1d = mask_s[:, m]
-        update_mask = mask_s_1d > 0.1
-        d = np.where(update_mask[:, np.newaxis], d, d_prev)
-
-        # Update memory for the next frame
-        d_prev = d.copy()
-        # Stabilization logic:
-        # If the voice mask is too low at this frequency, the estimated RTF is noise.
-        # Retain the RTF from the previous frame for those frequencies.
-        mask_s_1d = mask_s[:, m]
-        update_mask = mask_s_1d > 0.1 # Confidence threshold
-        d = np.where(update_mask[:, np.newaxis], d, d_prev)
-        d_prev = d.copy()
-
+        # Diagonal loading for numerical stability before inversion
         tr_Phi = np.real(np.trace(Phi_NN, axis1=1, axis2=2))
         adaptive_load = min_loading * (tr_Phi / M)
         loading_matrix = np.eye(M)[np.newaxis, :, :] * np.maximum(adaptive_load, 1e-9)[:, np.newaxis, np.newaxis]
@@ -71,21 +63,33 @@ def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-6, lamda=0.
         Phi_NN_stable = Phi_NN + loading_matrix
         Phi_NN_inv = np.linalg.inv(Phi_NN_stable)
 
-        weights_nom = np.einsum("fmn,fn->fm", Phi_NN_inv, d)
-        weights_den = np.einsum("fm,fm->f", d.conj(), weights_nom)
+        # -----------------------------------------------------------------
+        # SOUDEN'S MVDR FORMULATION
+        # -----------------------------------------------------------------
+        # 1. Compute the product of Phi_NN_inv and Phi_XX
+        # Shape: (K, M, M)
+        Phi_inv_Phi_X = np.einsum("fmn,fnk->fmk", Phi_NN_inv, Phi_XX)
 
-        # The denominator is always real.
-        # Force np.real to prevent numerical imaginary residuals.
-        weights = weights_nom / (np.real(weights_den[:, np.newaxis]) + 1e-10)
+        # 2. Calculate the normalization factor lambda (trace of the product)
+        # The trace of this specific product is theoretically real.
+        lambda_norm = np.real(np.trace(Phi_inv_Phi_X, axis1=1, axis2=2))
+
+        # 3. Multiply by the reference microphone vector 'r'
+        # Since 'r' is a unit vector [1, 0, 0...], multiplying Phi_inv_Phi_X by 'r'
+        # is mathematically equivalent to taking the column at the 'ref_mic' index.
+        weights_unnorm = Phi_inv_Phi_X[:, :, ref_mic]
+
+        # 4. Normalize the weights using lambda
+        weights = weights_unnorm / (lambda_norm[:, np.newaxis] + 1e-15)
+        # -----------------------------------------------------------------
 
         if save_weights:
             weights_rec[:, m, :] = weights
 
-
+        # Apply the weights to the current STFT frame
         Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
     if save_weights:
-
         return Y_stft, weights_rec
     else:
         return Y_stft
@@ -93,7 +97,7 @@ def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-6, lamda=0.
 # =====================================================================
 # 2. OFFLINE MASK ESTIMATION WRAPPER (DTLN) - SINGLE MIC OPTIMIZED
 # =====================================================================
-def get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=512, block_shift=128):
+def get_dtln_masks_soft(time_domain_input, ref_mic, model1_path, block_len=512, block_shift=128):
     """
     Processes a single reference channel offline to extract neural masks
     using the DTLN STFT-based model. This avoids computing masks for all M channels.
@@ -153,17 +157,14 @@ def get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=512, block
     def stretch_mask(m):
         return (m - np.min(m)) / (np.max(m) - np.min(m) + 1e-12)
 
-    sp_mask_condensed = stretch_mask(sp_mask_condensed)
 
-    # Calculate noise mask mathematically
+    # Calculate noise mask mathematically (linear complement)
     n_mask_condensed = 1.0 - sp_mask_condensed
 
-    # Sharpen the masks by squaring them
-    sp_mask_condensed = sp_mask_condensed ** 2
-    n_mask_condensed = n_mask_condensed ** 2
+    # The squaring operation was removed here to keep the soft, linear continuous mask
+    # This prevents harsh zeros in the STFT domain and reduces potential artifacts
 
     return sp_mask_condensed, n_mask_condensed
-
 
 # =====================================================================
 # 3. PIPELINE INTEGRATION
@@ -176,7 +177,7 @@ def apply_hybrid_pipeline(time_domain_input, fs, model1_path, ref_mic=None, leng
         ref_mic = M_total // 2
 
     print(f" -> Computing offline neural masks with DTLN (using reference mic {ref_mic})...")
-    mask_s, mask_n = get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=length_fft, block_shift=hop_length_fft)
+    mask_s, mask_n = get_dtln_masks_soft(time_domain_input, ref_mic, model1_path, block_len=length_fft, block_shift=hop_length_fft)
 
     print(" -> Computing STFT of the mixture...")
     freqs, times, Zxx = signal.stft(
@@ -281,7 +282,7 @@ if __name__ == "__main__":
 
     print("=== HYBRID TEST: DTLN MASK-BASED ONLINE MVDR ===")
 
-    output_folder = "tests/data/single_dtln_mvdr_output"
+    output_folder = "tests/data/single_dtln_mvdr"
     os.makedirs(output_folder, exist_ok=True)
     # =================================================================
     # 3D LOGARITHMIC FIBONACCI SPHERE GEOMETRY
@@ -326,7 +327,7 @@ if __name__ == "__main__":
     print(" -> Initializing acoustic scene...")
     acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=20, fs=FS)
     acoustic_scene.set_source(r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
-    acoustic_scene.set_interference(r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav", gain=1, position=interf_pos1.reshape(1,3))
+    acoustic_scene.set_interference(r"tools/data/signals/hairdryer_02_RHODE_NT5.wav", gain=1, position=interf_pos1.reshape(1,3))
 
 
     # =================================================================

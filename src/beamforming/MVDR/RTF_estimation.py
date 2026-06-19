@@ -35,7 +35,7 @@ def RTF_MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, 
         X_frame = X_stft[:, m, :]
 
         # Define VAD frame state (mapping STFT frame to time-domain VAD)
-        vad_frame = vad[m * hop_length_fft : length_fft + m * hop_length_fft]
+        vad_frame = vad[m * hop_length_fft : lengthº_fft + m * hop_length_fft]
         vad_status = np.mean(vad_frame) > 0.1
 
         # Calculate instantaneous covariance matrix: (K, M) and (K, M) -> (K, M, M)

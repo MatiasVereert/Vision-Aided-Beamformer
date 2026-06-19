@@ -8,116 +8,105 @@ import tensorflow as tf
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav, normalize_signal
 from ai_edge_litert.interpreter import Interpreter
+
+# =====================================================================
+# 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
+# =====================================================================
 import numpy as np
+from beamforming.signal_model import compute_rtf_steering_vector
 
-def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, hop_time=0.008,
-                                  T_s=0.7, T_c=5.0, tau_x=0.5, tau_n=5.0,
-                                  min_loading=1e-5, mask_floor=1e-5, ref_mic=4):
-
+def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, fs, array_geometry, source_pos, alpha=0.8, min_loading=1e-6, lamda=0.99, save_weights=False):
+    # Extract dimensions
     K, T, M = X_stft.shape
+
+    # Initialize output complex STFT matrix
     Y_stft = np.zeros((K, T), dtype=np.complex128)
 
-    # Convert time lengths (seconds) to frame counts based on STFT hop length
-    seg_frames = int(T_s / hop_time)
-    ctx_frames = int(T_c / hop_time)
+    # Initialize covariance matrices for all frequencies (K, M, M)
+    Phi_NN = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
+    Phi_XX = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
 
-    # Define the reference microphone vector
-    r = np.zeros(M, dtype=np.complex128)
-    r[ref_mic] = 1.0
+    # Memory for the directional vector
+    d_prev = np.ones((K, M), dtype=np.complex128)
+    d_prev[:, 0] = 1.0  # Reference at mic 0
 
-    # Initialize weights to blindly pass the reference mic for the very first segment
-    weights = np.zeros((K, M), dtype=np.complex128)
-    weights[:, ref_mic] = 1.0
+    if save_weights:
+        weights_rec = np.zeros((K, T, M), dtype=np.complex128)
 
-    # Apply flooring to masks to prevent total cancellation
-    mask_s = np.clip(mask_s, mask_floor, 1.0)
-    mask_n = np.clip(mask_n, mask_floor, 1.0)
+    # Calculate frequencies for the steering vector
+    frecs = np.linspace(0, fs/2, K)
 
-    # Process the signal block by block
-    for start_idx in range(0, T, seg_frames):
-        end_idx = min(start_idx + seg_frames, T)
+    # Get geometric steering vectors as a fallback anchor, expected shape (K, M)
+    sv = compute_rtf_steering_vector(frecs, source_pos, array_geometry, ref_mic_idx=0, mode="near_field", squeeze=True)
 
-        # =====================================================================
-        # 1. ZERO-DELAY APPLICATION
-        # Apply the previously computed weights to the CURRENT incoming segment
-        # =====================================================================
-        X_seg = X_stft[:, start_idx:end_idx, :]
-        Y_stft[:, start_idx:end_idx] = np.einsum("km,ktm->kt", weights.conj(), X_seg)
+    for m in range(T):
+        print(f"\rProcessing frame {m} of {T}", end="")
 
-        # =====================================================================
-        # 2. UPDATE WEIGHTS FOR THE NEXT SEGMENT
-        # Compute spatial statistics using current segment + past context buffer
-        # =====================================================================
-        ctx_start = max(0, start_idx - ctx_frames)
-        region_len = end_idx - ctx_start
+        # Extract current frame and masks
+        X_frame = X_stft[:, m, :]
+        m_s_frame = mask_s[:, m, np.newaxis, np.newaxis]
+        m_n_frame = mask_n[:, m, np.newaxis, np.newaxis]
 
-        # Initialize decay weight arrays (1.0 for the current segment)
-        decay_x = np.ones(region_len)
-        decay_n = np.ones(region_len)
+        # Calculate instantaneous covariance matrix
+        R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
 
-        # Apply exponential decay to the context region (older frames get lower weights)
-        num_ctx = start_idx - ctx_start
-        if num_ctx > 0:
-            # Distance in seconds from the boundary of the current segment
-            distances = np.arange(num_ctx, 0, -1) * hop_time
-            decay_x[:num_ctx] = np.exp(-distances / tau_x)
-            decay_n[:num_ctx] = np.exp(-distances / tau_n)
+        # Update covariance matrices based on masks
+        # Phi_XX approximates noisy speech covariance, Phi_NN approximates noise covariance
+        Phi_XX = lamda * Phi_XX + (1 - lamda) * (m_s_frame * R_instant)
+        Phi_NN = lamda * Phi_NN + (1 - lamda) * (m_n_frame * R_instant)
 
-        # Extract the relevant region and apply decay to the masks
-        X_region = X_stft[:, ctx_start:end_idx, :]
-        M_s_region = mask_s[:, ctx_start:end_idx] * decay_x[np.newaxis, :]
-        M_n_region = mask_n[:, ctx_start:end_idx] * decay_n[np.newaxis, :]
+        # --- RTF Estimation via Power Iteration ---
+        # Matrix-vector multiplication using the previous directional vector to approximate the principal eigenvector
+        d_unnorm = np.einsum("fmn,fn->fm", Phi_XX, d_prev)
 
-        # Efficient covariance calculation by pre-multiplying X with sqrt of masks
-        X_s = X_region * np.sqrt(M_s_region)[:, :, np.newaxis]
-        X_n = X_region * np.sqrt(M_n_region)[:, :, np.newaxis]
+        # L2 Normalization to prevent numerical overflow during infinite iterations
+        norm = np.linalg.norm(d_unnorm, axis=1, keepdims=True)
+        d_norm = d_unnorm / (norm + 1e-15)
 
-        # Sum over time (axis=1) to get instantaneous covariance matrices
-        Phi_XX = np.einsum('ktm,ktn->kmn', X_s, X_s.conj())
-        Phi_NN = np.einsum('ktm,ktn->kmn', X_n, X_n.conj())
+        # Alignment relative to the reference microphone (mic 0)
+        rtf_empirical = d_norm / (d_norm[:, 0:1] + 1e-15 + 1j*1e-15)
 
-        # Normalize by the sum of the applied weights
-        sum_M_s = np.sum(M_s_region, axis=1) + 1e-10
-        sum_M_n = np.sum(M_n_region, axis=1) + 1e-10
+        # --- Mix Empirical RTF with Geometric Steering Vector ---
+        rtf_mixed = alpha * rtf_empirical + (1.0 - alpha) * sv
 
-        Phi_XX = Phi_XX / sum_M_s[:, np.newaxis, np.newaxis]
-        Phi_NN = Phi_NN / sum_M_n[:, np.newaxis, np.newaxis]
-        # =====================================================================
-        # 3. MVDR CALCULATION
-        # =====================================================================
+        # --- Stabilization Logic ---
+        # If the voice mask is too low at this frequency, the estimated RTF is mostly noise.
+        # Retain the RTF from the previous frame for those frequencies.
+        mask_s_1d = mask_s[:, m]
+        update_mask = mask_s_1d > 0.1  # Confidence threshold
+
+        # Use the mixed RTF for the directional vector update
+        d = np.where(update_mask[:, np.newaxis], rtf_mixed, d_prev)
+
+        # Update memory for the next frame
+        d_prev = d.copy()
+
+        # --- Dynamic Diagonal Loading ---
         tr_Phi = np.real(np.trace(Phi_NN, axis1=1, axis2=2))
         adaptive_load = min_loading * (tr_Phi / M)
-        loading_matrix = np.eye(M)[np.newaxis, :, :] * np.maximum(adaptive_load, min_loading)[:, np.newaxis, np.newaxis]
+        loading_matrix = np.eye(M)[np.newaxis, :, :] * np.maximum(adaptive_load, 1e-9)[:, np.newaxis, np.newaxis]
 
+        # Apply stabilization to noise covariance matrix
         Phi_NN_stable = Phi_NN + loading_matrix
         Phi_NN_inv = np.linalg.inv(Phi_NN_stable)
 
-        matrix_product = np.matmul(Phi_NN_inv, Phi_XX)
-        trace_val = np.real(np.trace(matrix_product, axis1=1, axis2=2))
+        # --- Calculate MVDR Weights ---
+        weights_nom = np.einsum("fmn,fn->fm", Phi_NN_inv, d)
+        weights_den = np.einsum("fm,fm->f", d.conj(), weights_nom)
 
-        weights_nom = np.einsum("kmn,n->km", matrix_product, r)
-        weights_mvdr = weights_nom / (trace_val[:, np.newaxis] + 1e-10)
+        # The denominator is always real. Force np.real to prevent numerical imaginary residuals.
+        weights = weights_nom / (np.real(weights_den[:, np.newaxis]) + 1e-10)
 
-        # =====================================================================
-        # 4. BAN POST-FILTER (Blind Analytic Normalization)
-        # =====================================================================
-        # Estimamos cuánta energía de voz vs ruido pasa por el filtro
-        power_speech = np.einsum('km,kmn,kn->k', weights_mvdr.conj(), Phi_XX, weights_mvdr)
-        power_noise = np.einsum('km,kmn,kn->k', weights_mvdr.conj(), Phi_NN, weights_mvdr)
+        if save_weights:
+            weights_rec[:, m, :] = weights
 
-        # Calculamos la ganancia BAN (asegurando valores reales y positivos)
-        G_ban = np.sqrt(np.maximum(np.real(power_speech), 1e-12)) / (np.maximum(np.real(power_noise), 1e-12))
+        # Apply weights to the current observation to get the clean output
+        Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
 
-        # Multiplicamos los pesos del MVDR por esta ganancia de corrección
-        weights = weights_mvdr * G_ban[:, np.newaxis]
-
-        print(f"\rProcessed segment {start_idx//seg_frames + 1} / {int(np.ceil(T/seg_frames))}", end="")
-
-        print(f"\rProcessed segment {start_idx//seg_frames + 1} / {int(np.ceil(T/seg_frames))}", end="")
-
-    print()
-    return Y_stft
-
+    if save_weights:
+        return Y_stft, weights_rec
+    else:
+        return Y_stft
 # =====================================================================
 # 2. OFFLINE MASK ESTIMATION WRAPPER (DTLN) - SINGLE MIC OPTIMIZED
 # =====================================================================
@@ -309,7 +298,7 @@ if __name__ == "__main__":
 
     print("=== HYBRID TEST: DTLN MASK-BASED ONLINE MVDR ===")
 
-    output_folder = "tests/data/hybrid_mvdr_block-level_output"
+    output_folder = "tests/data/single_dtln_mvdr_output_new"
     os.makedirs(output_folder, exist_ok=True)
     # =================================================================
     # 3D LOGARITHMIC FIBONACCI SPHERE GEOMETRY

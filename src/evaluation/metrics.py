@@ -1,18 +1,12 @@
-
 import numpy as np
-import mir_eval
-import pysepm
 from scipy import signal
-import os
-import scipy.io.wavfile as wav
-# pb_bss official wrappers
-from pb_bss.evaluation import pesq as pb_pesq
-from pb_bss.evaluation import stoi as pb_stoi
+import pb_bss
+from pb_bss.evaluation import OutputMetrics
 
 def precise_slice_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, max_shift_s: float = 0.5) -> tuple:
     """
-    Aligns signals by slicing out the unaligned portions.
-    Used for metrics that do not have internal alignment (SDR, SIR, CD).
+    Aligns signals by slicing out the unaligned portions using cross-correlation.
+    Preserved exactly to handle temporal processing delays before metric evaluation.
     """
     # Emphasize transients for better phase-alignment using a high-pass filter
     b, a = signal.butter(4, 300 / (fs / 2), btype='high')
@@ -48,81 +42,97 @@ def precise_slice_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, m
     return aligned_ref[:min_len], aligned_deg[:min_len], shift
 
 
-def evaluate_bss_metrics(ref_sig: np.ndarray, deg_sig: np.ndarray, interf_sig: np.ndarray = None) -> tuple:
+def compute_si_sar(target: np.ndarray, estimate: np.ndarray, noise: np.ndarray) -> float:
     """
-    Evaluates BSS Eval metrics safely using mir_eval.
+    Computes Scale-Invariant SAR (SI-SAR) according to Le Roux et al. (2019).
+    Requires the target reference and the composite noise reference to project
+    the residual error and isolate algorithmic artifacts.
     """
-    ref_sig = np.squeeze(ref_sig)
-    deg_sig = np.squeeze(deg_sig)
+    target = target.flatten()
+    estimate = estimate.flatten()
+    noise = noise.flatten()
 
-    if interf_sig is not None:
-        interf_sig = np.squeeze(interf_sig)
-        ref_sources = np.vstack((ref_sig, interf_sig))
-        est_sources = np.vstack((deg_sig, interf_sig))
-        calc_permutation = False
-    else:
-        ref_sources = ref_sig[np.newaxis, :]
-        est_sources = deg_sig[np.newaxis, :]
-        calc_permutation = True
+    # 1. Compute scaling factor and isolate the target component
+    alpha = np.dot(estimate, target) / (np.dot(target, target) + 1e-15)
+    e_target = alpha * target
 
-    try:
-        sdr, sir, sar, _ = mir_eval.separation.bss_eval_sources(
-            ref_sources, est_sources, compute_permutation=calc_permutation
-        )
-        return float(sdr[0]), float(sir[0]), float(sar[0])
-    except Exception:
-        return np.nan, np.nan, np.nan
+    # 2. Compute the residual error (interference + artifacts)
+    e_res = estimate - e_target
+
+    # 3. Orthogonalize the noise reference with respect to the target
+    beta = np.dot(noise, target) / (np.dot(target, target) + 1e-15)
+    n_orth = noise - beta * target
+
+    # 4. Project the residual error onto the orthogonalized noise subspace to find interference
+    gamma = np.dot(e_res, n_orth) / (np.dot(n_orth, n_orth) + 1e-15)
+    e_interf = gamma * n_orth
+
+    # 5. Isolate artifacts (what cannot be explained by target or noise)
+    e_artif = e_res - e_interf
+
+    # 6. Calculate final SI-SAR ratio
+    den = np.sum(e_artif**2)
+    if den < 1e-15:
+        return np.inf
+
+    return float(10 * np.log10(np.sum(e_target**2) / den))
+
 
 def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                            interf_early: np.ndarray = None,
                            interf_late: np.ndarray = None,
                            target_late: np.ndarray = None,
-                           compute_pesq: bool = True,
-                           compute_cd: bool = True,
                            eval_start_s: float = 5.0,
-                           inspection_name: str = "eval") -> dict:
+                           **kwargs) -> dict:
     """
-    Master evaluation function. Updated to compute both spatial SIR
-    and global acoustic SINR by incorporating late reverberation tails.
+    Master evaluation function.
+    Uses pb_bss for PESQ, STOI, and SI-SDR.
+    Calculates SI-SAR analytically using the noise subspace.
+    Absorbs extra kwargs to maintain benchmark compatibility.
     """
     ref_sig = np.squeeze(ref_sig)
     deg_sig = np.squeeze(deg_sig)
     results = {}
 
-    # Calculate the starting sample index to discard the convergence period
-    start_idx_raw = int(eval_start_s * fs)
-
-    # --- PATH A: Perceptual Metrics (PESQ / STOI) ---
-    min_len_raw = min(len(ref_sig), len(deg_sig))
-
-    # Apply the crop to avoid penalizing the algorithm's transient state
-    if start_idx_raw < min_len_raw:
-        ref_perceptual = ref_sig[start_idx_raw:min_len_raw]
-        deg_perceptual = deg_sig[start_idx_raw:min_len_raw]
-    else:
-        # Fallback just in case the signal is shorter than the crop time
-        ref_perceptual = ref_sig[:min_len_raw]
-        deg_perceptual = deg_sig[:min_len_raw]
-
-    if compute_pesq:
-        try:
-            pesq_score = pb_pesq(ref_perceptual, deg_perceptual, sample_rate=fs)
-            results['PESQ'] = float(np.mean(pesq_score))
-        except Exception:
-            results['PESQ'] = np.nan
-    else:
-        results['PESQ'] = np.nan
-
-    try:
-        results['STOI'] = float(np.mean(pb_stoi(ref_perceptual, deg_perceptual, sample_rate=fs)))
-    except Exception:
-        results['STOI'] = np.nan
-
-    # --- PATH B: Spatial & Distortion Metrics ---
-    # Perform strict physical slice alignment
+    # 1. Strict physical slice alignment
     aligned_ref, aligned_deg, shift = precise_slice_alignment(ref_sig, deg_sig, fs)
 
-    # Helper function to align individual secondary sources using the identical shift
+    # 2. Extract steady-state signals to avoid penalizing algorithm convergence
+    start_idx = int(eval_start_s * fs)
+    min_len = len(aligned_ref)
+
+    if start_idx < min_len:
+        ref_crop = aligned_ref[start_idx:]
+        deg_crop = aligned_deg[start_idx:]
+    else:
+        # Fallback just in case the signal is shorter than the crop time
+        ref_crop = aligned_ref
+        deg_crop = aligned_deg
+
+    # 3. Core single-channel Metrics via pb_bss OutputMetrics Facade
+    try:
+        metrics_facade = OutputMetrics(
+            speech_source=ref_crop[np.newaxis, :],
+            speech_prediction=deg_crop[np.newaxis, :],
+            sample_rate=fs,
+            enable_si_sdr=True,
+            compute_permutation=False
+        )
+
+        results['PESQ'] = float(metrics_facade.pesq[0])
+        results['STOI'] = float(metrics_facade.stoi[0])
+        results['SI-SDR'] = float(metrics_facade.si_sdr[0])
+
+        # We retain the classic SDR and SAR just so the benchmark's tracked_metrics
+        # dictionary doesn't throw KeyErrors, but we focus analysis on SI metrics.
+        results['SDR'] = float(metrics_facade.mir_eval_sdr[0])
+        results['SAR'] = float(metrics_facade.mir_eval_sar[0])
+
+    except Exception:
+        for key in ['PESQ', 'STOI', 'SI-SDR', 'SDR', 'SAR']:
+            results[key] = np.nan
+
+    # 4. Modern SI-SAR computation
     def align_secondary(sig):
         if sig is None: return None
         sig_sq = np.squeeze(sig)
@@ -132,47 +142,30 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
             arr = sig_sq[:-abs(shift)]
         else:
             arr = sig_sq.copy()
-        return arr[:len(aligned_ref)]
+        return arr[:min_len]
 
-    aligned_interf_early = align_secondary(interf_early)
-    aligned_interf_late = align_secondary(interf_late)
-    aligned_target_late = align_secondary(target_late)
+    aligned_ie = align_secondary(interf_early)
+    aligned_il = align_secondary(interf_late)
+    aligned_tl = align_secondary(target_late)
 
-    # Cepstrum Distance
-    if compute_cd:
+    # Calculate SI-SAR only if all noise components are available
+    if start_idx < min_len and all(s is not None for s in [aligned_ie, aligned_il, aligned_tl]):
+        ie_crop = aligned_ie[start_idx:]
+        il_crop = aligned_il[start_idx:]
+        tl_crop = aligned_tl[start_idx:]
+
+        # Composite noise is everything spatial/reverberant we don't want
+        noise_total_crop = ie_crop + il_crop + tl_crop
+
         try:
-            results['CD'] = float(pysepm.cepstrum_distance(aligned_ref, aligned_deg, fs))
+            results['SI-SAR'] = compute_si_sar(ref_crop, deg_crop, noise_total_crop)
         except Exception:
-            results['CD'] = np.nan
+            results['SI-SAR'] = np.nan
     else:
-        results['CD'] = np.nan
+        results['SI-SAR'] = np.nan
 
-    # Spatial metrics with steady-state crop
-    start_idx = int(eval_start_s * fs)
-    if start_idx < len(aligned_ref):
-        ref_crop = aligned_ref[start_idx:]
-        deg_crop = aligned_deg[start_idx:]
-
-        # 1. Compute strict Spatial SIR and global SDR
-        if aligned_interf_early is not None:
-            ie_crop = aligned_interf_early[start_idx:]
-            sdr, sir, sar = evaluate_bss_metrics(ref_crop, deg_crop, interf_sig=ie_crop)
-            results['SDR'], results['SIR'], results['SAR'] = sdr, sir, sar
-        else:
-            results['SDR'] = results['SIR'] = results['SAR'] = np.nan
-
-        # 2. Compute true SINR by creating the composite unwanted noise subspace
-        if all(s is not None for s in [aligned_interf_early, aligned_interf_late, aligned_target_late]):
-            noise_total_crop = (aligned_interf_early[start_idx:] +
-                                aligned_interf_late[start_idx:] +
-                                aligned_target_late[start_idx:])
-
-            # The SIR returned against the total noise composite is mathematically the SINR
-            _, sinr, _ = evaluate_bss_metrics(ref_crop, deg_crop, interf_sig=noise_total_crop)
-            results['SINR'] = sinr
-        else:
-            results['SINR'] = np.nan
-    else:
-        results['SDR'] = results['SIR'] = results['SAR'] = results['SINR'] = np.nan
+    # Fill deprecated keys with NaN to prevent benchmark DataFrame from shifting
+    results['SIR'] = np.nan
+    results['SINR'] = np.nan
 
     return results

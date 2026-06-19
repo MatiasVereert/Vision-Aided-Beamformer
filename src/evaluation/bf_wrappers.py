@@ -10,7 +10,10 @@ from beamforming.MVDR.RTF_estimation import RTF_MVDR_recursive
 from beamforming.MVDR.SPP import SPP_MVDR_recursive
 from beamforming.MVDR.SPP_mono import SPP_mono_MVDR_recursive
 
-from beamforming.mask.single_dtln_mvdr import get_dtln_masks, MVDR_recursive_mask_based
+from beamforming.mask.single_dtln_mvdr_exp import get_dtln_masks, MVDR_recursive_mask_based
+from beamforming.mask.single_dtln_mvdr_Souden import  MVDR_l_recursive_mask_based
+from beamforming.mask.single_dtln_mvdr_Souden_BAN import MVDR_l_recursive_mask_based_BAN
+
 
 from beamforming.mask.single_dtln_mvdr_rtf_geo import MVDR_recursive_mask_based as MVDR_recursive_mask_based_rtf
 
@@ -233,6 +236,167 @@ class DTLN_MB_MVDR_Processor:
 
         # 5. Execute the core mathematical function passing the STFT matrix
         Y_stft, weights = MVDR_recursive_mask_based(
+            X_stft,
+            mask_s,
+            mask_n,
+            save_weights=True
+        )
+
+        # 6. Compute ISTFT to return to the time domain
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 7. Ensure the output length exactly matches the original input signal
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights
+
+
+class DTLN_MB_MVDR_SOUDEN_BAN_Processor:
+    """
+    Wrapper for the DTLN mask-based MVDR beamformer.
+    Integrates offline neural mask estimation with recursive spatial filtering.
+    """
+    def __init__(self, nperseg=512, noverlap=384):
+        # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Extract physical and operational configurations
+        fs = scene_config['fs']
+
+        # Dynamically extract DTLN model path from the benchmark config
+        # Defaults to a standard path if not provided in the dictionary
+        model_path = scene_config.get('dtln_model_path', r'dnn_denoise\models\model_quant_1.tflite')
+
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
+        # Warning to use the same windows as the DTLN model was trained on
+        if nperseg_dyn != 512 or hop_length_dyn != 128:
+            print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
+
+        # Define Reference Microphone Index as middle index
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = M_tot // 2
+
+        # 2. Extract masks using block_shift (hop_length)
+        mask_s, mask_n = get_dtln_masks(
+            mic_signals,
+            ref_mic_idx,
+            model_path,
+            block_len=nperseg_dyn,
+            block_shift=hop_length_dyn
+        )
+
+        # 3. Compute STFT
+        # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
+        freqs, times, Zxx = sig.stft(
+            mic_signals, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # Transpose to (K, T, M) for spatial frequency-domain processing
+        X_stft = np.transpose(Zxx, (1, 2, 0))
+
+        # 4. Ensure time dimensions match between STFT and neural masks
+        min_frames = min(X_stft.shape[1], mask_s.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        mask_s = mask_s[:, :min_frames]
+        mask_n = mask_n[:, :min_frames]
+
+        # 5. Execute the core mathematical function passing the STFT matrix
+        Y_stft, weights = MVDR_l_recursive_mask_based_BAN(
+            X_stft,
+            mask_s,
+            mask_n,
+            save_weights=True
+        )
+
+        # 6. Compute ISTFT to return to the time domain
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 7. Ensure the output length exactly matches the original input signal
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights
+
+
+
+class DTLN_MB_MVDR_soft_Processor:
+    """
+    Wrapper for the DTLN mask-based MVDR beamformer.
+    Integrates offline neural mask estimation with recursive spatial filtering.
+    """
+    def __init__(self, nperseg=512, noverlap=384):
+        # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Extract physical and operational configurations
+        fs = scene_config['fs']
+
+        # Dynamically extract DTLN model path from the benchmark config
+        # Defaults to a standard path if not provided in the dictionary
+        model_path = scene_config.get('dtln_model_path', r'dnn_denoise\models\model_quant_1.tflite')
+
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
+        # Warning to use the same windows as the DTLN model was trained on
+        if nperseg_dyn != 512 or hop_length_dyn != 128:
+            print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
+
+        # Define Reference Microphone Index as middle index
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = M_tot // 2
+
+        # 2. Extract masks using block_shift (hop_length)
+        mask_s, mask_n = get_dtln_masks(
+            mic_signals,
+            ref_mic_idx,
+            model_path,
+            block_len=nperseg_dyn,
+            block_shift=hop_length_dyn
+        )
+
+        # 3. Compute STFT
+        # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
+        freqs, times, Zxx = sig.stft(
+            mic_signals, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # Transpose to (K, T, M) for spatial frequency-domain processing
+        X_stft = np.transpose(Zxx, (1, 2, 0))
+
+        # 4. Ensure time dimensions match between STFT and neural masks
+        min_frames = min(X_stft.shape[1], mask_s.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        mask_s = mask_s[:, :min_frames]
+        mask_n = mask_n[:, :min_frames]
+
+        # 5. Execute the core mathematical function passing the STFT matrix
+        Y_stft, weights = MVDR_l_recursive_mask_based(
             X_stft,
             mask_s,
             mask_n,

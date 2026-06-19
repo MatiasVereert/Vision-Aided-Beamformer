@@ -338,7 +338,7 @@ if __name__ == "__main__":
     print(" -> Initializing acoustic scene...")
     acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=20, fs=FS)
     acoustic_scene.set_source(r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
-    acoustic_scene.set_interference(r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav", gain=1, position=interf_pos1.reshape(1,3))
+    acoustic_scene.set_interference(r"tools/data/signals/hairdryer_02_RHODE_NT5.wav", gain=1, position=interf_pos1.reshape(1,3))
 
 
     # =================================================================

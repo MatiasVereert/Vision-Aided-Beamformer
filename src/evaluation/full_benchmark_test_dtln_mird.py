@@ -26,7 +26,9 @@ from evaluation.bf_wrappers import (
     SPP_MVDR_Recursive_Processor,
     SPP_mono_MVDR_Recursive_Processor,
     DTLN_MB_MVDR_Processor,
-    DTLN_RTF_MVDR_Processor
+    DTLN_RTF_MVDR_Processor,
+    DTLN_MB_MVDR_soft_Processor,
+    DTLN_MB_MVDR_SOUDEN_BAN_Processor
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -533,7 +535,7 @@ if __name__ == "__main__":
         'snr_db': 60.0,
         'source_path': r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
         'interf_paths': [
-            r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/all minor ab oz.wav"
+            r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav"
         ],
 
         'wpe_taps': 7,
@@ -575,7 +577,9 @@ if __name__ == "__main__":
         "DS": DS_Processor(),
         "DTLN-MVDR": DTLN_MB_MVDR_Processor(),
         "DTLN-RTF-MVDR": DTLN_RTF_MVDR_Processor(),
-        "MVDR-Recursive": MVDR_Recursive_Processor()
+        "MVDR-Recursive": MVDR_Recursive_Processor(),
+        "DTLN-MVDR-Souden" : DTLN_MB_MVDR_soft_Processor(),
+        "DTLN-MVDR-Souden-BAN": DTLN_MB_MVDR_SOUDEN_BAN_Processor()
     }
 
     df_final = run_mird_grid_search(
@@ -583,7 +587,7 @@ if __name__ == "__main__":
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/mird_benchmark_test",
+        output_dir="tests/dataset_out/linear_recursive",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )

@@ -8,120 +8,115 @@ import tensorflow as tf
 from propagation.simulate_acoustics import SimAcoustic
 from utils.audio import save_wav, normalize_signal
 from ai_edge_litert.interpreter import Interpreter
+
+# =====================================================================
+# 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
+# =====================================================================
+
+# =====================================================================
+# 1. ONLINE MVDR BEAMFORMER (MASK-BASED) - PAPER ACCUMULATIVE VERSION
+# =====================================================================
 import numpy as np
 
-def MVDR_recursive_mask_based(X_stft, mask_s, mask_n, hop_time=0.008,
-                                  T_s=0.7, T_c=5.0, tau_x=0.5, tau_n=5.0,
-                                  min_loading=1e-5, mask_floor=1e-5, ref_mic=4):
+import numpy as np
 
+def MVDR_l_recursive_mask_based_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False):
     K, T, M = X_stft.shape
+
     Y_stft = np.zeros((K, T), dtype=np.complex128)
 
-    # Convert time lengths (seconds) to frame counts based on STFT hop length
-    seg_frames = int(T_s / hop_time)
-    ctx_frames = int(T_c / hop_time)
+    # Accumulators for matrix estimation
+    Num_XX = np.zeros((K, M, M), dtype=np.complex128)
+    Num_NN = np.zeros((K, M, M), dtype=np.complex128)
 
-    # Define the reference microphone vector
-    r = np.zeros(M, dtype=np.complex128)
-    r[ref_mic] = 1.0
+    Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
+    Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
 
-    # Initialize weights to blindly pass the reference mic for the very first segment
-    weights = np.zeros((K, M), dtype=np.complex128)
-    weights[:, ref_mic] = 1.0
+    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula)
+    ref_mic = 0
 
-    # Apply flooring to masks to prevent total cancellation
-    mask_s = np.clip(mask_s, mask_floor, 1.0)
-    mask_n = np.clip(mask_n, mask_floor, 1.0)
+    if save_weights:
+        weights_rec = np.zeros((K, T, M), dtype=np.complex128)
 
-    # Process the signal block by block
-    for start_idx in range(0, T, seg_frames):
-        end_idx = min(start_idx + seg_frames, T)
+    for m in range(T):
+        print(f"\rProcessing frame {m} of {T}", end="")
+        X_frame = X_stft[:, m, :]
+        m_s_frame = mask_s[:, m, np.newaxis, np.newaxis]
+        m_n_frame = mask_n[:, m, np.newaxis, np.newaxis]
 
-        # =====================================================================
-        # 1. ZERO-DELAY APPLICATION
-        # Apply the previously computed weights to the CURRENT incoming segment
-        # =====================================================================
-        X_seg = X_stft[:, start_idx:end_idx, :]
-        Y_stft[:, start_idx:end_idx] = np.einsum("km,ktm->kt", weights.conj(), X_seg)
+        R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
 
-        # =====================================================================
-        # 2. UPDATE WEIGHTS FOR THE NEXT SEGMENT
-        # Compute spatial statistics using current segment + past context buffer
-        # =====================================================================
-        ctx_start = max(0, start_idx - ctx_frames)
-        region_len = end_idx - ctx_start
+        # Strict cumulative sum (Equation 4)
+        Num_XX += m_s_frame * R_instant
+        Den_XX += m_s_frame
 
-        # Initialize decay weight arrays (1.0 for the current segment)
-        decay_x = np.ones(region_len)
-        decay_n = np.ones(region_len)
+        Num_NN += m_n_frame * R_instant
+        Den_NN += m_n_frame
 
-        # Apply exponential decay to the context region (older frames get lower weights)
-        num_ctx = start_idx - ctx_start
-        if num_ctx > 0:
-            # Distance in seconds from the boundary of the current segment
-            distances = np.arange(num_ctx, 0, -1) * hop_time
-            decay_x[:num_ctx] = np.exp(-distances / tau_x)
-            decay_n[:num_ctx] = np.exp(-distances / tau_n)
+        # Calculate matrices by dividing the accumulators
+        Phi_XX = Num_XX / (Den_XX + 1e-15)
+        Phi_NN = Num_NN / (Den_NN + 1e-15)
 
-        # Extract the relevant region and apply decay to the masks
-        X_region = X_stft[:, ctx_start:end_idx, :]
-        M_s_region = mask_s[:, ctx_start:end_idx] * decay_x[np.newaxis, :]
-        M_n_region = mask_n[:, ctx_start:end_idx] * decay_n[np.newaxis, :]
-
-        # Efficient covariance calculation by pre-multiplying X with sqrt of masks
-        X_s = X_region * np.sqrt(M_s_region)[:, :, np.newaxis]
-        X_n = X_region * np.sqrt(M_n_region)[:, :, np.newaxis]
-
-        # Sum over time (axis=1) to get instantaneous covariance matrices
-        Phi_XX = np.einsum('ktm,ktn->kmn', X_s, X_s.conj())
-        Phi_NN = np.einsum('ktm,ktn->kmn', X_n, X_n.conj())
-
-        # Normalize by the sum of the applied weights
-        sum_M_s = np.sum(M_s_region, axis=1) + 1e-10
-        sum_M_n = np.sum(M_n_region, axis=1) + 1e-10
-
-        Phi_XX = Phi_XX / sum_M_s[:, np.newaxis, np.newaxis]
-        Phi_NN = Phi_NN / sum_M_n[:, np.newaxis, np.newaxis]
-        # =====================================================================
-        # 3. MVDR CALCULATION
-        # =====================================================================
+        # Diagonal loading for numerical stability before inversion
         tr_Phi = np.real(np.trace(Phi_NN, axis1=1, axis2=2))
         adaptive_load = min_loading * (tr_Phi / M)
-        loading_matrix = np.eye(M)[np.newaxis, :, :] * np.maximum(adaptive_load, min_loading)[:, np.newaxis, np.newaxis]
+        loading_matrix = np.eye(M)[np.newaxis, :, :] * np.maximum(adaptive_load, 1e-9)[:, np.newaxis, np.newaxis]
 
         Phi_NN_stable = Phi_NN + loading_matrix
         Phi_NN_inv = np.linalg.inv(Phi_NN_stable)
 
-        matrix_product = np.matmul(Phi_NN_inv, Phi_XX)
-        trace_val = np.real(np.trace(matrix_product, axis1=1, axis2=2))
+        # -----------------------------------------------------------------
+        # SOUDEN'S MVDR FORMULATION
+        # -----------------------------------------------------------------
+        # 1. Compute the product of Phi_NN_inv and Phi_XX
+        Phi_inv_Phi_X = np.einsum("fmn,fnk->fmk", Phi_NN_inv, Phi_XX)
 
-        weights_nom = np.einsum("kmn,n->km", matrix_product, r)
-        weights_mvdr = weights_nom / (trace_val[:, np.newaxis] + 1e-10)
+        # 2. Calculate the normalization factor lambda (trace of the product)
+        lambda_norm = np.real(np.trace(Phi_inv_Phi_X, axis1=1, axis2=2))
 
-        # =====================================================================
-        # 4. BAN POST-FILTER (Blind Analytic Normalization)
-        # =====================================================================
-        # Estimamos cuánta energía de voz vs ruido pasa por el filtro
-        power_speech = np.einsum('km,kmn,kn->k', weights_mvdr.conj(), Phi_XX, weights_mvdr)
-        power_noise = np.einsum('km,kmn,kn->k', weights_mvdr.conj(), Phi_NN, weights_mvdr)
+        # 3. Extract the unnormalized weights
+        weights_unnorm = Phi_inv_Phi_X[:, :, ref_mic]
 
-        # Calculamos la ganancia BAN (asegurando valores reales y positivos)
-        G_ban = np.sqrt(np.maximum(np.real(power_speech), 1e-12)) / (np.maximum(np.real(power_noise), 1e-12))
+        # 4. Normalize the weights using lambda
+        weights = weights_unnorm / (lambda_norm[:, np.newaxis] + 1e-15)
 
-        # Multiplicamos los pesos del MVDR por esta ganancia de corrección
-        weights = weights_mvdr * G_ban[:, np.newaxis]
+        # -----------------------------------------------------------------
+        # BLIND ANALYTICAL NORMALIZATION (BAN)
+        # -----------------------------------------------------------------
+        # Step A: Compute Phi_NN * w
+        Phi_NN_w = np.einsum("fmn,fn->fm", Phi_NN_stable, weights)
 
-        print(f"\rProcessed segment {start_idx//seg_frames + 1} / {int(np.ceil(T/seg_frames))}", end="")
+        # Step B: Denominator = w^H * Phi_NN * w
+        # Forcing real output to prevent accumulation of floating-point imaginary noise
+        ban_denom = np.real(np.einsum("fm,fm->f", weights.conj(), Phi_NN_w))
 
-        print(f"\rProcessed segment {start_idx//seg_frames + 1} / {int(np.ceil(T/seg_frames))}", end="")
+        # Step C: Numerator = sqrt( (w^H * Phi_NN^2 * w) / M )
+        # w^H * Phi_NN^2 * w is equivalent to the squared L2 norm of (Phi_NN * w)
+        w_Phi_NN_sq = np.real(np.einsum("fm,fm->f", Phi_NN_w.conj(), Phi_NN_w))
+        ban_num = np.sqrt(w_Phi_NN_sq / M)
 
-    print()
-    return Y_stft
+        # Step D: Compute BAN scalar per frequency bin
+        ban_factor = ban_num / (ban_denom + 1e-15)
+
+        # Step E: Apply BAN scaling to the current MVDR weights
+        weights = weights * ban_factor[:, np.newaxis]
+        # -----------------------------------------------------------------
+
+        if save_weights:
+            weights_rec[:, m, :] = weights
+
+        # Apply the weights to the current STFT frame
+        Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
+
+    if save_weights:
+        return Y_stft, weights_rec
+    else:
+        return Y_stft
 
 # =====================================================================
 # 2. OFFLINE MASK ESTIMATION WRAPPER (DTLN) - SINGLE MIC OPTIMIZED
 # =====================================================================
-def get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=512, block_shift=128):
+def get_dtln_masks_soft(time_domain_input, ref_mic, model1_path, block_len=512, block_shift=128):
     """
     Processes a single reference channel offline to extract neural masks
     using the DTLN STFT-based model. This avoids computing masks for all M channels.
@@ -181,17 +176,14 @@ def get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=512, block
     def stretch_mask(m):
         return (m - np.min(m)) / (np.max(m) - np.min(m) + 1e-12)
 
-    sp_mask_condensed = stretch_mask(sp_mask_condensed)
 
-    # Calculate noise mask mathematically
+    # Calculate noise mask mathematically (linear complement)
     n_mask_condensed = 1.0 - sp_mask_condensed
 
-    # Sharpen the masks by squaring them
-    sp_mask_condensed = sp_mask_condensed ** 2
-    n_mask_condensed = n_mask_condensed ** 2
+    # The squaring operation was removed here to keep the soft, linear continuous mask
+    # This prevents harsh zeros in the STFT domain and reduces potential artifacts
 
     return sp_mask_condensed, n_mask_condensed
-
 
 # =====================================================================
 # 3. PIPELINE INTEGRATION
@@ -204,7 +196,7 @@ def apply_hybrid_pipeline(time_domain_input, fs, model1_path, ref_mic=None, leng
         ref_mic = M_total // 2
 
     print(f" -> Computing offline neural masks with DTLN (using reference mic {ref_mic})...")
-    mask_s, mask_n = get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=length_fft, block_shift=hop_length_fft)
+    mask_s, mask_n = get_dtln_masks_soft(time_domain_input, ref_mic, model1_path, block_len=length_fft, block_shift=hop_length_fft)
 
     print(" -> Computing STFT of the mixture...")
     freqs, times, Zxx = signal.stft(
@@ -309,7 +301,7 @@ if __name__ == "__main__":
 
     print("=== HYBRID TEST: DTLN MASK-BASED ONLINE MVDR ===")
 
-    output_folder = "tests/data/hybrid_mvdr_block-level_output"
+    output_folder = "tests/data/single_dtln_mvdr"
     os.makedirs(output_folder, exist_ok=True)
     # =================================================================
     # 3D LOGARITHMIC FIBONACCI SPHERE GEOMETRY
@@ -354,7 +346,7 @@ if __name__ == "__main__":
     print(" -> Initializing acoustic scene...")
     acoustic_scene = SimAcoustic(mic_coords, array_mismatch=0.0, duration=20, fs=FS)
     acoustic_scene.set_source(r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav", gain=1, position=source_pos_2d)
-    acoustic_scene.set_interference(r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav", gain=1, position=interf_pos1.reshape(1,3))
+    acoustic_scene.set_interference(r"tools/data/signals/hairdryer_02_RHODE_NT5.wav", gain=1, position=interf_pos1.reshape(1,3))
 
 
     # =================================================================
