@@ -42,42 +42,6 @@ def precise_slice_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, m
     return aligned_ref[:min_len], aligned_deg[:min_len], shift
 
 
-def compute_si_sar(target: np.ndarray, estimate: np.ndarray, noise: np.ndarray) -> float:
-    """
-    Computes Scale-Invariant SAR (SI-SAR) according to Le Roux et al. (2019).
-    Requires the target reference and the composite noise reference to project
-    the residual error and isolate algorithmic artifacts.
-    """
-    target = target.flatten()
-    estimate = estimate.flatten()
-    noise = noise.flatten()
-
-    # 1. Compute scaling factor and isolate the target component
-    alpha = np.dot(estimate, target) / (np.dot(target, target) + 1e-15)
-    e_target = alpha * target
-
-    # 2. Compute the residual error (interference + artifacts)
-    e_res = estimate - e_target
-
-    # 3. Orthogonalize the noise reference with respect to the target
-    beta = np.dot(noise, target) / (np.dot(target, target) + 1e-15)
-    n_orth = noise - beta * target
-
-    # 4. Project the residual error onto the orthogonalized noise subspace to find interference
-    gamma = np.dot(e_res, n_orth) / (np.dot(n_orth, n_orth) + 1e-15)
-    e_interf = gamma * n_orth
-
-    # 5. Isolate artifacts (what cannot be explained by target or noise)
-    e_artif = e_res - e_interf
-
-    # 6. Calculate final SI-SAR ratio
-    den = np.sum(e_artif**2)
-    if den < 1e-15:
-        return np.inf
-
-    return float(10 * np.log10(np.sum(e_target**2) / den))
-
-
 def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                            interf_early: np.ndarray = None,
                            interf_late: np.ndarray = None,
@@ -86,8 +50,7 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                            **kwargs) -> dict:
     """
     Master evaluation function.
-    Uses pb_bss for PESQ, STOI, and SI-SDR.
-    Calculates SI-SAR analytically using the noise subspace.
+    Uses pb_bss for PESQ, STOI, SI-SDR, and traditional SDR/SIR/SAR via multi-source evaluation.
     Absorbs extra kwargs to maintain benchmark compatibility.
     """
     ref_sig = np.squeeze(ref_sig)
@@ -109,63 +72,82 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
         ref_crop = aligned_ref
         deg_crop = aligned_deg
 
-    # 3. Core single-channel Metrics via pb_bss OutputMetrics Facade
+    # 3. Core multi-source Metrics via pb_bss OutputMetrics Facade
     try:
-        metrics_facade = OutputMetrics(
-            speech_source=ref_crop[np.newaxis, :],
-            speech_prediction=deg_crop[np.newaxis, :],
-            sample_rate=fs,
-            enable_si_sdr=True,
-            compute_permutation=False
-        )
+        # Check if secondary noise components are available to build the full subspace
+        if interf_early is not None and interf_late is not None and target_late is not None:
 
-        results['PESQ'] = float(metrics_facade.pesq[0])
-        results['STOI'] = float(metrics_facade.stoi[0])
-        results['SI-SDR'] = float(metrics_facade.si_sdr[0])
+            # Align secondary paths using the same shift parameter
+            def align_secondary(sig):
+                if sig is None: return None
+                sig_sq = np.squeeze(sig)
+                if shift > 0:
+                    arr = sig_sq[shift:]
+                elif shift < 0:
+                    arr = sig_sq[:-abs(shift)]
+                else:
+                    arr = sig_sq.copy()
+                return arr[:min_len]
 
-        # We retain the classic SDR and SAR just so the benchmark's tracked_metrics
-        # dictionary doesn't throw KeyErrors, but we focus analysis on SI metrics.
-        results['SDR'] = float(metrics_facade.mir_eval_sdr[0])
-        results['SAR'] = float(metrics_facade.mir_eval_sar[0])
+            aligned_ie = align_secondary(interf_early)
+            aligned_il = align_secondary(interf_late)
+            aligned_tl = align_secondary(target_late)
+
+            if start_idx < min_len:
+                ie_crop = aligned_ie[start_idx:]
+                il_crop = aligned_il[start_idx:]
+                tl_crop = aligned_tl[start_idx:]
+                # Composite noise is everything spatial/reverberant we do not want
+                noise_total_crop = ie_crop + il_crop + tl_crop
+            else:
+                noise_total_crop = np.zeros_like(ref_crop)
+
+            # Stack target and noise as separate reference sources: shape (2, samples)
+            speech_source = np.stack([ref_crop, noise_total_crop], axis=0)
+
+            # Stack the degraded signal and a low-power dummy noise floor to match shapes: shape (2, samples)
+            # This prevents mathematical degeneracy in the underlying projections
+            dummy_noise_floor = np.random.randn(len(deg_crop)) * 1e-10
+            speech_prediction = np.stack([deg_crop, dummy_noise_floor], axis=0)
+
+            metrics_facade = OutputMetrics(
+                speech_source=speech_source,
+                speech_prediction=speech_prediction,
+                sample_rate=fs,
+                enable_si_sdr=True,
+                compute_permutation=False
+            )
+
+            # Extract index 0 metrics which correspond strictly to the target speech channel
+            results['PESQ'] = float(metrics_facade.pesq[0])
+            results['STOI'] = float(metrics_facade.stoi[0])
+            results['SI-SDR'] = float(metrics_facade.si_sdr[0])
+            results['SDR'] = float(metrics_facade.mir_eval_sdr[0])
+            results['SIR'] = float(metrics_facade.mir_eval_sir[0])
+            results['SAR'] = float(metrics_facade.mir_eval_sar[0])
+
+        else:
+            # Fallback to single-source evaluation if secondary components are missing
+            metrics_facade = OutputMetrics(
+                speech_source=ref_crop[np.newaxis, :],
+                speech_prediction=deg_crop[np.newaxis, :],
+                sample_rate=fs,
+                enable_si_sdr=True,
+                compute_permutation=False
+            )
+
+            results['PESQ'] = float(metrics_facade.pesq[0])
+            results['STOI'] = float(metrics_facade.stoi[0])
+            results['SI-SDR'] = float(metrics_facade.si_sdr[0])
+            results['SDR'] = float(metrics_facade.mir_eval_sdr[0])
+            results['SAR'] = float(metrics_facade.mir_eval_sar[0])
+            results['SIR'] = np.nan
 
     except Exception:
-        for key in ['PESQ', 'STOI', 'SI-SDR', 'SDR', 'SAR']:
+        for key in ['PESQ', 'STOI', 'SI-SDR', 'SDR', 'SIR', 'SAR']:
             results[key] = np.nan
 
-    # 4. Modern SI-SAR computation
-    def align_secondary(sig):
-        if sig is None: return None
-        sig_sq = np.squeeze(sig)
-        if shift > 0:
-            arr = sig_sq[shift:]
-        elif shift < 0:
-            arr = sig_sq[:-abs(shift)]
-        else:
-            arr = sig_sq.copy()
-        return arr[:min_len]
-
-    aligned_ie = align_secondary(interf_early)
-    aligned_il = align_secondary(interf_late)
-    aligned_tl = align_secondary(target_late)
-
-    # Calculate SI-SAR only if all noise components are available
-    if start_idx < min_len and all(s is not None for s in [aligned_ie, aligned_il, aligned_tl]):
-        ie_crop = aligned_ie[start_idx:]
-        il_crop = aligned_il[start_idx:]
-        tl_crop = aligned_tl[start_idx:]
-
-        # Composite noise is everything spatial/reverberant we don't want
-        noise_total_crop = ie_crop + il_crop + tl_crop
-
-        try:
-            results['SI-SAR'] = compute_si_sar(ref_crop, deg_crop, noise_total_crop)
-        except Exception:
-            results['SI-SAR'] = np.nan
-    else:
-        results['SI-SAR'] = np.nan
-
     # Fill deprecated keys with NaN to prevent benchmark DataFrame from shifting
-    results['SIR'] = np.nan
     results['SINR'] = np.nan
 
     return results

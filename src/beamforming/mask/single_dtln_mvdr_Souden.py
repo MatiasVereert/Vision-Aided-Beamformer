@@ -18,7 +18,7 @@ from ai_edge_litert.interpreter import Interpreter
 # =====================================================================
 import numpy as np
 
-def MVDR_l_recursive_mask_based(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False):
+def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False):
     K, T, M = X_stft.shape
 
     Y_stft = np.zeros((K, T), dtype=np.complex128)

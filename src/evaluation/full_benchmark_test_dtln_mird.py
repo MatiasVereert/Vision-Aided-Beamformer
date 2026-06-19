@@ -26,8 +26,7 @@ from evaluation.bf_wrappers import (
     SPP_MVDR_Recursive_Processor,
     SPP_mono_MVDR_Recursive_Processor,
     DTLN_MB_MVDR_Processor,
-    DTLN_RTF_MVDR_Processor,
-    DTLN_MB_MVDR_soft_Processor,
+    DTLN_MB_MVDR_SOUDEN_Processor,
     DTLN_MB_MVDR_SOUDEN_BAN_Processor
 )
 
@@ -503,6 +502,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     parquet_path = os.path.join(output_dir, "mird_benchmark_metrics.parquet")
     df_results.to_parquet(parquet_path, engine="pyarrow")
 
+    df_results.to_csv("mird_benchmark_metrics.csv", index=False)
+
     return df_results
 
 
@@ -576,9 +577,8 @@ if __name__ == "__main__":
     processors_dict = {
         "DS": DS_Processor(),
         "DTLN-MVDR": DTLN_MB_MVDR_Processor(),
-        "DTLN-RTF-MVDR": DTLN_RTF_MVDR_Processor(),
         "MVDR-Recursive": MVDR_Recursive_Processor(),
-        "DTLN-MVDR-Souden" : DTLN_MB_MVDR_soft_Processor(),
+        "DTLN-MVDR-Souden" : DTLN_MB_MVDR_SOUDEN_Processor(),
         "DTLN-MVDR-Souden-BAN": DTLN_MB_MVDR_SOUDEN_BAN_Processor()
     }
 

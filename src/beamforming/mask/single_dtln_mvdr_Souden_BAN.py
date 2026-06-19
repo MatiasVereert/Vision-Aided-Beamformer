@@ -10,17 +10,12 @@ from utils.audio import save_wav, normalize_signal
 from ai_edge_litert.interpreter import Interpreter
 
 # =====================================================================
-# 1. ONLINE MVDR BEAMFORMER (MASK-BASED)
-# =====================================================================
-
-# =====================================================================
 # 1. ONLINE MVDR BEAMFORMER (MASK-BASED) - PAPER ACCUMULATIVE VERSION
 # =====================================================================
 import numpy as np
 
-import numpy as np
 
-def MVDR_l_recursive_mask_based_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False):
+def MVDR_Souden_recursive_mask_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False):
     K, T, M = X_stft.shape
 
     Y_stft = np.zeros((K, T), dtype=np.complex128)
