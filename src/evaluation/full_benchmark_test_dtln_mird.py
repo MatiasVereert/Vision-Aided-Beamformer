@@ -575,8 +575,8 @@ if __name__ == "__main__":
     }
 
     processors_dict = {
-        "NM-MVDR_alpha_1" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
-        "NM-MVDR_alpha_0.99" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99),
+        "NM-MVDR_alpha_1_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
+        "NM-MVDR_alpha_0.99_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99),
 
 
     }

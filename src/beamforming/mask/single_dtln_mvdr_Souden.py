@@ -31,7 +31,13 @@ def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_we
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
 
     # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula)
-    ref_mic = 0
+
+
+        # Define Reference Microphone Index as middle index
+    ref_mic_idx = M // 2
+    ref_mic = ref_mic_idx
+
+
 
     if save_weights:
         weights_rec = np.zeros((K, T, M), dtype=np.complex128)
