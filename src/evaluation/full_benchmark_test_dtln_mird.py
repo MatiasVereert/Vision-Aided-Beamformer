@@ -575,11 +575,10 @@ if __name__ == "__main__":
     }
 
     processors_dict = {
-        "DS": DS_Processor(),
-        "NM-MVDR_9" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-9),
-        "DTLN-MVDR-BAN_9": DTLN_MB_MVDR_SOUDEN_BAN_Processor(min_loading =1e-9),
-        "NM-MVDR_6" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6),
-        "DTLN-MVDR-BAN_6_": DTLN_MB_MVDR_SOUDEN_BAN_Processor(min_loading =1e-6)
+        "NM-MVDR_alpha_1" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
+        "NM-MVDR_alpha_0.99" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99),
+
+
     }
 
     df_final = run_mird_grid_search(

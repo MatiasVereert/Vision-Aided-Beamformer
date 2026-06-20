@@ -18,7 +18,7 @@ from ai_edge_litert.interpreter import Interpreter
 # =====================================================================
 import numpy as np
 
-def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False):
+def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False, alpha = 0.99):
     K, T, M = X_stft.shape
 
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -44,12 +44,12 @@ def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_we
 
         R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
 
-        # Strict cumulative sum (Equation 4)
-        Num_XX += m_s_frame * R_instant
-        Den_XX += m_s_frame
+        # Apply exponential forgetting factor (alpha) to both accumulators
+        Num_XX = alpha * Num_XX + m_s_frame * R_instant
+        Den_XX = alpha * Den_XX + m_s_frame
 
-        Num_NN += m_n_frame * R_instant
-        Den_NN += m_n_frame
+        Num_NN = alpha * Num_NN + m_n_frame * R_instant
+        Den_NN = alpha * Den_NN + m_n_frame
 
         # Calculate matrices by dividing the accumulators
         Phi_XX = Num_XX / (Den_XX + 1e-15)
