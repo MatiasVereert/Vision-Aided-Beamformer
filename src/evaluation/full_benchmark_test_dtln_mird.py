@@ -603,29 +603,25 @@ if __name__ == "__main__":
             [(45, 1.0)],
         ],
 
-        'isir_db': [0],
+        'isir_db': [3],
         'mismatch_gain': [0],
         'mismatch_phase': [0],
-        'use_wpe': [True, False],
+        'use_wpe': [True],
         'error_angle_deg': [0.0],
         'error_distance_m': [0.0]
     }
 
     processors_dict = {
-        #"NM-MVDR_alpha_1_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
+        "NM-MVDR_alpha_1_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
         "NM-MVDR_alpha_0.99_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99),
         # Cota superior agnostica al modelo: misma cadena Souden pero con mascara ideal.
         # SOFT (sharpen_exp=1.0, IRM continua) y HARD-EDGE (sharpen_exp=4.0, == **4 del DTLN).
-        #"Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
+        "Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
         "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
-        #"Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
+        "Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
         "Oracle-MVDR_hard_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=4.0),
-        #"Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW_Processor(),
+        "Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW_Processor(),
         "Specsub" : DTLN_Souden_Specsub_Processor(smooth=1.0, min_loading=1e-6),
-        "DS" :  DS_Processor(),
-        "MVDR_geo": MVDR_Recursive_Processor(),
-        "DSW-MWF": DS_Processor(),
-
     }
 
 

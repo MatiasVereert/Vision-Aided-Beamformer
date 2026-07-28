@@ -2,7 +2,6 @@ import numpy as np
 import scipy as sc
 from matplotlib import pyplot as plt 
 from utils.audio import load_audio_source, save_wav
-from propagation.free_field import space_delay
 import pyroomacoustics as pra
 from scipy.spatial.distance import pdist
 
@@ -52,19 +51,19 @@ def get_hybrid_sim_params(room_dims, mic_spacing, t_mix=0.08):
     dist_mix = c * t_mix
     max_order_ism = int(np.ceil(dist_mix / min_dim))
     
-    # "Recomendación: Configurar max_order en el rango de 10 a 15" [cite: 123]
+    # Recomendación: max_order en el rango de 10 a 15.
     # Quitamos el límite de 5. Ponemos un tope de 15 por seguridad de RAM.
     max_order_ism = np.clip(max_order_ism, 10, 15)
 
     # 2. RAY TRACING: Alta Resolución Espacial
     
-    # "Radio del Receptor: Debe ser <= d_min_mic / 2" [cite: 129]
+    # Radio del Receptor: debe ser <= d_min_mic / 2.
     # Si d=0.04, radio debe ser <= 0.02. Usamos un margen de seguridad (factor 0.45)
     rec_radius = mic_spacing * 0.45
     
     # Al reducir el radio, la probabilidad de que un rayo pegue baja cuadráticamente.
     # Necesitamos aumentar MASIVAMENTE los rayos para compensar.
-    # "Valores del orden de 10^5 a 10^6 son comunes" [cite: 133]
+    # Valores del orden de 10^5 a 10^6 son comunes.
     
     # Densidad base alta para compensar el radio pequeño
     # Heurística ajustada: Volumen * Densidad * Factor_Escala_Radio
@@ -90,21 +89,31 @@ def get_hybrid_sim_params(room_dims, mic_spacing, t_mix=0.08):
 
 class SimAcoustic():
 
-    def __init__(self, 
-                 array_geometry, 
-                 array_mismatch = 1e-3, 
-                 duration= 4, 
-                 fs = 48000 ):
-        
-        #define the scene atributes 
+    def __init__(self,
+                 array_geometry,
+                 array_mismatch = 1e-3,
+                 duration= 4,
+                 fs = 48000,
+                 seed = None ):
+
+        #define the scene atributes
         self.ideal_array = array_geometry
-        self.duration = duration #s 
+        self.duration = duration #s
         self.array_mismatch = array_mismatch
         self.M = array_geometry.shape[0]
 
-        #Ramdomize position error
+        # Reproducible RNG for the array position error (thesis benchmarks must
+        # be repeatable / comparable across configurations). Pass seed=None for
+        # a fresh random placement each run.
+        self.rng = np.random.default_rng(seed)
+
+        # Randomize position error: symmetric and centered on zero, i.e. each
+        # coordinate is perturbed uniformly in [-mismatch, +mismatch].
+        # The previous formula (-2m*U - m) was always negative (mean -2m), so it
+        # rigidly shifted the whole array in one direction instead of modelling
+        # an unbiased placement error.
         geo_shape = np.shape(array_geometry)
-        random_diferences = (- 2* array_mismatch) * np.random.random_sample(geo_shape) - array_mismatch
+        random_diferences = self.rng.uniform(-array_mismatch, array_mismatch, size=geo_shape)
         self.real_array = self.ideal_array + random_diferences
 
         #Inicialice audio
@@ -182,7 +191,7 @@ class SimAcoustic():
                 min_spacing = np.min(distances[distances > 0])
 
                 # Get optimal settings for hybrid simulation
-                params_dic = get_hybrid_sim_params(room_dimensions, min_spacing, t_mix=0.06)
+                params_dic = get_hybrid_sim_params(room_dimensions, min_spacing, t_mix=0.08)
                 max_order = params_dic["max_order"]
 
                 material = pra.Material(alpha, scattering=0.2)        
@@ -224,7 +233,26 @@ class SimAcoustic():
         # Store the RIRs as a class attribute for later convolution and mixing stages
         # room.rir structure: list of lists -> room.rir[mic_index][source_index]
         self.rirs = room.rir
-        
+
+        # Anechoic reference RIR for the target (direct path only). We build it
+        # with pyroomacoustics itself (max_order=0) instead of an independent
+        # free-field model so the reference shares the EXACT fractional-delay
+        # kernel, constant global offset and speed of sound as the reverberant
+        # RIRs. This keeps target_anechoic sample-aligned with target_early,
+        # which is what any per-sample reference metric (SI-SDR, PESQ alignment)
+        # relies on.
+        anech_room = pra.ShoeBox(
+            room_dimensions,
+            self.fs,
+            materials=pra.Material(1.0),
+            max_order=0,
+            ray_tracing=False,
+        )
+        anech_room.add_source(source_pos.T)
+        anech_room.add_microphone_array(self.real_array.T)
+        anech_room.compute_rir()
+        self.rirs_anechoic = [anech_room.rir[m][0] for m in range(self.M)]
+
         print("[SimAcoustic] RIRs successfully computed and stored in 'self.rirs'.")
             
     def import_rirs(self, dataset_provider, target_t60, array_center=[3.0, 3.0, 1.2], spacing_cfg="4-4-4-8-4-4-4"):
@@ -300,9 +328,35 @@ class SimAcoustic():
                 sensor_responses.append(resampled_rir)
             self.rirs.append(sensor_responses)
 
+        # Anechoic reference for measured RIRs: a real dataset has no
+        # reflection-free capture, so we isolate the direct path (first arrival)
+        # of the target RIR per channel. This keeps the reference consistent with
+        # the SAME measured array and resampling kernel as self.rirs, mirroring
+        # the role that the max_order=0 pra room plays in compute_rirs().
+        self.rirs_anechoic = [self._extract_direct_path(self.rirs[m][0]) for m in range(self.M)]
+
         print(f"[SimAcoustic] Successfully loaded and synchronized real dataset environment spanning {self.M} sensor channels.")
         
     
+    def _extract_direct_path(self, rir_vector, half_window_s=0.0015):
+        """
+        Isolates the direct-path (anechoic) portion of a RIR by keeping a short
+        window centred on the first arrival (|peak|) and zeroing everything else.
+        Used to build an anechoic target reference from measured RIRs (e.g. MIRD),
+        where no reflection-free version exists. Temporal position is preserved so
+        the downstream cross-correlation alignment stays consistent.
+        """
+        rir_vector = np.asarray(rir_vector).flatten()
+        peak_idx = int(np.argmax(np.abs(rir_vector)))
+        half_w = int(round(half_window_s * self.fs))
+
+        start = max(0, peak_idx - half_w)
+        stop = min(len(rir_vector), peak_idx + half_w + 1)
+
+        h_direct = np.zeros_like(rir_vector)
+        h_direct[start:stop] = rir_vector[start:stop]
+        return h_direct
+
     def _split_rir(self, rir_vector, t_early=0.050):
         # Find the index of the direct path arrival
         peak_idx = np.argmax(np.abs(rir_vector))
@@ -341,7 +395,6 @@ class SimAcoustic():
         self.interf_late_sum_unscaled = np.zeros((self.M, N_samples))
 
         # Get source audio
-        source_pos = self.audio_sources[0]["position"]
         source_sig = self.audio_sources[0]["audio"].flatten()
 
         # Convolve Target (Source 0)
@@ -375,21 +428,20 @@ class SimAcoustic():
             self.interf_early_sum_unscaled += curr_interf_early
             self.interf_late_sum_unscaled += curr_interf_late
 
-        # Compute pure anechoic target using free field propagation
-        # We use the real array geometry to perfectly match the RIR conditions
-        target_anechoic = space_delay(
-            signal_in=source_sig,
-            fs=self.fs,
-            source_pos=source_pos,
-            mic_array=self.real_array 
-        )
-        
-        # Ensure length matches N_samples (pad with zeros if shorter, crop if longer)
-        if target_anechoic.shape[1] < N_samples:
-            target_anechoic = np.pad(target_anechoic, ((0, 0), (0, N_samples - target_anechoic.shape[1])))
-        else:
-            target_anechoic = target_anechoic[:, :N_samples]
-            
+        # Compute pure anechoic target reference from pyroomacoustics' own
+        # direct-path RIR (built in compute_rirs). Convolving with
+        # self.rirs_anechoic guarantees the reference shares the same delay
+        # kernel, global offset and speed of sound as target_early, so both stay
+        # sample-aligned (unlike the previous free-field model, which used a
+        # different c and lacked pra's constant delay offset).
+        if not hasattr(self, 'rirs_anechoic'):
+            raise ValueError("Anechoic reference RIRs not found. Call compute_rirs() before convolving.")
+
+        target_anechoic = np.zeros((self.M, N_samples))
+        for i in range(self.M):
+            sig_anech = sc.signal.fftconvolve(self.rirs_anechoic[i], source_sig)
+            target_anechoic[i, :] = sig_anech[:N_samples]
+
         self.target_anechoic_unscaled = target_anechoic
         
         print("[SimAcoustic] Signals successfully convolved and split (Early/Late).")

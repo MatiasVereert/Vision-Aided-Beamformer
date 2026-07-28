@@ -538,10 +538,10 @@ if __name__ == "__main__":
         'mismatch_pos': [0.0],
 
         # --- Ejes compartidos, alineados con full_benchmark_test_dtln_mird ---
-        'isir_db': [-5],
+        'isir_db': [3],
         'mismatch_gain': [0],
         'mismatch_phase': [0],
-        'use_wpe': [False],
+        'use_wpe': [True],
         'error_angle_deg': [0.0],
         'error_distance_m': [0.0]
     }
