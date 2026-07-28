@@ -10,14 +10,16 @@ from beamforming.MVDR.RTF_estimation import RTF_MVDR_recursive
 from beamforming.MVDR.SPP import SPP_MVDR_recursive
 from beamforming.MVDR.SPP_mono import SPP_mono_MVDR_recursive
 
-from beamforming.mask.single_dtln_mvdr_exp import get_dtln_masks, MVDR_recursive_exp_mask_based
-from beamforming.mask.single_dtln_mvdr_Souden import  MVDR_Souden_recursive_mask
-from beamforming.mask.single_dtln_mvdr_Souden_BAN import MVDR_Souden_recursive_mask_BAN
-
-
-
-
-
+from beamforming.mask.dtln_masks import get_dtln_masks, get_dtln_masks_sharpen
+from beamforming.mask.oracle_masks import get_oracle_masks
+from beamforming.mask.souden_mvdr import (
+    MVDR_Souden_recursive_mask,
+    MVDR_Souden_recursive_mask_BAN,
+    MVDR_Souden_recursive_mask_slow,
+    MVDR_Souden_recursive_mask_specsub,
+    MVDR_Souden_recursive_mask_fixed,
+    MVDR_Souden_recursive_oracle,
+)
 
 class DS_Processor:
     """
@@ -245,8 +247,7 @@ class DTLN_MB_MVDR_SOUDEN_BAN_Processor:
         return y_time, weights
 
 
-
-class DTLN_MB_MVDR_SOUDEN_Processor:
+class DTLN_MB_MVDR_SOUDEN_SLOW_Processor:
     """
     Wrapper for the DTLN mask-based MVDR beamformer.
     Integrates offline neural mask estimation with recursive spatial filtering.
@@ -308,6 +309,102 @@ class DTLN_MB_MVDR_SOUDEN_Processor:
         mask_n = mask_n[:, :min_frames]
 
         # 5. Execute the core mathematical function passing the STFT matrix
+        Y_stft, weights = MVDR_Souden_recursive_mask_slow(
+            X_stft,
+            mask_s,
+            mask_n,
+            min_loading= self.min_loading,
+            save_weights=True,
+            alpha= self.alpha
+        )
+
+        # 6. Compute ISTFT to return to the time domain
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 7. Ensure the output length exactly matches the original input signal
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights
+
+
+class DTLN_MB_MVDR_SOUDEN_Processor:
+    """
+    Wrapper for the DTLN mask-based MVDR beamformer.
+    Integrates offline neural mask estimation with recursive spatial filtering.
+
+    El exponente de realce de la mascara (`sharpen_exp`) es ahora un argumento de
+    la clase: controla cuan abrupta es la transicion voz/ruido de la mascara DTLN,
+    analogo al del Oracle. sharpen_exp=4.0 (default) reproduce EXACTAMENTE el
+    comportamiento original (get_dtln_masks tenia el `** 4` fijo). Se puede
+    overridear por escena con scene_config['dtln_sharpen_exp'].
+    """
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, alpha=0.99, sharpen_exp=4.0):
+        # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+        self.alpha = alpha
+        self.sharpen_exp = sharpen_exp
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Extract physical and operational configurations
+        fs = scene_config['fs']
+
+        # Dynamically extract DTLN model path from the benchmark config
+        # Defaults to a standard path if not provided in the dictionary
+        model_path = scene_config.get('dtln_model_path', r'dnn_denoise\models\model_quant_1.tflite')
+
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
+        # Warning to use the same windows as the DTLN model was trained on
+        if nperseg_dyn != 512 or hop_length_dyn != 128:
+            print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
+
+        # Define Reference Microphone Index as middle index
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = M_tot // 2
+
+        # Exponente de realce de la mascara (controlable por instancia o por escena)
+        sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
+
+        # 2. Extract masks using block_shift (hop_length)
+        # get_dtln_masks_sharpen con sharpen_exp=4.0 == get_dtln_masks original.
+        mask_s, mask_n = get_dtln_masks_sharpen(
+            mic_signals,
+            ref_mic_idx,
+            model_path,
+            block_len=nperseg_dyn,
+            block_shift=hop_length_dyn,
+            sharpen_exp=sharpen_exp
+        )
+
+        # 3. Compute STFT
+        # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
+        freqs, times, Zxx = sig.stft(
+            mic_signals, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # Transpose to (K, T, M) for spatial frequency-domain processing
+        X_stft = np.transpose(Zxx, (1, 2, 0))
+
+        # 4. Ensure time dimensions match between STFT and neural masks
+        min_frames = min(X_stft.shape[1], mask_s.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        mask_s = mask_s[:, :min_frames]
+        mask_n = mask_n[:, :min_frames]
+
+        # 5. Execute the core mathematical function passing the STFT matrix
         Y_stft, weights = MVDR_Souden_recursive_mask(
             X_stft,
             mask_s,
@@ -324,6 +421,265 @@ class DTLN_MB_MVDR_SOUDEN_Processor:
         )
 
         # 7. Ensure the output length exactly matches the original input signal
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights
+
+
+class DTLN_MB_MVDR_SOUDEN_FIXED_Processor:
+    """
+    Variante FIXED del DTLN mask-based Souden MVDR. Identica a
+    DTLN_MB_MVDR_SOUDEN_Processor salvo que el core es MVDR_Souden_recursive_mask_fixed,
+    que corrige la estimacion/inversion de la SCM:
+      - carga diagonal RELATIVA escala-invariante (default 1e-2, sin piso absoluto),
+      - simetrizacion Hermitiana antes de invertir,
+      - inversion por np.linalg.solve (mas estable que inv()@),
+      - (opcional rank1=True) aproximacion rango-1 de Phi_XX.
+    Mantiene la mascara DTLN con exponente parametrizable (sharpen_exp).
+    """
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-2, alpha=0.99,
+                 sharpen_exp=4.0, rank1=False):
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+        self.alpha = alpha
+        self.sharpen_exp = sharpen_exp
+        self.rank1 = rank1
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Configuraciones
+        fs = scene_config['fs']
+        model_path = scene_config.get('dtln_model_path', r'dnn_denoise\models\model_quant_1.tflite')
+
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
+        if nperseg_dyn != 512 or hop_length_dyn != 128:
+            print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
+
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = M_tot // 2
+
+        # Exponente de realce de la mascara (controlable por instancia o por escena)
+        sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
+
+        # 2. Mascara DTLN
+        mask_s, mask_n = get_dtln_masks_sharpen(
+            mic_signals,
+            ref_mic_idx,
+            model_path,
+            block_len=nperseg_dyn,
+            block_shift=hop_length_dyn,
+            sharpen_exp=sharpen_exp
+        )
+
+        # 3. STFT
+        freqs, times, Zxx = sig.stft(
+            mic_signals, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+        X_stft = np.transpose(Zxx, (1, 2, 0))
+
+        # 4. Alinear frames STFT/mascaras
+        min_frames = min(X_stft.shape[1], mask_s.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        mask_s = mask_s[:, :min_frames]
+        mask_n = mask_n[:, :min_frames]
+
+        # 5. Core FIXED
+        Y_stft, weights = MVDR_Souden_recursive_mask_fixed(
+            X_stft,
+            mask_s,
+            mask_n,
+            min_loading=self.min_loading,
+            save_weights=True,
+            alpha=self.alpha,
+            rank1=self.rank1
+        )
+
+        # 6. ISTFT
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 7. Ajustar largo exacto
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights
+
+
+class ORACLE_MB_MVDR_SOUDEN_Processor:
+    """
+    Espejo de DTLN_MB_MVDR_SOUDEN_Processor pero usando MASCARAS ORACLE (ideales)
+    calculadas a partir de las señales limpias de referencia en lugar del modelo
+    DTLN. Sirve como cota superior / referencia agnostica al modelo neuronal para
+    comparar Oracle vs DTLN dentro del mismo pipeline mask-based (Souden MVDR).
+
+    El resto de la cadena (framing STFT, alineacion de frames, algoritmo core,
+    ISTFT) es identica a la version DTLN, de modo que la unica diferencia sea el
+    ORIGEN de la mascara.
+
+    Requiere en scene_config las señales limpias de referencia:
+      - 'oracle_target': (M, N) target limpio (p.ej. target_early + target_late)
+      - 'oracle_noise' : (M, N) ruido + interferencia limpio
+    Opcional:
+      - 'oracle_sharpen_exp': exponente de realce (default 1.0 = mascara suave).
+    """
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, alpha=0.99, sharpen_exp=1.0):
+        # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+        self.alpha = alpha
+        self.sharpen_exp = sharpen_exp
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Extract physical and operational configurations
+        fs = scene_config['fs']
+
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
+        # Warning to keep the framing aligned with the DTLN path (fair comparison)
+        if nperseg_dyn != 512 or hop_length_dyn != 128:
+            print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match the DTLN path (512/128) for a fair Oracle-vs-DTLN comparison.")
+
+        # Define Reference Microphone Index as middle index (same as DTLN wrappers)
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = M_tot // 2
+
+        # 2. Retrieve the clean reference signals and build the ORACLE masks
+        # These are the ground-truth (pre-hardware/pre-WPE) components; the mask
+        # encodes perfect per-T-F SNR knowledge and is applied to the real observation.
+        speech_ref = scene_config['oracle_target']
+        noise_ref = scene_config['oracle_noise']
+        sharpen_exp = scene_config.get('oracle_sharpen_exp', self.sharpen_exp)
+
+        mask_s, mask_n = get_oracle_masks(
+            speech_ref,
+            noise_ref,
+            ref_mic=ref_mic_idx,
+            block_len=nperseg_dyn,
+            block_shift=hop_length_dyn,
+            sharpen_exp=sharpen_exp
+        )
+
+        # 3. Compute STFT
+        # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
+        freqs, times, Zxx = sig.stft(
+            mic_signals, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # Transpose to (K, T, M) for spatial frequency-domain processing
+        X_stft = np.transpose(Zxx, (1, 2, 0))
+
+        # 4. Ensure time dimensions match between STFT and oracle masks
+        min_frames = min(X_stft.shape[1], mask_s.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        mask_s = mask_s[:, :min_frames]
+        mask_n = mask_n[:, :min_frames]
+
+        # 5. Execute the same core mathematical function as the DTLN Souden path
+        Y_stft, weights = MVDR_Souden_recursive_mask(
+            X_stft,
+            mask_s,
+            mask_n,
+            min_loading=self.min_loading,
+            save_weights=True,
+            alpha=self.alpha
+        )
+
+        # 6. Compute ISTFT to return to the time domain
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 7. Ensure the output length exactly matches the original input signal
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights
+
+
+class SOUDEN_ORACLE_SCM_Processor:
+    """
+    Souden MVDR con covarianzas ORACLE estimadas DIRECTAMENTE de las señales
+    limpias multicanal (target y ruido de referencia), SIN mascara. Es la cota
+    superior mas limpia: mientras el oracle-mask todavia estima las SCM desde la
+    mezcla ruidosa enmascarada, aca Phi_SS y Phi_NN salen de la estadistica real
+    de la señal y el ruido. Los pesos se aplican a la mezcla observada.
+
+    Requiere en scene_config las señales limpias de referencia:
+      - 'oracle_target': (M, N) target limpio (p.ej. target_early + target_late)
+      - 'oracle_noise' : (M, N) ruido + interferencia limpio
+    """
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, alpha=0.99):
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+        self.alpha = alpha
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Configuraciones
+        fs = scene_config['fs']
+
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+
+        # 2. Señales limpias de referencia (mismas que usa el oracle-mask)
+        speech_ref = np.asarray(scene_config['oracle_target'])
+        noise_ref = np.asarray(scene_config['oracle_noise'])
+
+        # 3. STFT de las tres señales: mezcla observada (para filtrar) + limpias (para SCM)
+        def _stft(sig_in):
+            _, _, Z = sig.stft(
+                sig_in, fs=fs, window='hamming',
+                nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+            )
+            return np.transpose(Z, (1, 2, 0))  # (K, T, M)
+
+        X_stft = _stft(mic_signals)
+        S_stft = _stft(speech_ref)
+        N_stft = _stft(noise_ref)
+
+        # 4. Alinear frames al minimo comun
+        min_frames = min(X_stft.shape[1], S_stft.shape[1], N_stft.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        S_stft = S_stft[:, :min_frames, :]
+        N_stft = N_stft[:, :min_frames, :]
+
+        # 5. Core: covarianzas oracle directas + Souden MVDR
+        Y_stft, weights = MVDR_Souden_recursive_oracle(
+            X_stft, S_stft, N_stft,
+            min_loading=self.min_loading,
+            save_weights=True,
+            alpha=self.alpha
+        )
+
+        # 6. ISTFT
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 7. Ajustar largo exacto
         original_length = mic_signals.shape[1]
         y_time = y_time[:original_length]
 
@@ -802,3 +1158,90 @@ class MPDR_Recursive_Processor:
         y_time = y_time[:original_length]
 
         return y_time, weights_rec
+
+
+class DTLN_Souden_Specsub_Processor:
+    """
+    Wrapper del MVDR de Souden mask-based (variante FIXED) + POST-FILTRO DE
+    SUSTRACCION ESPECTRAL con la mascara ORIGINAL del DTLN (sin realce). Fue la
+    variante con mejor rendimiento perceptual en el barrido de iSNR (mejor mejora
+    de PESQ entre los beamformers puros, y buen DNSMOS_BAK).
+
+    Cadena: mascara DTLN sharpened (para el beamformer) -> beamformer fixed ->
+    ganancia espectral suave G = smooth + (1-smooth)*mask_orig sobre Y_bf, donde
+    mask_orig = mask_sharpen ** (1/sharpen_exp) es la mascara continua sin realce.
+
+    smooth: 1.0 = sin filtro (== fixed) ; 0.33 (default) = extraccion suave con
+    piso ~0.33 ; 0.5 = punto mas equilibrado (recupera DNSMOS_SIG/OVRL).
+    """
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-2, alpha=0.99,
+                 sharpen_exp=4.0, smooth=0.33):
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+        self.alpha = alpha
+        self.sharpen_exp = sharpen_exp
+        self.smooth = smooth
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Configuraciones
+        fs = scene_config['fs']
+        model_path = scene_config.get('dtln_model_path', r'dnn_denoise\models\model_quant_1.tflite')
+
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+        if nperseg_dyn != 512 or hop_length_dyn != 128:
+            print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
+
+        # sharpen_exp / smooth desde config si estan, si no los del __init__
+        sharpen_exp = scene_config.get('souden_sharpen_exp', self.sharpen_exp)
+
+
+
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = M_tot // 2
+
+        # 2. Mascara DTLN sharpened (para el beamformer)
+        mask_s, mask_n = get_dtln_masks_sharpen(
+            mic_signals, ref_mic_idx, model_path,
+            block_len=nperseg_dyn, block_shift=hop_length_dyn, sharpen_exp=sharpen_exp
+        )
+
+        # 3. STFT
+        freqs, times, Zxx = sig.stft(
+            mic_signals, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+        X_stft = np.transpose(Zxx, (1, 2, 0))
+
+        # 4. Alinear frames STFT/mascaras
+        min_frames = min(X_stft.shape[1], mask_s.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        mask_s = mask_s[:, :min_frames]
+        mask_n = mask_n[:, :min_frames]
+
+        # 5. Mascara ORIGINAL (sin realce) para el post-filtro de sustraccion
+        mask_s_soft = np.clip(mask_s ** (1.0 / sharpen_exp), 0.0, 1.0)
+
+        # 6. Algoritmo core: fixed + sustraccion espectral
+        Y_stft, weights = MVDR_Souden_recursive_mask_specsub(
+            X_stft, mask_s, mask_n, mask_s_soft,
+            min_loading=self.min_loading, alpha=self.alpha,
+            smooth=self.smooth, save_weights=True
+        )
+
+        # 7. ISTFT
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 8. Ajustar largo exacto
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights

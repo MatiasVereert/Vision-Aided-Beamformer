@@ -22,11 +22,11 @@ from evaluation.bf_wrappers import (
     KMVDR_Recursive_Processor,
     SDW_MWF_Processor,
     MPDR_Recursive_Processor,
-    RTF_MVDR_Recursive_Processor,
-    SPP_MVDR_Recursive_Processor,
-    SPP_mono_MVDR_Recursive_Processor,
-    DTLN_MB_MVDR_Processor,
-    DTLN_RTF_MVDR_Processor
+    DTLN_MB_MVDR_SOUDEN_Processor,
+    DTLN_MB_MVDR_SOUDEN_BAN_Processor,
+    DTLN_MB_MVDR_SOUDEN_SLOW_Processor,
+    DTLN_Souden_Specsub_Processor,
+    ORACLE_MB_MVDR_SOUDEN_Processor
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,12 +53,18 @@ def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, 
         # 1. METADATA & GEOMETRY
         grp_meta = grp.create_group("metadata")
         grp_meta.attrs["fs"] = fs
-        for k, v in exp_config.items(): grp_meta.attrs[k] = v
+        for k, v in exp_config.items():
+            # Convert lists/tuples to strings for HDF5 attribute compatibility
+            grp_meta.attrs[k] = str(v) if isinstance(v, (list, tuple)) else v
 
         grp_geom = grp.create_group("geometry")
         grp_geom.create_dataset("mic_coords", data=scene_base_config['mic_coords'])
         grp_geom.create_dataset("source_pos", data=scene_base_config['source_pos'])
         grp_geom.create_dataset("room_dims", data=current_room_dims)
+        # Absolute interference positions (N_interferences, 3), if any were placed.
+        interferences_pos = scene_base_config.get('interferences_pos')
+        if interferences_pos is not None and len(interferences_pos) > 0:
+            grp_geom.create_dataset("interferences_pos", data=np.asarray(interferences_pos))
 
         # 2. AUDIO
         grp_audio = grp.create_group("audio")
@@ -217,6 +223,9 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                 array_center=room_center
             )
             scene_base_config['source_pos'] = source_pos
+            # Persist absolute interference positions so they can be saved to H5 and
+            # rendered by the dashboard (shape (N_interferences, 3)).
+            scene_base_config['interferences_pos'] = interferences_pos
 
             acoustic_scene.set_source(scene_base_config['source_path'], gain=1.0, position=source_pos.reshape(1,3))
             for idx in range(exp['N_interferences']):
@@ -226,7 +235,8 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                     gain=1.0, position=interferences_pos[idx].reshape(1,3)
                 )
 
-            acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'], ray_tracing=True)
+            acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'],
+                                        ray_tracing=scene_base_config.get('ray_tracing', True))
             acoustic_scene.convolve_signals(t_early=t_early_dynamic)
             current_rt60, current_M, current_N_int, current_mismatch_pos = exp['rt60'], exp['M'], exp['N_interferences'], exp['mismatch_pos']
 
@@ -238,6 +248,10 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             scene_data = acoustic_scene.mix_and_normalize(iSIR_dB=exp['isir_db'])
             current_isir_db = exp['isir_db']
             scene_base_config['VAD'] = scene_data["VAD"]
+
+            # Clean reference signals for the ORACLE mask processors (pre-hardware/pre-WPE)
+            scene_base_config['oracle_target'] = scene_data["target_early"] + scene_data["target_late"]
+            scene_base_config['oracle_noise'] = scene_data["interference_early"] + scene_data["interference_late"]
 
             # Prepare multiple ground truth references based on configuration
             refs_dict.clear()
@@ -452,8 +466,16 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
 
     tqdm.write(f"\n=== BATCH COMPLETED IN {(time.time() - start_total_time)/60:.2f} MINUTES ===")
     df_results = pd.DataFrame(all_metrics_results)
+
+    # Cast list columns to string for parquet compatibility
+    for col in df_results.columns:
+        if df_results[col].apply(lambda x: isinstance(x, (list, tuple))).any():
+            df_results[col] = df_results[col].astype(str)
+
     parquet_path = os.path.join(output_dir, "benchmark_metrics.parquet")
     df_results.to_parquet(parquet_path, engine="pyarrow")
+
+    df_results.to_csv(os.path.join(output_dir, "benchmark_metrics.csv"), index=False)
 
     return df_results
 
@@ -480,13 +502,17 @@ if __name__ == "__main__":
         'duration': 15,
         'd_min': 0.02,
         'd_max': 0.30,
-        'radius_source': .6,
-        'radius_interf': 1.2,
-        'delta_ang_deg': 30.0,
+        # DIAGNOSTICO: matchear la escena MIRD (fuente/interf a 1 m, separacion 45 deg)
+        'radius_source': 1.0,
+        'radius_interf': 1.0,
+        'delta_ang_deg': 45.0,
+        # Generacion de RIRs SIMULADAS: True = hibrido ISM+RayTracing (estocastico);
+        # False = ISM puro (deterministico, mas rapido, sin cola difusa de rayos).
+        'ray_tracing': True,
         'snr_db': 60.0,
         'source_path': r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
         'interf_paths': [
-            r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/hairdryer_07_SH_MKH800.wav"
+            r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav"
         ],
         'wpe_taps': 7,
         'wpe_delay': 3,
@@ -505,23 +531,32 @@ if __name__ == "__main__":
     }
 
     param_grid = {
+        # --- Ejes propios de la generacion de RIRs SIMULADAS (no MIRD) ---
         'rt60': [0.5],
         'M': [9],
         'N_interferences': [1],
         'mismatch_pos': [0.0],
-        'isir_db': [0],
-        'mismatch_gain': [0, 3],
-        'mismatch_phase': [0,7],
+
+        # --- Ejes compartidos, alineados con full_benchmark_test_dtln_mird ---
+        'isir_db': [-5],
+        'mismatch_gain': [0],
+        'mismatch_phase': [0],
         'use_wpe': [False],
-        'error_angle_deg': [0.0, 6.0, 10],
+        'error_angle_deg': [0.0],
         'error_distance_m': [0.0]
     }
 
     processors_dict = {
-        "DS": DS_Processor(),
-        "DTLN-MVDR": DTLN_MB_MVDR_Processor(),
-        "DTLN-RTF-MVDR": DTLN_RTF_MVDR_Processor(),
-        "MVDR-Recursive": MVDR_Recursive_Processor()
+        "NM-MVDR_alpha_1_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
+        "NM-MVDR_alpha_0.99_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99),
+        # Cota superior agnostica al modelo: misma cadena Souden pero con mascara ideal.
+        # SOFT (sharpen_exp=1.0, IRM continua) y HARD-EDGE (sharpen_exp=4.0, == **4 del DTLN).
+        "Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
+        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
+        "Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
+        "Oracle-MVDR_hard_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=4.0),
+        "Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW_Processor(),
+        "Specsub" : DTLN_Souden_Specsub_Processor(smooth=1.0, min_loading=1e-6),
     }
 
     df_final = run_grid_search(

@@ -1,20 +1,17 @@
 import numpy as np
 import tensorflow as tf
 
-import numpy as np
-import tensorflow as tf
-import numpy as np
-import tensorflow as tf
 
 def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono):
     """
-    Applies the Float32 DTLN TF-Lite models using a strict real-time
+    Applies the DTLN TF-Lite models using a strict real-time
     frame-by-frame loop.
 
     Includes critical fixes for benchmark integration:
     - Memory contiguity enforcement for TFLite raw pointer access.
-    - Robust 99.9th percentile scaling to prevent INT8 quantization
-      starvation caused by acoustic simulator initialization transients.
+    - Peak normalization so inputs of arbitrary scale (e.g. beamformer
+      outputs) reach the network in the [-1, 1] range it was trained on,
+      without clipping. The original scale is restored at the end.
     - Hard copies of interpreter state tensors to prevent memory
       corruption across massive grid-search loops.
     """
@@ -22,19 +19,11 @@ def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono):
     # 1. Enforce shape and memory contiguity
     audio_mono = np.ascontiguousarray(np.squeeze(audio_mono), dtype=np.float32)
 
-    # 2. Robust Peak Detection (Spike Starvation Protection)
-    abs_audio = np.abs(audio_mono)
-    robust_peak = np.percentile(abs_audio, 99.9)
+    # 2. Peak normalization (lossless, no clipping)
+    peak = np.max(np.abs(audio_mono))
+    scale_factor = peak if peak > 1e-6 else 1.0
 
-    # Fallback for absolute silence or edge cases
-    if robust_peak < 1e-6:
-        robust_peak = np.max(abs_audio)
-
-    scale_factor = robust_peak if robust_peak > 0 else 1.0
-
-    # Normalize and strictly clip initialization transients to expected model range
     audio_norm = audio_mono / scale_factor
-    audio_norm = np.clip(audio_norm, -1.0, 1.0)
 
     block_len = 512
     block_shift = 128
@@ -137,10 +126,7 @@ def main():
         # Average the channels to create a single mono track
         audio = np.mean(audio, axis=1)
 
-    #normalize
-    max = np.max(audio)
-    print(f"max: {max}")
-    audio = audio /max
+    # Normalization now happens inside the wrapper (peak-based, scale restored)
 
     print("Processing audio frame-by-frame...")
 

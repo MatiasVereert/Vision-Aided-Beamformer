@@ -42,6 +42,19 @@ def precise_slice_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, m
     return aligned_ref[:min_len], aligned_deg[:min_len], shift
 
 
+def _safe_metric(getter):
+    """
+    Evalua una metrica de forma AISLADA. Si su calculo lanza una excepcion
+    (p.ej. PESQ 'NoUtterancesError' cuando la señal esta demasiado degradada y su
+    VAD interno no detecta habla), devuelve NaN sin tumbar al resto de las
+    metricas de la misma llamada.
+    """
+    try:
+        return float(getter())
+    except Exception:
+        return np.nan
+
+
 def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                            interf_early: np.ndarray = None,
                            interf_late: np.ndarray = None,
@@ -118,13 +131,14 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                 compute_permutation=False
             )
 
-            # Extract index 0 metrics which correspond strictly to the target speech channel
-            results['PESQ'] = float(metrics_facade.pesq[0])
-            results['STOI'] = float(metrics_facade.stoi[0])
-            results['SI-SDR'] = float(metrics_facade.si_sdr[0])
-            results['SDR'] = float(metrics_facade.mir_eval_sdr[0])
-            results['SIR'] = float(metrics_facade.mir_eval_sir[0])
-            results['SAR'] = float(metrics_facade.mir_eval_sar[0])
+            # Extract index 0 metrics which correspond strictly to the target speech channel.
+            # Each metric is isolated so a PESQ 'NoUtterances' failure does not discard the rest.
+            results['PESQ'] = _safe_metric(lambda: metrics_facade.pesq[0])
+            results['STOI'] = _safe_metric(lambda: metrics_facade.stoi[0])
+            results['SI-SDR'] = _safe_metric(lambda: metrics_facade.si_sdr[0])
+            results['SDR'] = _safe_metric(lambda: metrics_facade.mir_eval_sdr[0])
+            results['SIR'] = _safe_metric(lambda: metrics_facade.mir_eval_sir[0])
+            results['SAR'] = _safe_metric(lambda: metrics_facade.mir_eval_sar[0])
 
         else:
             # Fallback to single-source evaluation if secondary components are missing
@@ -136,11 +150,11 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                 compute_permutation=False
             )
 
-            results['PESQ'] = float(metrics_facade.pesq[0])
-            results['STOI'] = float(metrics_facade.stoi[0])
-            results['SI-SDR'] = float(metrics_facade.si_sdr[0])
-            results['SDR'] = float(metrics_facade.mir_eval_sdr[0])
-            results['SAR'] = float(metrics_facade.mir_eval_sar[0])
+            results['PESQ'] = _safe_metric(lambda: metrics_facade.pesq[0])
+            results['STOI'] = _safe_metric(lambda: metrics_facade.stoi[0])
+            results['SI-SDR'] = _safe_metric(lambda: metrics_facade.si_sdr[0])
+            results['SDR'] = _safe_metric(lambda: metrics_facade.mir_eval_sdr[0])
+            results['SAR'] = _safe_metric(lambda: metrics_facade.mir_eval_sar[0])
             results['SIR'] = np.nan
 
     except Exception:

@@ -1,0 +1,11 @@
+senal,PESQ,STOI,SI-SDR,SDR,SAR,SIR
+mixture_raw,1.3180,0.6322,3.7934,4.8232,4.8232,nan
+mixture_wpe,1.4548,0.7122,8.9163,8.9240,8.9240,nan
+ref_mic_raw,1.4548,0.7122,8.9163,8.9240,8.9240,nan
+dtln_mono,2.1236,0.8060,14.9217,15.7217,15.7217,nan
+dtln_souden_ban_mvdr,2.9768,0.8705,11.8215,14.1042,14.1042,nan
+dtln_souden_ban_then_dtln,2.3474,0.8651,11.6981,13.9982,13.9982,nan
+dtln_souden_mvdr,3.2305,0.8587,5.8271,10.1724,10.1724,nan
+dtln_souden_specsub,3.1963,0.8605,7.4073,11.2813,11.2813,nan
+oracle_souden_mask,3.3764,0.8763,11.0372,12.1884,12.1884,nan
+oracle_souden_scm,3.7947,0.9077,15.6212,16.9307,16.9307,nan

@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 *.log
 
+# Build artifacts (generados por pip/setuptools)
+build/
+dist/
+*.egg-info/
+
 #  NumPy y Matplotlib
 *.npy
 *.npz

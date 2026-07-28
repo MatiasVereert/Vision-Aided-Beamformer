@@ -7,8 +7,29 @@ import plotly.graph_objects as go
 # Configure page to maximize screen space
 st.set_page_config(page_title="Acoustic Benchmark", layout="wide")
 
+# CSS to compact Streamlit's metric widgets (injected once in main)
+METRIC_CSS = """
+<style>
+[data-testid="stMetricValue"] { font-size: 1.5rem; }
+[data-testid="stMetricLabel"] { font-size: 0.8rem; padding-bottom: 0.1rem; }
+[data-testid="stMetricDelta"] { font-size: 0.8rem; }
+</style>
+"""
+
+def prep_audio(sig):
+    """
+    Normalize a signal to int16 for Streamlit playback.
+    Handles both 1D and 2D arrays (takes the first channel if 2D).
+    """
+    if isinstance(sig, np.ndarray) and len(sig.shape) > 1:
+        sig = sig[0]  # Take the first channel if it is a 2D array
+    max_val = np.max(np.abs(sig))
+    if max_val == 0:
+        return np.int16(sig)
+    return np.int16(sig / max_val * 32767)
+
 @st.cache_data
-def get_h5_structure(h5_filepath: str) -> dict:
+def get_h5_structure(h5_filepath: str, mtime: float) -> dict:
     """
     Scans the HDF5 file to build a nested dictionary of available paths:
     { Processor : { Metric : [Cases] } }
@@ -23,7 +44,7 @@ def get_h5_structure(h5_filepath: str) -> dict:
     return structure
 
 @st.cache_data
-def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case_type: str) -> dict:
+def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case_type: str, mtime: float) -> dict:
     """
     Reads a specific case path from the HDF5 file and extracts the data.
     Cached by Streamlit to prevent disk reads on every UI interaction.
@@ -70,17 +91,8 @@ def display_metrics_row(metrics_dict: dict):
     Displays metrics dynamically, adapting to the new prefix-based naming
     convention and multiple ground truth references (e.g., anechoic, early).
     """
-    st.markdown("""
-    <style>
-    /* Reduce font size and padding for Streamlit's metric widget */
-    [data-testid="stMetricValue"] { font-size: 1.5rem; }
-    [data-testid="stMetricLabel"] { font-size: 0.8rem; padding-bottom: 0.1rem; }
-    [data-testid="stMetricDelta"] { font-size: 0.8rem; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Extract unique metric names by stripping the 'base_' prefix
-    base_keys = [k for k in metrics_dict.keys() if k.startswith("base_")]
+    # Extract unique metric names by stripping the 'base_' prefix (CD excluded)
+    base_keys = [k for k in metrics_dict.keys() if k.startswith("base_") and "CD" not in k]
     all_metric_names = [k.replace("base_", "") for k in base_keys]
 
     if not all_metric_names: return
@@ -94,6 +106,8 @@ def display_metrics_row(metrics_dict: dict):
         selected_ref = st.selectbox("Ground Truth Reference for Metrics", sorted(references))
         # Filter metric names for the selected reference
         metric_names = [m for m in all_metric_names if m.endswith(f"_{selected_ref}")]
+
+    if not metric_names: return
 
     # Row 1: Beamformer Performance vs Baseline
     st.markdown("### Spatial Processing Performance")
@@ -119,10 +133,6 @@ def display_metrics_row(metrics_dict: dict):
                 # Compute total absolute delta improvement against raw baseline
                 delta_tot_alone = val - base_val if not np.isnan(val) and not np.isnan(base_val) else np.nan
 
-                # Invert delta direction visual color for Cepstral Distance (lower is better)
-                if "CD" in m:
-                    delta_tot_alone = -delta_tot_alone if not np.isnan(delta_tot_alone) else np.nan
-
                 st.metric(label=f"{display_name} (DTLN Alone)", value=f"{val:.3f}", delta=f"{delta_tot_alone:.3f}" if not np.isnan(delta_tot_alone) else None)
 
     # Row 3: Full Pipeline (including DTLN) vs Baseline, if available
@@ -136,11 +146,83 @@ def display_metrics_row(metrics_dict: dict):
                 val = metrics_dict.get(f"dtln_post_{m}", np.nan)
                 delta = metrics_dict.get(f"Delta_tot_pipeline_{m}", np.nan)
 
-                # Invert delta for CD metric
-                if "CD" in m:
-                    delta = -delta if not np.isnan(delta) else np.nan
-
                 st.metric(label=f"{display_name} (Pipeline)", value=f"{val:.3f}", delta=f"{delta:.3f}")
+
+# Human-readable labels for known metadata keys (unknown keys fall back to Title Case).
+_META_LABELS = {
+    "rt60": ("RT60", "s"),
+    "isir_db": ("iSIR", "dB"),
+    "target_angle": ("Ángulo objetivo", "°"),
+    "target_dist": ("Distancia objetivo", "m"),
+    "interf_configs": ("Interferencias (áng°, dist m)", ""),
+    "N_interferences": ("# Interferencias", ""),
+    "error_angle_deg": ("Error de ángulo", "°"),
+    "error_distance_m": ("Error de distancia", "m"),
+    "mismatch_gain": ("Mismatch ganancia", ""),
+    "mismatch_phase": ("Mismatch fase", ""),
+    "mismatch_pos": ("Mismatch posición", ""),
+    "use_wpe": ("WPE (dereverb.)", ""),
+    "M": ("# Micrófonos", ""),
+    "fs": ("Frecuencia de muestreo", "Hz"),
+}
+
+def _fmt_meta_value(key: str, val) -> str:
+    """Format a metadata attribute value for display."""
+    if isinstance(val, (bool, np.bool_)):
+        return "Sí" if val else "No"
+    if isinstance(val, (float, np.floating)):
+        return f"{val:g}"
+    return str(val)
+
+def display_experiment_conditions(data: dict, h5_structure: dict, selected_proc: str,
+                                  selected_metric: str, selected_case: str):
+    """
+    Renders the searchgrid parameters and processor context for the case in view,
+    adapting to whatever metadata keys are present (works for both the simulated
+    and MIRD benchmark variants).
+    """
+    meta = data.get("metadata", {})
+    geom = data.get("geometry", {})
+
+    with st.expander("🔬 Condiciones del experimento", expanded=True):
+        # Processor / metric / scenario context
+        all_procs = list(h5_structure.keys())
+        all_metrics = list(h5_structure.get(selected_proc, {}).keys())
+        st.markdown(
+            f"**Procesador:** `{selected_proc}`  &nbsp;·&nbsp;  "
+            f"**Métrica optimizada:** `{selected_metric}`  &nbsp;·&nbsp;  "
+            f"**Escenario:** `{selected_case}`"
+        )
+        st.caption(
+            f"Procesadores disponibles: {', '.join(all_procs)}  |  "
+            f"Métricas del searchgrid: {', '.join(all_metrics)}"
+        )
+
+        # Build the parameter list: geometry-derived facts first, then metadata attrs
+        params = []
+        mic_coords = np.atleast_2d(geom.get("mic_coords", [])) if "mic_coords" in geom else None
+        if mic_coords is not None and mic_coords.size:
+            params.append(("# Micrófonos", str(mic_coords.shape[0])))
+        room_dims = geom.get("room_dims")
+        if room_dims is not None:
+            params.append(("Sala (X×Y×Z)", " × ".join(f"{d:g}" for d in np.ravel(room_dims)) + " m"))
+        if "interferences_pos" in geom:
+            params.append(("# Interferencias", str(np.atleast_2d(geom["interferences_pos"]).shape[0])))
+
+        skip = {"fs"}  # fs is shown in the audio section; keep this panel focused on the grid
+        for key, val in meta.items():
+            if key in skip:
+                continue
+            label, unit = _META_LABELS.get(key, (key.replace("_", " ").title(), ""))
+            text = _fmt_meta_value(key, val)
+            params.append((label, f"{text} {unit}".strip()))
+
+        # Render as a responsive grid, 4 items per row
+        per_row = 4
+        for i in range(0, len(params), per_row):
+            cols = st.columns(per_row)
+            for col, (label, value) in zip(cols, params[i:i + per_row]):
+                col.markdown(f"**{label}**  \n{value}")
 
 def get_room_wireframe_traces(room_dims: list, **kwargs) -> list:
     """
@@ -193,6 +275,8 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
     mic_coords = np.atleast_2d(geom.get("mic_coords", [[0, 0, 0]]))
     source_pos = np.atleast_2d(geom.get("source_pos", [[1, 1, 1]]))
     interf_pos = geom.get("interferences_pos", None)
+    if interf_pos is not None:
+        interf_pos = np.atleast_2d(interf_pos)
     room_dims = geom.get("room_dims", [5.0, 5.0, 3.0])
 
     array_center = np.mean(mic_coords, axis=0)
@@ -236,7 +320,7 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
 
     fig.add_trace(go.Scatter3d(x=mic_coords[:, 0], y=mic_coords[:, 1], z=mic_coords[:, 2], mode='markers', marker=dict(size=4, color='black'), name='Mics'))
     fig.add_trace(go.Scatter3d(x=source_pos[:, 0], y=source_pos[:, 1], z=source_pos[:, 2], mode='markers', marker=dict(size=8, color='green', symbol='diamond'), name='Target'))
-    if interf_pos is not None:
+    if interf_pos is not None and len(interf_pos) > 0:
         fig.add_trace(go.Scatter3d(x=interf_pos[:, 0], y=interf_pos[:, 1], z=interf_pos[:, 2], mode='markers', marker=dict(size=6, color='red', symbol='x'), name='Interf'))
 
     frames = []
@@ -288,10 +372,11 @@ def build_native_plotly_animation(data: dict, proc_name: str, f_idx: int, user_s
     return fig
 
 def main():
+    st.markdown(METRIC_CSS, unsafe_allow_html=True)
     st.sidebar.title("Acoustic Benchmark")
     st.sidebar.markdown("---")
 
-    results_dir = r"/home/matias/Downloads"
+    results_dir = os.environ.get("BENCHMARK_RESULTS_DIR", "/home/matias/Downloads")
     if not os.path.exists(results_dir):
         st.sidebar.error(f"Directory not found: {results_dir}")
         return
@@ -303,9 +388,10 @@ def main():
 
     selected_file = st.sidebar.selectbox("Select Benchmark File", h5_files)
     h5_path = os.path.join(results_dir, selected_file)
+    h5_mtime = os.path.getmtime(h5_path)  # cache key: invalidates when the file changes
 
     # 1. Parse H5 Structure dynamically
-    h5_structure = get_h5_structure(h5_path)
+    h5_structure = get_h5_structure(h5_path, h5_mtime)
     if not h5_structure:
         st.sidebar.warning("File is empty or not in the expected nested format.")
         return
@@ -321,7 +407,7 @@ def main():
     selected_case = st.sidebar.selectbox("Scenario", available_cases)
 
     # 3. Load specific data chunk
-    data = load_benchmark_case(h5_path, selected_proc, selected_metric, selected_case)
+    data = load_benchmark_case(h5_path, selected_proc, selected_metric, selected_case, h5_mtime)
 
     if not data["spatial"]:
         st.error(f"Could not load spatial data for path: {selected_proc}/{selected_metric}/{selected_case}")
@@ -347,15 +433,6 @@ def main():
     if "audio" in data and data["audio"]:
         st.sidebar.markdown("---")
         st.sidebar.subheader("Audio Comparison")
-
-        # --- BUG FIX: Robust Audio Normalization ---
-        # Handles both 1D and 2D arrays properly based on new H5 output
-        def prep_audio(sig):
-            if isinstance(sig, np.ndarray) and len(sig.shape) > 1:
-                sig = sig[0]  # Take the first channel if it is a 2D array
-            max_val = np.max(np.abs(sig))
-            if max_val == 0: return np.int16(sig)
-            return np.int16(sig / max_val * 32767)
 
         audio_dict = data["audio"]
 
@@ -388,6 +465,8 @@ def main():
     # --- MAIN PANEL ---
     st.title(f"Visualizing: {selected_proc} ({selected_case.replace('_', ' ').title()})")
     st.caption(f"Optimized for extreme variance in: **{selected_metric}**")
+
+    display_experiment_conditions(data, h5_structure, selected_proc, selected_metric, selected_case)
 
     if data["metrics"]:
         display_metrics_row(data["metrics"])

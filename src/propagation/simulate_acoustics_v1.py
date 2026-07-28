@@ -276,17 +276,22 @@ class SimAcoustic():
         else:
             up_factor, down_factor = 1, 1
 
-        # CÓDIGO CORREGIDO EN import_rirs
         self.rirs = []
         for m in range(self.M):
             sensor_responses = []
             for mat in extracted_matrices:
-                # Aseguramos que la matriz RIR tenga forma (M, N_samples)
-                mat_arr = np.atleast_2d(mat) 
-                
-                # Extraemos estrictamente la fila correspondiente al micrófono actual 'm'
-                raw_rir_channel = mat_arr[m, :].flatten()
-                
+                mat_arr = np.atleast_2d(mat)
+
+                # La matriz del dataset MIRD viene como (N_samples, M_channels).
+                # Detectamos el eje de canales (tamaño == self.M) y extraemos la RIR
+                # COMPLETA del microfono 'm'. El codigo anterior tomaba mat_arr[m, :]
+                # (una unica muestra temporal a traves de los canales -> RIR basura de
+                # pocas muestras tras el resampleo), colapsando la RIR a una casi-delta.
+                if mat_arr.shape[0] == self.M and mat_arr.shape[1] != self.M:
+                    raw_rir_channel = mat_arr[m, :].flatten()   # ya orientada (M, N)
+                else:
+                    raw_rir_channel = mat_arr[:, m].flatten()   # (N, M) -> columna del canal
+
                 if native_fs != self.fs:
                     resampled_rir = signal.resample_poly(raw_rir_channel, up_factor, down_factor)
                 else:

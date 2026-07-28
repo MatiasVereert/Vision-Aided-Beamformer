@@ -14,6 +14,7 @@ from beamforming.array.microphone import Microphone
 from propagation.simulate_acoustics_v1 import SimAcoustic
 from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array
 from dereverberation.nara_wrappers import process_wpe_online
+from dereverberation.nara_wrappers_fixed import process_wpe_online_fixed, FixedPointConfig
 from evaluation.metrics import evaluate_full_pipeline
 
 from evaluation.bf_wrappers import (
@@ -22,12 +23,11 @@ from evaluation.bf_wrappers import (
     KMVDR_Recursive_Processor,
     SDW_MWF_Processor,
     MPDR_Recursive_Processor,
-    RTF_MVDR_Recursive_Processor,
-    SPP_MVDR_Recursive_Processor,
-    SPP_mono_MVDR_Recursive_Processor,
-    DTLN_MB_MVDR_Processor,
     DTLN_MB_MVDR_SOUDEN_Processor,
-    DTLN_MB_MVDR_SOUDEN_BAN_Processor
+    DTLN_MB_MVDR_SOUDEN_BAN_Processor,
+    DTLN_MB_MVDR_SOUDEN_SLOW_Processor,
+    DTLN_Souden_Specsub_Processor,
+    ORACLE_MB_MVDR_SOUDEN_Processor
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +62,10 @@ def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, 
         grp_geom.create_dataset("mic_coords", data=scene_base_config['mic_coords'])
         grp_geom.create_dataset("source_pos", data=scene_base_config['source_pos'])
         grp_geom.create_dataset("room_dims", data=current_room_dims)
+        # Absolute interference positions (N_interferences, 3), if any were placed.
+        interferences_pos = scene_base_config.get('interferences_pos')
+        if interferences_pos is not None and len(interferences_pos) > 0:
+            grp_geom.create_dataset("interferences_pos", data=np.asarray(interferences_pos))
 
         # 2. AUDIO
         grp_audio = grp.create_group("audio")
@@ -229,6 +233,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             acoustic_scene.set_source(scene_base_config['source_path'], gain=1.0, position=abs_pos_target.reshape(1,3))
 
             # Map Interference Positions
+            interferences_pos = []
             for idx, interf_cfg in enumerate(exp['interf_configs']):
 
                 i_ang = interf_cfg[0]
@@ -244,12 +249,16 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], i_dist, i_ang)
                 rel_pos_interf = dataset_provider.export_position('cartesian')
                 abs_pos_interf = array_center + rel_pos_interf.squeeze()
+                interferences_pos.append(abs_pos_interf)
 
                 # Inject interference
                 acoustic_scene.set_interference(
                     audio_path=scene_base_config['interf_paths'][audio_idx],
                     gain=1.0, position=abs_pos_interf.reshape(1,3)
                 )
+            # Persist absolute interference positions (N_interferences, 3) so they can be
+            # saved to H5 and rendered by the dashboard.
+            scene_base_config['interferences_pos'] = np.asarray(interferences_pos) if interferences_pos else np.zeros((0, 3))
             # Inject actual measurement matrices
             acoustic_scene.import_rirs(
                 dataset_provider=dataset_provider,
@@ -274,6 +283,12 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             scene_data = acoustic_scene.mix_and_normalize(iSIR_dB=exp['isir_db'])
             current_isir_db = exp['isir_db']
             scene_base_config['VAD'] = scene_data["VAD"]
+
+            # Clean reference signals for the ORACLE mask (agnostic upper bound):
+            # voz = target reverberante completo (early + late), como trata el
+            # mask-based MVDR clasico; ruido = interferencia (early + late).
+            scene_base_config['oracle_target'] = scene_data["target_early"] + scene_data["target_late"]
+            scene_base_config['oracle_noise'] = scene_data["interference_early"] + scene_data["interference_late"]
 
             refs_dict.clear()
             if 'anechoic' in scene_base_config['eval_references']:
@@ -310,11 +325,25 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         # ---------------------------------------------------------
         if recalc_wpe:
             if exp['use_wpe']:
-                tqdm.write(" -> [NODE 4] Applying heavy WPE pre-processing...")
-                mic_signals_ready = process_wpe_online(
-                    u=mic_signals_degraded, taps=scene_base_config['wpe_taps'], delay=scene_base_config['wpe_delay'],
-                    alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'], stft_shift=scene_base_config['wpe_stft_shift']
-                )
+                fixed_bits = scene_base_config.get('wpe_fixed_bits', None)
+                if fixed_bits is None:
+                    tqdm.write(" -> [NODE 4] Applying WPE pre-processing (float)...")
+                    mic_signals_ready = process_wpe_online(
+                        u=mic_signals_degraded, taps=scene_base_config['wpe_taps'], delay=scene_base_config['wpe_delay'],
+                        alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'], stft_shift=scene_base_config['wpe_stft_shift']
+                    )
+                else:
+                    tqdm.write(f" -> [NODE 4] Applying WPE pre-processing (FIXED-POINT {fixed_bits}-bit, FPGA emulation)...")
+                    fp_cfg = FixedPointConfig.wordlength(
+                        fixed_bits, rounding=scene_base_config.get('wpe_fixed_round', 'nearest')
+                    )
+                    mic_signals_ready, fp_stats = process_wpe_online_fixed(
+                        u=mic_signals_degraded, taps=scene_base_config['wpe_taps'], delay=scene_base_config['wpe_delay'],
+                        alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'],
+                        stft_shift=scene_base_config['wpe_stft_shift'], fp_cfg=fp_cfg, return_stats=True
+                    )
+                    tqdm.write(f"    [FP-STATS] overflow={fp_stats.overflow} max|P|={fp_stats.max_absP:.2e} "
+                               f"max|G|={fp_stats.max_absG:.2e} diverged={fp_stats.diverged}")
 
                 tqdm.write(" -> Evaluating WPE Metrics against all references...")
                 wpe_metrics = evaluate_all_references(
@@ -421,6 +450,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 "mismatch_gain": exp['mismatch_gain'],
                 "mismatch_phase": exp['mismatch_phase'],
                 "use_wpe": exp['use_wpe'],
+                "wpe_bits": scene_base_config.get('wpe_fixed_bits', None),
                 "error_angle_deg": err_ang,
                 "error_distance_m": err_dist,
                 "t_early_s": t_early_dynamic,
@@ -502,7 +532,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     parquet_path = os.path.join(output_dir, "mird_benchmark_metrics.parquet")
     df_results.to_parquet(parquet_path, engine="pyarrow")
 
-    df_results.to_csv("mird_benchmark_metrics.csv", index=False)
+    df_results.to_csv(os.path.join(output_dir, "mird_benchmark_metrics.csv"), index=False)
 
     return df_results
 
@@ -545,6 +575,13 @@ if __name__ == "__main__":
         'wpe_stft_size': 512,
         'wpe_stft_shift': 128,
 
+        # --- FPGA fixed-point emulation of WPE ---
+        # None => float (original). Set to 16/18/24/32 to run the causal
+        # Online-WPE RLS in fixed-point (URAM-storage precision emulation).
+        # Change this value and re-run to sweep word length against MIRD metrics.
+        'wpe_fixed_bits': None,   # <-- set to 24 (safe) / 20 / 18 to emulate fixed-point FPGA WPE
+        'wpe_fixed_round': 'nearest',   # 'nearest' | 'floor'
+
         'stft_window': 512,
         'stft_overlap': 384,
 
@@ -566,27 +603,38 @@ if __name__ == "__main__":
             [(45, 1.0)],
         ],
 
-        'isir_db': [-5 ,0, 5],
-        'mismatch_gain': [3],
-        'mismatch_phase': [5],
-        'use_wpe': [False],
+        'isir_db': [0],
+        'mismatch_gain': [0],
+        'mismatch_phase': [0],
+        'use_wpe': [True, False],
         'error_angle_deg': [0.0],
         'error_distance_m': [0.0]
     }
 
     processors_dict = {
-        "NM-MVDR_alpha_1_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
+        #"NM-MVDR_alpha_1_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
         "NM-MVDR_alpha_0.99_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99),
-
+        # Cota superior agnostica al modelo: misma cadena Souden pero con mascara ideal.
+        # SOFT (sharpen_exp=1.0, IRM continua) y HARD-EDGE (sharpen_exp=4.0, == **4 del DTLN).
+        #"Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
+        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
+        #"Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
+        "Oracle-MVDR_hard_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=4.0),
+        #"Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW_Processor(),
+        "Specsub" : DTLN_Souden_Specsub_Processor(smooth=1.0, min_loading=1e-6),
+        "DS" :  DS_Processor(),
+        "MVDR_geo": MVDR_Recursive_Processor(),
+        "DSW-MWF": DS_Processor(),
 
     }
+
 
     df_final = run_mird_grid_search(
         grid_params=param_grid,
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/linear_recursive",
+        output_dir="tests/dataset_out/with_ds",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )
