@@ -14,7 +14,7 @@ from evaluation.polar_plots import precompute_quantized_spatial_response, subsam
 from beamforming.array.microphone import Microphone
 from propagation.simulate_acoustics_v1 import SimAcoustic
 from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array
-from dereverberation.nara_wrappers import process_wpe_online
+from dereverberation.nara_wrappers import process_wpe_online, process_wpe_online_with_components
 from dereverberation.nara_wrappers_fixed import process_wpe_online_fixed, FixedPointConfig
 from evaluation.metrics import evaluate_full_pipeline
 
@@ -229,6 +229,9 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     current_source_path = None
 
     acoustic_scene, scene_data, mic_signals_degraded, mic_signals_ready = None, None, None, None
+    # Componentes target-solo / (interf+ruido)-solo POST-HW (dominio de Node 3), a
+    # partir de los cuales se derivan las refs del oracle POST-WPE en Node 4.
+    hw_oracle_target, hw_oracle_noise = None, None
     refs_dict = {}
     baseline_metrics = {}
     wpe_metrics = {}
@@ -354,11 +357,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             current_isir_db = exp['isir_db']
             scene_base_config['VAD'] = scene_data["VAD"]
 
-            # Clean reference signals for the ORACLE mask (agnostic upper bound):
-            # voz = target reverberante completo (early + late), como trata el
-            # mask-based MVDR clasico; ruido = interferencia (early + late).
-            scene_base_config['oracle_target'] = scene_data["target_early"] + scene_data["target_late"]
-            scene_base_config['oracle_noise'] = scene_data["interference_early"] + scene_data["interference_late"]
+            # NOTA: las referencias del ORACLE (oracle_target/oracle_noise) YA NO se
+            # fijan aca. Deben vivir en el MISMO dominio que la senal que se filtra
+            # (mic_signals_ready = post HW mismatch + WPE), no en el dominio limpio
+            # pre-front-end. Se construyen en Node 3 (HW) + Node 4 (WPE). Ver el
+            # bloque "ORACLE REFERENCES" mas abajo.
 
             refs_dict.clear()
             if 'anechoic' in scene_base_config['eval_references']:
@@ -386,6 +389,21 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             mic_signals_degraded = mic_simulator.emulate(unprocessed_mic_signals)
             current_gain_mismatch, current_phase_mismatch = exp['mismatch_gain'], exp['mismatch_phase']
 
+            # --- COMPONENTES POST-HW PARA EL ORACLE (dominio de la observacion) ---
+            # emulate() = mismatch(mezcla) + ruido_termico. _apply_mismatch es LINEAL
+            # (ganancia por-mic + fase via FFT) y su patron ya quedo fijado por la
+            # semilla dentro de emulate(), asi que reaplicarlo al target-solo es
+            # consistente con lo aplicado a la mezcla:
+            #   hw_target = mismatch(target_limpio)
+            #   hw_noise  = mic_signals_degraded - hw_target
+            #              = mismatch(interf_limpio) + ruido_termico
+            # => hw_target + hw_noise == mic_signals_degraded (exacto). El ruido
+            # termico, aditivo, cae ENTERO en el ruido (donde corresponde). Con
+            # mismatch=0 -> mismatch() es identidad -> hw_target = target_limpio.
+            target_clean = scene_data["target_early"] + scene_data["target_late"]
+            hw_oracle_target = mic_simulator._apply_mismatch(target_clean)
+            hw_oracle_noise = mic_signals_degraded - hw_oracle_target
+
             tqdm.write(" -> Evaluating Baseline Metrics against all references...")
             baseline_metrics = evaluate_all_references(
                 refs_dict=refs_dict, deg_sig=mic_signals_degraded[0], fs=scene_base_config['fs'],
@@ -399,13 +417,24 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         # NODE 4: WPE PRE-PROCESSING
         # ---------------------------------------------------------
         if recalc_wpe:
+            wpe_kw = dict(
+                taps=exp['wpe_taps'], delay=exp['wpe_delay'],
+                alpha=scene_base_config['wpe_alpha'],
+                stft_size=scene_base_config['wpe_stft_size'],
+                stft_shift=scene_base_config['wpe_stft_shift'],
+            )
             if exp['use_wpe']:
                 fixed_bits = scene_base_config.get('wpe_fixed_bits', None)
                 if fixed_bits is None:
                     tqdm.write(" -> [NODE 4] Applying WPE pre-processing (float)...")
-                    mic_signals_ready = process_wpe_online(
-                        u=mic_signals_degraded, taps=exp['wpe_taps'], delay=exp['wpe_delay'],
-                        alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'], stft_shift=scene_base_config['wpe_stft_shift']
+                    # Un solo pase de WPE que devuelve la mezcla dereverberada Y las
+                    # componentes target/ruido filtradas con el MISMO G (estimado de la
+                    # mezcla). Al ser lineal dado G: WPE(target)+WPE(ruido)==WPE(mezcla).
+                    # z_u es IDENTICO (bit a bit) a process_wpe_online(mezcla): el
+                    # filtrado de componentes no toca el estado del filtro de la mezcla.
+                    mic_signals_ready, (oracle_target, oracle_noise) = process_wpe_online_with_components(
+                        u=mic_signals_degraded,
+                        components=[hw_oracle_target, hw_oracle_noise], **wpe_kw
                     )
                 else:
                     tqdm.write(f" -> [NODE 4] Applying WPE pre-processing (FIXED-POINT {fixed_bits}-bit, FPGA emulation)...")
@@ -419,6 +448,20 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                     )
                     tqdm.write(f"    [FP-STATS] overflow={fp_stats.overflow} max|P|={fp_stats.max_absP:.2e} "
                                f"max|G|={fp_stats.max_absG:.2e} diverged={fp_stats.diverged}")
+                    # OPCION A (aproximacion documentada): el front-end fixed-point es NO
+                    # lineal, asi que no admite descomposicion exacta. Las refs del oracle
+                    # se computan con la descomposicion FLOAT (exacta) sobre la MISMA
+                    # mezcla degradada. A alta word-length fixed~=float, asi que las refs
+                    # son una aproximacion cercana del target/ruido dentro de la
+                    # observacion fixed; el desajuste esta acotado por el error de
+                    # cuantizacion (crece a pocos bits -> interpretar el oracle con
+                    # cuidado en ese regimen).
+                    tqdm.write("    [NODE 4] Oracle refs via FLOAT decomposition (Opcion A): "
+                               "aprox. del dominio fixed-point acotada por la cuantizacion.")
+                    _, (oracle_target, oracle_noise) = process_wpe_online_with_components(
+                        u=mic_signals_degraded,
+                        components=[hw_oracle_target, hw_oracle_noise], **wpe_kw
+                    )
 
                 tqdm.write(" -> Evaluating WPE Metrics against all references...")
                 wpe_metrics = evaluate_all_references(
@@ -432,6 +475,16 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 tqdm.write(" -> [NODE 4] Bypassing WPE pre-processing...")
                 mic_signals_ready = mic_signals_degraded.copy()
                 wpe_metrics = baseline_metrics.copy()
+                # Sin WPE: las refs del oracle son las componentes POST-HW (mismo
+                # dominio que mic_signals_ready = mezcla degradada sin WPE).
+                oracle_target, oracle_noise = hw_oracle_target, hw_oracle_noise
+
+            # --- ORACLE REFERENCES (dominio consistente con mic_signals_ready) ---
+            # Cualquier procesador oracle (SOUDEN_ORACLE_SCM, ORACLE_MB_MVDR_SOUDEN)
+            # consume estas dos senales; ahora viven en el MISMO dominio (HW+WPE) que
+            # la senal que filtran -> las SCM / mascaras ideales quedan consistentes.
+            scene_base_config['oracle_target'] = oracle_target
+            scene_base_config['oracle_noise'] = oracle_noise
 
             current_use_wpe = exp['use_wpe']
             current_wpe_taps = exp['wpe_taps']
