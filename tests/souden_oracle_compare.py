@@ -31,9 +31,9 @@ import pandas as pd
 from propagation.mird_loader import MirdDatasetProvider
 from evaluation.full_benchmark_test_dtln_mird import run_mird_grid_search
 from evaluation.bf_wrappers import (
-    SOUDEN_ORACLE_SCM_Processor,
-    ORACLE_MB_MVDR_SOUDEN_Processor,
-    DTLN_MB_MVDR_SOUDEN_Processor,
+    SOUDEN_ORACLE_SCM,
+    ORACLE_MB_MVDR_SOUDEN,
+    NM_MVDR,
 )
 
 ROOT_MIRD_DIR = "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/rirs/mird"
@@ -81,10 +81,10 @@ def main():
     }
 
     processors_dict = {
-        "Souden_Oracle_SCM": SOUDEN_ORACLE_SCM_Processor(min_loading=1e-6, alpha=ALPHA),
-        "Oracle_mask_exp4": ORACLE_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=ALPHA, sharpen_exp=4.0),
-        "Oracle_mask_soft": ORACLE_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=ALPHA, sharpen_exp=1.0),
-        "DTLN_mask_exp32": DTLN_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=ALPHA, sharpen_exp=32.0),
+        "Souden_Oracle_SCM": SOUDEN_ORACLE_SCM(min_loading=1e-6, alpha=ALPHA),
+        "Oracle_mask_exp4": ORACLE_MB_MVDR_SOUDEN(min_loading=1e-6, alpha=ALPHA, sharpen_exp=4.0),
+        "Oracle_mask_soft": ORACLE_MB_MVDR_SOUDEN(min_loading=1e-6, alpha=ALPHA, sharpen_exp=1.0),
+        "DTLN_mask_exp32": NM_MVDR(min_loading=1e-6, alpha=ALPHA, sharpen_exp=32.0),
     }
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)

@@ -29,8 +29,8 @@ import pandas as pd
 from propagation.mird_loader import MirdDatasetProvider
 from evaluation.full_benchmark_test_dtln_mird import run_mird_grid_search
 from evaluation.bf_wrappers import (
-    DTLN_MB_MVDR_SOUDEN_Processor,
-    ORACLE_MB_MVDR_SOUDEN_Processor,
+    NM_MVDR,
+    ORACLE_MB_MVDR_SOUDEN,
 )
 
 ROOT_MIRD_DIR = "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/rirs/mird"
@@ -82,10 +82,10 @@ def main():
 
     # Procesadores: DTLN de referencia + Oracle barriendo el exponente
     processors_dict = {
-        "DTLN_NM-MVDR_alpha_1": DTLN_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=1),
+        "DTLN_NM-MVDR_alpha_1": NM_MVDR(min_loading=1e-6, alpha=1),
     }
     for e in SHARPEN_EXPS:
-        processors_dict[f"Oracle_exp{e:g}_alpha_1"] = ORACLE_MB_MVDR_SOUDEN_Processor(
+        processors_dict[f"Oracle_exp{e:g}_alpha_1"] = ORACLE_MB_MVDR_SOUDEN(
             min_loading=1e-6, alpha=1, sharpen_exp=e
         )
 

@@ -751,6 +751,81 @@ def MVDR_Souden_recursive_mask_specsub(X_stft, mask_s, mask_n, mask_s_soft,
     return Y
 
 
+def MVDR_Souden_recursive_mask_specsub_base(X_stft, mask_s, mask_n, mask_s_soft,
+                                            min_loading=1e-6, alpha=0.99, smooth=0.33,
+                                            save_weights=False):
+    """
+    Sustraccion espectral sobre el CORE BASE (MVDR_Souden_recursive_mask), el mismo
+    beamformer que usa NM_MVDR (el de mejor rendimiento).
+
+    Diferencia con MVDR_Souden_recursive_mask_specsub: aquel apoyaba el post-filtro
+    sobre _fixed (carga diagonal RELATIVA pura, solve). Este lo apoya sobre el core
+    original -> carga diagonal RELATIVA CON PISO ABSOLUTO (max(min_loading*tr/M, 1e-9),
+    inv()). Se verifico empiricamente (barrido de iSNR) que la carga liviana del core
+    base preserva mejor PESQ/SIR; esta variante combina ESE beamformer con la misma
+    ganancia espectral suave:
+
+        Beamformer = MVDR_Souden_recursive_mask(X, mask_s, mask_n)  -> Y_bf
+        Post-filtro: G(k,t) = smooth + (1 - smooth) * mask_s_soft(k,t) ;  Y = Y_bf * G
+
+    mask_s_soft = mascara ORIGINAL del DTLN (sin realce; = mask_sharpen ** (1/sharpen_exp)).
+    smooth: 1.0 = sin filtro (== core base exacto); 0.33 default (piso ~-9.6 dB);
+    0.0 = mascara suave pura.
+    """
+    res = MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n,
+                                     min_loading=min_loading, alpha=alpha,
+                                     save_weights=save_weights)
+    Y, W = (res if save_weights else (res, None))
+    Y = Y.copy()
+
+    Tm = min(Y.shape[1], mask_s_soft.shape[1])
+    G = smooth + (1.0 - smooth) * np.clip(mask_s_soft[:, :Tm], 0.0, 1.0)  # (K,Tm) real
+    Y[:, :Tm] *= G
+
+    if save_weights:
+        return Y, W
+    return Y
+
+
+def MVDR_Souden_recursive_mask_BAN_specsub_base(X_stft, mask_s, mask_n, mask_s_soft,
+                                                min_loading=1e-6, alpha=0.99, smooth=0.33,
+                                                save_weights=False):
+    """
+    BAN sobre el CORE BASE + POST-FILTRO de sustraccion espectral.
+
+    A diferencia de MVDR_Souden_recursive_mask_BAN_specsub (que apoya la BAN sobre el
+    core _fixed via BAN_MWF: carga relativa pura + solve), este usa
+    MVDR_Souden_recursive_mask_BAN_alpha: Blind Analytical Normalization con factor de
+    olvido alpha sobre la carga diagonal RELATIVA CON PISO ABSOLUTO
+    (max(min_loading*tr/M, 1e-9), inv()), el mismo estilo de loading del ganador
+    NM_MVDR. Es el analogo BAN de MVDR_Souden_recursive_mask_specsub_base.
+
+    Cadena:
+        Beamformer = MVDR_Souden_recursive_mask_BAN_alpha(X, mask_s, mask_n) -> Y_ban
+        Post-filtro: G(k,t) = smooth + (1 - smooth) * mask_s_soft(k,t) ;  Y = Y_ban * G
+
+    La BAN fija una escala de salida referida al ruido (buena fidelidad de forma de
+    onda); el specsub actua DESPUES sobre la salida (ganancia por bin en magnitud),
+    asi que NO se cancela con la BAN (a diferencia de combinar BAN con el MWF, donde
+    la BAN invariante a escala anulaba mu). mask_s_soft = mascara original del DTLN
+    (= mask_sharpen ** (1/sharpen_exp)). smooth: 1.0 = sin filtro (== BAN base exacto);
+    0.33 default; 0.0 = mascara suave pura.
+    """
+    res = MVDR_Souden_recursive_mask_BAN_alpha(X_stft, mask_s, mask_n,
+                                               min_loading=min_loading, alpha=alpha,
+                                               save_weights=save_weights)
+    Y, W = (res if save_weights else (res, None))
+    Y = Y.copy()
+
+    Tm = min(Y.shape[1], mask_s_soft.shape[1])
+    G = smooth + (1.0 - smooth) * np.clip(mask_s_soft[:, :Tm], 0.0, 1.0)  # (K,Tm) real
+    Y[:, :Tm] *= G
+
+    if save_weights:
+        return Y, W
+    return Y
+
+
 def MVDR_Souden_recursive_mask_BAN_specsub(X_stft, mask_s, mask_n, mask_s_soft,
                                            min_loading=1e-6, alpha=0.99, smooth=0.33,
                                            save_weights=False):

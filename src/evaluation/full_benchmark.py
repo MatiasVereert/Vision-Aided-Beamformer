@@ -13,11 +13,11 @@ from dereverberation.nara_wrappers import process_wpe_online
 
 # Imported the real wrappers for the spatial filtering algorithms
 from evaluation.bf_wrappers import (
-    DS_Processor,
-    MVDR_Recursive_Processor,
-    KMVDR_Recursive_Processor,
-    SDW_MWF_Processor,
-    MPDR_Recursive_Processor
+    DS,
+    MVDR_Recursive,
+    KMVDR_Recursive,
+    SDW_MWF,
+    MPDR_Recursive
 )
 
 
@@ -299,11 +299,11 @@ if __name__ == "__main__":
 
     # Instantiate all actual algorithm wrappers
     processors_dict = {
-        "DS": DS_Processor(),
-        "MPDR": MPDR_Recursive_Processor(beta=1e-3, min_loading=1e-6),
-        "MVDR": MVDR_Recursive_Processor(min_loading=1e-6),
-        "KMVDR": KMVDR_Recursive_Processor(target_P=2, beta=1e-3, min_loading=1e-6),
-        "SDW_MWF": SDW_MWF_Processor(constrained=True)
+        "DS": DS(),
+        "MPDR": MPDR_Recursive(beta=1e-3, min_loading=1e-6),
+        "MVDR": MVDR_Recursive(min_loading=1e-6),
+        "KMVDR": KMVDR_Recursive(target_P=2, beta=1e-3, min_loading=1e-6),
+        "SDW_MWF": SDW_MWF(constrained=True)
     }
 
     df_final = run_grid_search(

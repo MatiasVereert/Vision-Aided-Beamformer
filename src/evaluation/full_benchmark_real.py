@@ -67,7 +67,7 @@ from beamforming.mask.dtln_masks import get_dtln_masks_sharpen
 from beamforming.mask.souden_mvdr import MVDR_Souden_recursive_mask_BAN_alpha
 
 
-class DTLN_Souden_MVDR_Processor:
+class DTLN_Souden_MVDR:
     """
     Beamformer ciego NUEVO: mascara DTLN (variante con sharpening parametrizable,
     get_dtln_masks_sharpen) + algoritmo de MVDR de Souden (MVDR_Souden_recursive_mask).
@@ -132,9 +132,9 @@ class DTLN_Souden_MVDR_Processor:
         return y_time, weights
 
 
-class DTLN_Souden_BAN_MVDR_Processor(DTLN_Souden_MVDR_Processor):
+class DTLN_Souden_BAN_MVDR(DTLN_Souden_MVDR):
     """
-    Igual que DTLN_Souden_MVDR_Processor pero con el algoritmo de Souden + BAN
+    Igual que DTLN_Souden_MVDR pero con el algoritmo de Souden + BAN
     (Blind Analytic Normalization, MVDR_Souden_recursive_mask_BAN), que aplica un
     post-filtro/normalizacion pensado para atacar el residual de ruido.
     Reusa la MISMA mascara variante (sharpening parametrizable). No edita ningun
@@ -381,7 +381,7 @@ def run_real_benchmark(input_wav, output_dir, base_config,
     print(f"[*] DTLN-Souden-MVDR (sharpen_exp={sharpen_exp}, alpha={alpha})...")
     t0 = time.time()
     with _quiet():
-        y_souden, _w = DTLN_Souden_MVDR_Processor(sharpen_exp=sharpen_exp, alpha=alpha).process(mic_signals, proc_config)
+        y_souden, _w = DTLN_Souden_MVDR(sharpen_exp=sharpen_exp, alpha=alpha).process(mic_signals, proc_config)
     print(f"    ({time.time() - t0:.1f} s)")
     outputs["dtln_souden_mvdr"] = y_souden
 
@@ -389,7 +389,7 @@ def run_real_benchmark(input_wav, output_dir, base_config,
     print(f"[*] DTLN-Souden-BAN-MVDR (sharpen_exp={sharpen_exp}, alpha={alpha})...")
     t0 = time.time()
     with _quiet():
-        y_ban, _w = DTLN_Souden_BAN_MVDR_Processor(sharpen_exp=sharpen_exp, alpha=alpha).process(mic_signals, proc_config)
+        y_ban, _w = DTLN_Souden_BAN_MVDR(sharpen_exp=sharpen_exp, alpha=alpha).process(mic_signals, proc_config)
     print(f"    ({time.time() - t0:.1f} s)")
     outputs["dtln_souden_ban_mvdr"] = y_ban
 
@@ -534,8 +534,8 @@ if __name__ == "__main__":
 
     # Beamformers GEOMETRICOS opcionales. Vacio por defecto (geometria placeholder).
     # Para activarlos cuando midas la geometria, descomenta:
-    # from evaluation.bf_wrappers import DS_Processor, MVDR_Recursive_Processor
-    # geometric_processors = {"DS": DS_Processor(), "MVDR": MVDR_Recursive_Processor()}
+    # from evaluation.bf_wrappers import DS, MVDR_Recursive
+    # geometric_processors = {"DS": DS(), "MVDR": MVDR_Recursive()}
     geometric_processors = {}
 
     run_real_benchmark(

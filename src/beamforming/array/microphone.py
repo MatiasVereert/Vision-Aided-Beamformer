@@ -48,24 +48,43 @@ def a_weighting_magnitude(freqs):
 
 class Microphone():
 
-    def __init__(self, fs=48000):
+    def __init__(self, fs=48000, seed=0):
         """
-        Initializes an ideal microphone by default. 
+        Initializes an ideal microphone by default.
         Errors and models can be set post-instantiation.
+
+        `seed` fija TODA la aleatoriedad del sensor (patron de mismatch y ruido
+        termico) de forma determinista. Ver set_seed() para el detalle del
+        desacople patron/escala que hace reproducible y monotono el barrido de
+        mismatch (Fig. 10).
         """
-        self.fs = fs 
-        
+        self.fs = fs
+
         # Default ideal parameters (No mismatch, infinite SNR)
         # NOTA: snr_dB se interpreta PONDERADO EN A (dBA), como en los datasheets
         # de microfonos MEMS. Ver a_weighting_magnitude() y emulate().
         self.std_gain_dB = 0.0
         self.std_phase_deg = 0.0
         self.snr_dB = 120.0
-        
-        # State variables for mismatch persistence
-        self.fixed_gain_mismatch = None
-        self.fixed_phase_mismatch = None
-        self.last_M = 0
+
+        # --- DETERMINISTIC RANDOMNESS ---
+        # Toda la aleatoriedad se deriva de esta semilla. El patron BASE (vectores
+        # unitarios z ~ N(0, I_M) y el ruido termino de referencia) queda fijado
+        # por (seed, M[, N]); la ESCALA (std / snr) se aplica sobre ese patron sin
+        # re-sortear. Asi, al barrer std_gain/std_phase con la misma escena, todas
+        # las celdas comparten el MISMO patron y solo cambian por el factor de
+        # escala -> heatmap suave/monotono en vez de ruido de sorteo.
+        self._seed = seed
+
+        # Patron unitario de mismatch (depende solo de (seed, M)):
+        self._z_gain = None
+        self._z_phase = None
+        self._pattern_M = None
+        self._pattern_seed = None
+
+        # Patron base de ruido termico (depende solo de (seed, M, N_samples)):
+        self._noise_base = None
+        self._noise_key = None
 
         # --- FIR FILTER DESIGN (Bandpass) ---
         f_min = 100
@@ -103,9 +122,30 @@ class Microphone():
         self.std_phase_deg = std_phase_deg
         self.snr_dB = snr_dB
 
-        # Reset mismatches so they are regenerated on the next emulation
-        self.fixed_gain_mismatch = None
+        # IMPORTANTE: NO se invalida el patron base aqui. La std es SOLO una escala
+        # que se aplica sobre el patron unitario fijo (ver _apply_mismatch). De este
+        # modo, al barrer std_gain/std_phase, todas las celdas re-escalan el MISMO
+        # sorteo z ~ N(0, I_M) en vez de sortear una realizacion nueva por celda
+        # (ese re-sorteo era el bug que ensuciaba la Fig. 10).
         print(f"[Microphone] Custom errors set -> Gain std: {std_gain_dB}dB | Phase std: {std_phase_deg}deg | SNR: {snr_dB}dBA")
+
+    def set_seed(self, seed):
+        """
+        Fija la semilla que determina el patron base de mismatch y de ruido termico.
+
+        El patron base solo se re-sortea cuando cambia la semilla (o el numero de
+        microfonos M / la longitud N de la senal), NUNCA cuando cambia la std o el
+        SNR. El orquestador debe derivar esta semilla UNICAMENTE de la fisica de la
+        escena (rt60, angulos target/interf, iSIR, ids de audio) para que:
+          - la misma escena de siempre el mismo patron (reproducible), y
+          - dentro del barrido de mismatch, las celdas difieran solo por la escala.
+        """
+        if seed != self._seed:
+            self._seed = seed
+            # Invalidar caches: se regeneran con la nueva semilla en la proxima
+            # emulacion (los _ensure_* tambien lo detectan por su clave).
+            self._z_gain = None
+            self._noise_key = None
 
 
     def load_model(self, model_name, json_path='src/beamforming/array/models.json'):
@@ -135,36 +175,49 @@ class Microphone():
         print(f"[Microphone] Loaded hardware profile: '{model_name}'")
 
 
+    def _ensure_mismatch_pattern(self, M):
+        """
+        Garantiza que exista el patron unitario de mismatch z_gain, z_phase ~
+        N(0, I_M), FIJADO por (seed, M). Se re-sortea SOLO si cambia la semilla o M,
+        nunca por cambiar la std. Se usa un RNG dedicado y derivado de la semilla
+        (rama 0) para desacoplarlo del ruido termico (rama 1).
+        """
+        if (self._z_gain is None or self._pattern_M != M
+                or self._pattern_seed != self._seed):
+            rng = np.random.default_rng([self._seed, 0])
+            self._z_gain = rng.standard_normal(M)
+            self._z_phase = rng.standard_normal(M)
+            self._pattern_M = M
+            self._pattern_seed = self._seed
+
     def _apply_mismatch(self, array_input):
         M = array_input.shape[0]
+        self._ensure_mismatch_pattern(M)
 
-        # Generate the hardware profile if it's the first run or if M changed
-        if self.fixed_gain_mismatch is None or self.last_M != M:
-            random_gain_dB = np.random.normal(loc=0, scale=self.std_gain_dB, size=M)
-            self.fixed_gain_mismatch = 10**(random_gain_dB / 20)
-            
-            random_phase = np.random.normal(loc=0, scale=self.std_phase_deg, size=M)
-            random_phase_rad = np.deg2rad(random_phase)
-            self.fixed_phase_mismatch = np.exp(1j * random_phase_rad)
-            
-            self.last_M = M
+        # ESCALA sobre el PATRON fijo: random_gain_dB = std_gain_dB * z_gain.
+        # Con std_gain_dB = 0 -> mismatch nulo (gain = 1), como en Prueba A/C.
+        random_gain_dB = self.std_gain_dB * self._z_gain
+        gain_mismatch = 10 ** (random_gain_dB / 20)
 
         # 1. Apply Gain Mismatch
-        signal_gain = array_input * self.fixed_gain_mismatch[:, np.newaxis]
+        signal_gain = array_input * gain_mismatch[:, np.newaxis]
 
-        # 2. Apply Phase Mismatch 
+        # 2. Apply Phase Mismatch
         if self.std_phase_deg > 0:
+            random_phase_rad = np.deg2rad(self.std_phase_deg * self._z_phase)
+            phase_mismatch = np.exp(1j * random_phase_rad)
+
             signal_f = fft.rfft(signal_gain, axis=1)
-            
+
             # CRITICAL FIX: Ensure the DC bin remains purely real to avoid artifacts
             N_freqs = signal_f.shape[1]
             phasor_matrix = np.ones((M, N_freqs), dtype=np.complex128)
-            phasor_matrix[:, 1:] = self.fixed_phase_mismatch[:, np.newaxis]
-            
+            phasor_matrix[:, 1:] = phase_mismatch[:, np.newaxis]
+
             signal_f = signal_f * phasor_matrix
             signal_out = fft.irfft(signal_f, n=array_input.shape[1], axis=1)
             return signal_out
-            
+
         return signal_gain
 
 
@@ -199,6 +252,21 @@ class Microphone():
         return np.sqrt(np.mean(mean_sq_per_mic))
 
 
+    def _ensure_noise_base(self, M, N_samples):
+        """
+        Garantiza el patron BASE de ruido termico blanco ~ N(0, 1), FIJADO por
+        (seed, M, N_samples). Se comparte entre celdas de la misma escena fisica
+        (misma semilla): asi, en el barrido de mismatch, el ruido es el MISMO y las
+        celdas difieren solo por el error barrido. El nivel (SNR) se aplica despues
+        como escala, no aqui. RNG derivado de la semilla (rama 1) para desacoplarlo
+        del patron de mismatch (rama 0).
+        """
+        key = (self._seed, M, N_samples)
+        if self._noise_key != key:
+            rng = np.random.default_rng([self._seed, 1, N_samples])
+            self._noise_base = rng.standard_normal((M, N_samples))
+            self._noise_key = key
+
     def emulate(self, array_input, show_plots=False):
         M, N_samples = array_input.shape
 
@@ -209,8 +277,10 @@ class Microphone():
 
         if signal_rms_A > 0:
             # Ruido de sensor: blanco, independiente por microfono, limitado a la
-            # banda de audio por el mismo pasabanda del sensor.
-            noise_raw = np.random.normal(loc=0, scale=1, size=(M, N_samples))
+            # banda de audio por el mismo pasabanda del sensor. El patron base es
+            # determinista y compartido por escena (ver _ensure_noise_base).
+            self._ensure_noise_base(M, N_samples)
+            noise_raw = self._noise_base
             noise_filtered = signal.lfilter(self.taps, self.a, noise_raw, axis=1)
 
             # Nivel de ruido objetivo definido en el dominio PONDERADO EN A:

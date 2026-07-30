@@ -31,6 +31,11 @@ dependencies = [
     "noisereduce"
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that invoke the MISOCP solver (seconds to minutes)",
+]
+
 [tool.setuptools.packages]
 # This section is CRUCIAL. It indicates where the modules are located.
 # In your case, 'src' contains the 'beamforming' and 'propagation' packages.

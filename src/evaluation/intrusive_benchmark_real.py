@@ -47,9 +47,9 @@ from evaluation.metrics import evaluate_full_pipeline
 from dereverberation.nara_wrappers import process_wpe_online, process_wpe_online_with_components
 from dereverberation.nara_wrappers_fixed import process_wpe_online_fixed, FixedPointConfig
 from evaluation.bf_wrappers import (
-    DTLN_Souden_Specsub_Processor,
-    ORACLE_MB_MVDR_SOUDEN_Processor,
-    SOUDEN_ORACLE_SCM_Processor,
+    NM_MVDR_PF,
+    ORACLE_MB_MVDR_SOUDEN,
+    SOUDEN_ORACLE_SCM,
 )
 
 
@@ -290,9 +290,9 @@ def run_intrusive_benchmark(senal_path, ruido_path, output_dir="intrusive_out",
     # Procesadores extra (mask-based / oracle) de bf_wrappers.
     if extra_processors is None:
         extra_processors = {
-            "dtln_souden_specsub": DTLN_Souden_Specsub_Processor(smooth=0.33, alpha=souden_alpha),
-            "oracle_souden_mask": ORACLE_MB_MVDR_SOUDEN_Processor(sharpen_exp=1.0, alpha=souden_alpha),
-            "oracle_souden_scm": SOUDEN_ORACLE_SCM_Processor(alpha=souden_alpha),
+            "dtln_souden_specsub": NM_MVDR_PF(smooth=0.33, alpha=souden_alpha),
+            "oracle_souden_mask": ORACLE_MB_MVDR_SOUDEN(sharpen_exp=1.0, alpha=souden_alpha),
+            "oracle_souden_scm": SOUDEN_ORACLE_SCM(alpha=souden_alpha),
         }
 
     # 4. correr TODOS los beamformers sobre el mixture (reusa el orquestador)

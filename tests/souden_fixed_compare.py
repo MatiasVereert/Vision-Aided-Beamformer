@@ -30,8 +30,7 @@ import pandas as pd
 from propagation.mird_loader import MirdDatasetProvider
 from evaluation.full_benchmark_test_dtln_mird import run_mird_grid_search
 from evaluation.bf_wrappers import (
-    DTLN_MB_MVDR_SOUDEN_Processor,
-    DTLN_MB_MVDR_SOUDEN_FIXED_Processor,
+    NM_MVDR,
 )
 
 ROOT_MIRD_DIR = "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/rirs/mird"
@@ -80,8 +79,8 @@ def main():
     }
 
     processors_dict = {
-        "DTLN_Souden_base": DTLN_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=ALPHA, sharpen_exp=SHARPEN_EXP),
-        "DTLN_Souden_fixed": DTLN_MB_MVDR_SOUDEN_FIXED_Processor(min_loading=1e-2, alpha=ALPHA, sharpen_exp=SHARPEN_EXP),
+        "DTLN_Souden_base": NM_MVDR(min_loading=1e-6, alpha=ALPHA, sharpen_exp=SHARPEN_EXP),
+        "DTLN_Souden_fixed": NM_MVDR(min_loading=1e-2, alpha=ALPHA, sharpen_exp=SHARPEN_EXP),
     }
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)

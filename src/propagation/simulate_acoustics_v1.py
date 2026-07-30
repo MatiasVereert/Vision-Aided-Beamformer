@@ -87,6 +87,49 @@ def get_hybrid_sim_params(room_dims, mic_spacing, t_mix=0.08):
         }
     }
 
+
+# --- Calibrated closed-loop RT60 control (validated vs MIRD, see
+# rt60_calibration.py / validate_ism_vs_mird.py) ---
+PROD_MAX_ORDER = 50          # pure-ISM order; RT60 saturates well below this
+PROD_AIR_ABSORPTION = True
+PROD_USE_RAND_ISM = True     # breaks shoebox sweeping-echoes -> realistic diffuse
+PROD_MAX_RAND_DISP = 0.08
+
+# Absorption grid for the single-channel alpha<->RT60 sweep. Spans RT ~0.08-1.0 s
+# in a MIRD-sized room; extend if you need longer RT.
+_ALPHA_SWEEP_GRID = np.array([0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.75, 0.90])
+
+# Per-room memoisation: building a map is a handful of single-channel RIRs, but
+# rooms repeat across a benchmark grid, so we cache by (dims, fs, order).
+_ALPHA_MAP_CACHE = {}
+
+
+def get_alpha_for_rt60(room_dimensions, fs, desire_RT, max_order=PROD_MAX_ORDER):
+    """
+    Closed-loop absorption for a target RT60: returns the broadband alpha whose
+    *realised* Schroeder RT60 matches desire_RT in this room, replacing the
+    biased open-loop pra.inverse_sabine. The alpha<->RT60 map is built once per
+    (room, fs, order) via a cheap single-channel sweep and cached. The sweep
+    uses the SAME acoustic model as production (air_absorption on, pure ISM at
+    `max_order`), so the mapping stays self-consistent.
+    """
+    from propagation.rt60_calibration import sweep_alpha, build_alpha_to_rt60
+
+    key = (tuple(np.round(np.asarray(room_dimensions, float), 4)), int(fs), int(max_order))
+    if key not in _ALPHA_MAP_CACHE:
+        sweep = sweep_alpha(np.asarray(room_dimensions, float), fs,
+                            _ALPHA_SWEEP_GRID, max_order)
+        _, alpha_of_rt60 = build_alpha_to_rt60(sweep)
+        _ALPHA_MAP_CACHE[key] = alpha_of_rt60
+        print(f"[SimAcoustic] Built calibrated alpha<->RT60 map for room "
+              f"{np.round(np.asarray(room_dimensions, float), 2)} "
+              f"(fs={fs}, order={max_order}).")
+
+    alpha = float(_ALPHA_MAP_CACHE[key](desire_RT))
+    # Guard: keep alpha a physically valid absorption coefficient.
+    return float(np.clip(alpha, 1e-3, 1.0))
+
+
 class SimAcoustic():
 
     def __init__(self,
@@ -166,54 +209,41 @@ class SimAcoustic():
         """
         # Determine absorption and maximum order based on the desired reverberation time
         if desire_RT <= 0.0:
-            # Anechoic setup (Free Field)
-            alpha = 1.0
-            max_order = 0
-            material = pra.Material(alpha)
-            
-            # Disable ray tracing for pure anechoic conditions to save processing time
+            # Anechoic setup (Free Field): direct path only.
             room = pra.ShoeBox(
-                room_dimensions, 
-                self.fs, 
-                materials=material, 
-                max_order=max_order,
-                ray_tracing=False
+                room_dimensions,
+                self.fs,
+                materials=pra.Material(1.0),
+                max_order=0,
+                air_absorption=PROD_AIR_ABSORPTION,
             )
             print("[SimAcoustic] Mode: Anechoic Chamber (Free Field)")
-            
+
         else:
-            # Reverberant setup using Sabine's formula
-            alpha, max_order = pra.inverse_sabine(desire_RT, room_dimensions)
-            
+            # Reverberant setup: CLOSED-LOOP absorption so the *realised* RT60
+            # matches desire_RT (replaces the biased pra.inverse_sabine). Pure
+            # ISM at PROD_MAX_ORDER was validated against MIRD as sufficient;
+            # ray tracing is not needed.
+            alpha = get_alpha_for_rt60(room_dimensions, self.fs, desire_RT,
+                                       max_order=PROD_MAX_ORDER)
+            max_order = PROD_MAX_ORDER
+
             if ray_tracing:
-                # Obtain minimum distance between sensors to optimize ray tracing radius
-                distances = pdist(self.real_array)
-                min_spacing = np.min(distances[distances > 0])
+                print("[SimAcoustic] Note: ray_tracing=True is ignored -- the "
+                      f"calibrated pure-ISM model (order {PROD_MAX_ORDER}) was "
+                      "validated as sufficient vs MIRD.")
 
-                # Get optimal settings for hybrid simulation
-                params_dic = get_hybrid_sim_params(room_dimensions, min_spacing, t_mix=0.08)
-                max_order = params_dic["max_order"]
-
-                material = pra.Material(alpha, scattering=0.2)        
-                room = pra.ShoeBox(
-                    room_dimensions, 
-                    self.fs, 
-                    materials=material,
-                    max_order=max_order,
-                    ray_tracing=True,
-                )
-                room.set_ray_tracing(**params_dic["ray_tracing"])
-                print(f"[SimAcoustic] Mode: Hybrid ISM+RT (RT60 = {desire_RT}s)")
-            else:
-                # Pure ISM simulation
-                material = pra.Material(alpha)        
-                room = pra.ShoeBox(
-                    room_dimensions, 
-                    self.fs, 
-                    materials=material, 
-                    max_order=max_order
-                )
-                print(f"[SimAcoustic] Mode: Pure ISM (RT60 = {desire_RT}s)")
+            room = pra.ShoeBox(
+                room_dimensions,
+                self.fs,
+                materials=pra.Material(alpha),
+                max_order=max_order,
+                air_absorption=PROD_AIR_ABSORPTION,
+                use_rand_ism=PROD_USE_RAND_ISM,
+                max_rand_disp=PROD_MAX_RAND_DISP,
+            )
+            print(f"[SimAcoustic] Mode: Calibrated Pure ISM "
+                  f"(RT60 target={desire_RT}s -> alpha={alpha:.3f}, order={max_order})")
 
         # Add target source to the room
         source_pos = self.audio_sources[0]["position"] 
@@ -246,7 +276,7 @@ class SimAcoustic():
             self.fs,
             materials=pra.Material(1.0),
             max_order=0,
-            ray_tracing=False,
+            air_absorption=PROD_AIR_ABSORPTION,
         )
         anech_room.add_source(source_pos.T)
         anech_room.add_microphone_array(self.real_array.T)

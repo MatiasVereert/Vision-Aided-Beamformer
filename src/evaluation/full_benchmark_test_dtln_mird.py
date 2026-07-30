@@ -1,6 +1,7 @@
 import os
 import time
 import itertools
+import hashlib
 import h5py
 import pandas as pd
 import numpy as np
@@ -18,20 +19,50 @@ from dereverberation.nara_wrappers_fixed import process_wpe_online_fixed, FixedP
 from evaluation.metrics import evaluate_full_pipeline
 
 from evaluation.bf_wrappers import (
-    DS_Processor,
-    MVDR_Recursive_Processor,
-    KMVDR_Recursive_Processor,
-    SDW_MWF_Processor,
-    MPDR_Recursive_Processor,
-    DTLN_MB_MVDR_SOUDEN_Processor,
-    DTLN_MB_MVDR_SOUDEN_BAN_Processor,
-    DTLN_MB_MVDR_SOUDEN_SLOW_Processor,
-    DTLN_Souden_Specsub_Processor,
-    ORACLE_MB_MVDR_SOUDEN_Processor
+    DS,
+    MVDR_Recursive,
+    KMVDR_Recursive,
+    SDW_MWF,
+    MPDR_Recursive,
+    NM_MVDR,
+    DTLN_MB_MVDR_SOUDEN_BAN,
+    DTLN_MB_MVDR_SOUDEN_SLOW,
+    NM_MVDR_PF,
+    ORACLE_MB_MVDR_SOUDEN,
+    SOUDEN_ORACLE_SCM
+
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../"))
+
+
+def compute_scene_seed(exp, scene_base_config):
+    """
+    Deriva una semilla DETERMINISTA y ESTABLE para la emulacion de hardware a
+    partir UNICAMENTE de la fisica de la escena: rt60, geometria target/interf,
+    iSIR e identidad de los audios. Deliberadamente NO incluye mismatch_gain ni
+    mismatch_phase, de modo que todas las celdas del barrido de mismatch de una
+    misma escena comparten la misma semilla -> el patron base de mismatch y el
+    ruido termico son identicos y las celdas difieren solo por la escala del error
+    (heatmap suave/monotono en la Fig. 10).
+
+    Se usa hashlib (no hash() de Python, que no es estable entre procesos por
+    PYTHONHASHSEED) para que la misma escena de siempre la misma semilla entre
+    corridas -> reproducibilidad.
+    """
+    physics_key = "|".join(str(x) for x in [
+        exp['rt60'],
+        exp['target_dist'],
+        exp['target_angle'],
+        exp['interf_configs'],
+        exp['isir_db'],
+        exp.get('source_path', scene_base_config.get('source_path', '')),
+        scene_base_config.get('interf_paths', ''),
+    ])
+    digest = hashlib.sha256(physics_key.encode('utf-8')).digest()
+    # 64 bits bastan y son comodos para SeedSequence de numpy.
+    return int.from_bytes(digest[:8], 'big')
 
 def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, processor_obj,
                                 mic_signals, y_processed, target_reference, weights,
@@ -138,22 +169,43 @@ def evaluate_all_references(refs_dict, deg_sig, fs, interf_early, interf_late, t
 def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None):
     os.makedirs(output_dir, exist_ok=True)
 
+    # --- BACKWARD-COMPAT: promote wpe_taps/wpe_delay to grid axes ---
+    # Callers that do not sweep these (e.g. notebooks A/B/C) still pass them as
+    # scalars in scene_base_config. Inject them as single-value lists so the
+    # itertools.product below keeps working and every experiment dict carries
+    # 'wpe_taps'/'wpe_delay' regardless of the caller.
+    grid_params = dict(grid_params)  # do not mutate the caller's dict
+    if 'wpe_taps' not in grid_params:
+        grid_params['wpe_taps'] = [scene_base_config['wpe_taps']]
+    if 'wpe_delay' not in grid_params:
+        grid_params['wpe_delay'] = [scene_base_config['wpe_delay']]
+    # source_path is now a grid axis too (target-speaker variety). Callers that do
+    # not sweep it (E0, notebooks A/B/C) keep passing the scalar in scene_base_config;
+    # promote it to a single-value list so every experiment dict carries it.
+    if 'source_path' not in grid_params:
+        grid_params['source_path'] = [scene_base_config['source_path']]
+
     # 1. Generate combinations
     keys, values = zip(*grid_params.items())
     experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
     # 2. STRATEGIC SORTING (Crucial for cascaded caching adapted to MIRD)
     experiments.sort(key=lambda x: (
-        x['rt60'], x['target_dist'], x['target_angle'], str(x['interf_configs']), # Node 1: Physical Environment
+        x['rt60'], x['target_dist'], x['target_angle'], str(x['interf_configs']), x['source_path'], # Node 1: Physical Environment
         x['isir_db'],                                                             # Node 2: Mixture
         x['mismatch_gain'], x['mismatch_phase'],                                  # Node 3: Hardware
-        x['use_wpe'],                                                             # Node 4: Pre-processing
+        x['use_wpe'], x['wpe_taps'], x['wpe_delay'],                              # Node 4: Pre-processing (WPE; wpe_delay no longer feeds t_early)
         x.get('error_angle_deg', 0.0), x.get('error_distance_m', 0.0)             # Node 5: Misinformation
     ))
 
-    # --- DERIVE DYNAMIC t_early FROM WPE CONFIG ---
-    t_early_dynamic = (scene_base_config['wpe_stft_shift'] * scene_base_config['wpe_delay']) / scene_base_config['fs']
-    tqdm.write(f"[*] Derived Dynamic t_early: {t_early_dynamic*1000:.1f} ms based on WPE parameters.")
+    # --- FIXED t_early (constant across the whole grid) ---
+    # t_early defines the "early" reference window of the metrics. It is a FIXED
+    # acoustic quantity read from scene_base_config['t_early'] and is deliberately
+    # DECOUPLED from wpe_delay: when sweeping wpe_delay (e.g. E0) every delay must
+    # be scored against the SAME early/late reference, otherwise the Delta metrics
+    # are biased by a moving target and delays are not comparable (correction A1).
+    t_early_dynamic = scene_base_config['t_early']
+    tqdm.write(f"[*] t_early FIXED at {t_early_dynamic*1000:.1f} ms (decoupled from wpe_delay).")
     tqdm.write(f"[*] Total experiments to run: {len(experiments)} per processor.")
 
     # Base tracked metrics.
@@ -173,6 +225,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     # --- CASCADING STATE VARIABLES ---
     current_rt60, current_target_dist, current_target_angle, current_interf_configs = None, None, None, None
     current_isir_db, current_gain_mismatch, current_phase_mismatch, current_use_wpe = None, None, None, None
+    current_wpe_taps, current_wpe_delay = None, None
+    current_source_path = None
 
     acoustic_scene, scene_data, mic_signals_degraded, mic_signals_ready = None, None, None, None
     refs_dict = {}
@@ -196,14 +250,24 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     for i, exp in enumerate(tqdm(experiments, desc="Running MIRD Benchmark", unit="exp")):
         tqdm.write(f"\n--- Iteration {i+1}/{len(experiments)} | Config: {exp} ---")
 
+        # t_early is FIXED (read once above); it drives the early/late split in
+        # convolve_signals (Node 1) and the metric reference window. It does NOT
+        # depend on wpe_delay, so sweeping the delay keeps the SAME reference.
+        t_early_dynamic = scene_base_config['t_early']
+
+        # wpe_delay no longer feeds t_early, so a delay-only change does NOT touch
+        # the physics/mixture; it is handled downstream by recalc_wpe (Node 4).
         recalc_physics = (exp['rt60'] != current_rt60 or
                           exp['target_dist'] != current_target_dist or
                           exp['target_angle'] != current_target_angle or
-                          str(exp['interf_configs']) != str(current_interf_configs))
+                          str(exp['interf_configs']) != str(current_interf_configs) or
+                          exp['source_path'] != current_source_path)
         recalc_mixture = recalc_physics or (exp['isir_db'] != current_isir_db)
         recalc_hardware = recalc_mixture or (exp['mismatch_gain'] != current_gain_mismatch or
                                              exp['mismatch_phase'] != current_phase_mismatch)
-        recalc_wpe = recalc_hardware or (exp['use_wpe'] != current_use_wpe)
+        recalc_wpe = recalc_hardware or (exp['use_wpe'] != current_use_wpe or
+                                         exp['wpe_taps'] != current_wpe_taps or
+                                         exp['wpe_delay'] != current_wpe_delay)
 
         # ---------------------------------------------------------
         # NODE 1: GEOMETRY AND PHYSICS (MIRD DATASET IMPORT)
@@ -224,13 +288,18 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 fs=scene_base_config['fs']
             )
 
+            # Target speaker for this experiment (now a grid axis). Persist it into
+            # scene_base_config so compute_scene_seed() derives a distinct, stable
+            # seed per speaker.
+            scene_base_config['source_path'] = exp['source_path']
+
             # Map Target Position
             _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], exp['target_dist'], exp['target_angle'])
             rel_pos_target = dataset_provider.export_position('cartesian')
             abs_pos_target = array_center + rel_pos_target.squeeze()
             scene_base_config['source_pos'] = abs_pos_target.reshape(1,3)
 
-            acoustic_scene.set_source(scene_base_config['source_path'], gain=1.0, position=abs_pos_target.reshape(1,3))
+            acoustic_scene.set_source(exp['source_path'], gain=1.0, position=abs_pos_target.reshape(1,3))
 
             # Map Interference Positions
             interferences_pos = []
@@ -274,6 +343,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             current_target_dist = exp['target_dist']
             current_target_angle = exp['target_angle']
             current_interf_configs = exp['interf_configs']
+            current_source_path = exp['source_path']
 
         # ---------------------------------------------------------
         # NODE 2: ACOUSTIC MIXTURE & GROUND TRUTHS PREPARATION
@@ -305,6 +375,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         # ---------------------------------------------------------
         if recalc_hardware:
             tqdm.write(f" -> [NODE 3] Emulating hardware (Gain: {exp['mismatch_gain']}dB, Phase: {exp['mismatch_phase']}deg)...")
+            # Semilla derivada SOLO de la fisica de la escena (no del mismatch): fija
+            # el patron base de mismatch/ruido para que el barrido de gain/phase varie
+            # solo la escala del error. Al no depender del mismatch, set_seed es no-op
+            # cuando solo cambian gain/phase -> se preservan los patrones cacheados.
+            mic_simulator.set_seed(compute_scene_seed(exp, scene_base_config))
             mic_simulator.set_custom_errors(
                 std_gain_dB=exp['mismatch_gain'], std_phase_deg=exp['mismatch_phase'], snr_dB=scene_base_config['snr_db']
             )
@@ -329,7 +404,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 if fixed_bits is None:
                     tqdm.write(" -> [NODE 4] Applying WPE pre-processing (float)...")
                     mic_signals_ready = process_wpe_online(
-                        u=mic_signals_degraded, taps=scene_base_config['wpe_taps'], delay=scene_base_config['wpe_delay'],
+                        u=mic_signals_degraded, taps=exp['wpe_taps'], delay=exp['wpe_delay'],
                         alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'], stft_shift=scene_base_config['wpe_stft_shift']
                     )
                 else:
@@ -338,7 +413,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                         fixed_bits, rounding=scene_base_config.get('wpe_fixed_round', 'nearest')
                     )
                     mic_signals_ready, fp_stats = process_wpe_online_fixed(
-                        u=mic_signals_degraded, taps=scene_base_config['wpe_taps'], delay=scene_base_config['wpe_delay'],
+                        u=mic_signals_degraded, taps=exp['wpe_taps'], delay=exp['wpe_delay'],
                         alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'],
                         stft_shift=scene_base_config['wpe_stft_shift'], fp_cfg=fp_cfg, return_stats=True
                     )
@@ -359,6 +434,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 wpe_metrics = baseline_metrics.copy()
 
             current_use_wpe = exp['use_wpe']
+            current_wpe_taps = exp['wpe_taps']
+            current_wpe_delay = exp['wpe_delay']  # tracked here now that t_early is fixed
 
             # ---------------------------------------------------------
             # NODE 4.5: SINGLE-MIC DTLN
@@ -450,13 +527,16 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 "mismatch_gain": exp['mismatch_gain'],
                 "mismatch_phase": exp['mismatch_phase'],
                 "use_wpe": exp['use_wpe'],
+                "wpe_taps": exp['wpe_taps'],
+                "wpe_delay": exp['wpe_delay'],
                 "wpe_bits": scene_base_config.get('wpe_fixed_bits', None),
                 "error_angle_deg": err_ang,
                 "error_distance_m": err_dist,
                 "t_early_s": t_early_dynamic,
                 "exec_time_s": proc_time,
                 "target_dist": exp['target_dist'],
-                "target_angle": exp['target_angle']
+                "target_angle": exp['target_angle'],
+                "source": os.path.basename(exp['source_path'])
             }
 
             # Append absolute metrics for all references
@@ -607,21 +687,28 @@ if __name__ == "__main__":
         'mismatch_gain': [0],
         'mismatch_phase': [0],
         'use_wpe': [True],
+
+        # WPE hyper-parameter sweep (NEW grid axes).
+        # If omitted, run_mird_grid_search falls back to the scalar values in
+        # base_config (wpe_taps / wpe_delay), preserving old A/B/C behaviour.
+        'wpe_taps': [3, 7, 10],
+        'wpe_delay': [1, 2, 3],
+
         'error_angle_deg': [0.0],
         'error_distance_m': [0.0]
     }
 
     processors_dict = {
-        "NM-MVDR_alpha_1_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
-        "NM-MVDR_alpha_0.99_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99),
+        "NM-MVDR_alpha_1_ref" : NM_MVDR(min_loading =1e-6, alpha = 1),
+        "NM-MVDR_alpha_0.99_ref" : NM_MVDR(min_loading =1e-6, alpha = 0.99),
         # Cota superior agnostica al modelo: misma cadena Souden pero con mascara ideal.
         # SOFT (sharpen_exp=1.0, IRM continua) y HARD-EDGE (sharpen_exp=4.0, == **4 del DTLN).
-        "Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
-        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
-        "Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
-        "Oracle-MVDR_hard_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=4.0),
-        "Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW_Processor(),
-        "Specsub" : DTLN_Souden_Specsub_Processor(smooth=1.0, min_loading=1e-6),
+        "Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
+        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
+        "Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
+        "Oracle-MVDR_hard_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=4.0),
+        "Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW(),
+        "NM-MVDR_PF" : NM_MVDR_PF(smooth=0.33, min_loading=1e-6),
     }
 
 
@@ -639,6 +726,7 @@ if __name__ == "__main__":
 
     cols_to_show = [
         "processor", "rt60", "target_angle", "interf_configs", "use_wpe",
+        "wpe_taps", "wpe_delay",
         "error_angle_deg", "Delta_tot_PESQ_early", "Delta_tot_SIR_early"
     ]
 

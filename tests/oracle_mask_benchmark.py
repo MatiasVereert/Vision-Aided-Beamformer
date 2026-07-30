@@ -35,10 +35,10 @@ import tensorflow as tf
 from propagation.mird_loader import MirdDatasetProvider
 from evaluation.full_benchmark_test_dtln_mird import run_mird_grid_search
 from evaluation.bf_wrappers import (
-    DTLN_MB_MVDR_SOUDEN_Processor,
-    DTLN_MB_MVDR_SOUDEN_SLOW_Processor,
-    DTLN_Souden_Specsub_Processor,
-    ORACLE_MB_MVDR_SOUDEN_Processor,
+    NM_MVDR,
+    DTLN_MB_MVDR_SOUDEN_SLOW,
+    NM_MVDR_PF,
+    ORACLE_MB_MVDR_SOUDEN,
 )
 
 # Modelos DTLN (rutas absolutas, no dependen del CWD)
@@ -122,17 +122,17 @@ def main():
     # processors: mismos que el benchmark (Oracle vs DTLN apareados por alpha)
     # =====================================================================
     processors_dict = {
-        "NM-MVDR_alpha_1_ref": DTLN_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=1),
-        "NM-MVDR_alpha_0.99_ref": DTLN_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=0.99),
+        "NM-MVDR_alpha_1_ref": NM_MVDR(min_loading=1e-6, alpha=1),
+        "NM-MVDR_alpha_0.99_ref": NM_MVDR(min_loading=1e-6, alpha=0.99),
         # Cota superior agnostica al modelo: misma cadena Souden pero con mascara ideal.
         # SOFT: mascara ideal suave (sharpen_exp=1.0, IRM continua).
-        "Oracle-MVDR_alpha_1": ORACLE_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=1, sharpen_exp=1.0),
-        "Oracle-MVDR_alpha_0.99": ORACLE_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=0.99, sharpen_exp=1.0),
+        "Oracle-MVDR_alpha_1": ORACLE_MB_MVDR_SOUDEN(min_loading=1e-6, alpha=1, sharpen_exp=1.0),
+        "Oracle-MVDR_alpha_0.99": ORACLE_MB_MVDR_SOUDEN(min_loading=1e-6, alpha=0.99, sharpen_exp=1.0),
         # HARD-EDGE: mascara ideal agudizada (sharpen_exp=4.0, iguala el **4 fijo del DTLN).
-        "Oracle-MVDR_hard_alpha_1": ORACLE_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=1, sharpen_exp=4.0),
-        "Oracle-MVDR_hard_alpha_0.99": ORACLE_MB_MVDR_SOUDEN_Processor(min_loading=1e-6, alpha=0.99, sharpen_exp=4.0),
-        "Slow": DTLN_MB_MVDR_SOUDEN_SLOW_Processor(),
-        "Specsub": DTLN_Souden_Specsub_Processor(smooth=1.0, min_loading=1e-6),
+        "Oracle-MVDR_hard_alpha_1": ORACLE_MB_MVDR_SOUDEN(min_loading=1e-6, alpha=1, sharpen_exp=4.0),
+        "Oracle-MVDR_hard_alpha_0.99": ORACLE_MB_MVDR_SOUDEN(min_loading=1e-6, alpha=0.99, sharpen_exp=4.0),
+        "Slow": DTLN_MB_MVDR_SOUDEN_SLOW(),
+        "Specsub": NM_MVDR_PF(smooth=1.0, min_loading=1e-6),
     }
 
     # Aseguramos la ruta nueva y corremos con CWD ahi, de modo que TODOS los

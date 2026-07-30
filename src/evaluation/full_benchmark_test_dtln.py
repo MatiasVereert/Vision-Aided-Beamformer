@@ -17,16 +17,17 @@ from dereverberation.nara_wrappers import process_wpe_online
 from evaluation.metrics import evaluate_full_pipeline
 
 from evaluation.bf_wrappers import (
-    DS_Processor,
-    MVDR_Recursive_Processor,
-    KMVDR_Recursive_Processor,
-    SDW_MWF_Processor,
-    MPDR_Recursive_Processor,
-    DTLN_MB_MVDR_SOUDEN_Processor,
-    DTLN_MB_MVDR_SOUDEN_BAN_Processor,
-    DTLN_MB_MVDR_SOUDEN_SLOW_Processor,
-    DTLN_Souden_Specsub_Processor,
-    ORACLE_MB_MVDR_SOUDEN_Processor
+    DS,
+    MVDR_Recursive,
+    KMVDR_Recursive,
+    SDW_MWF,
+    MPDR_Recursive,
+    NM_MVDR,
+    DTLN_MB_MVDR_SOUDEN_BAN,
+    DTLN_MB_MVDR_SOUDEN_SLOW,
+    NM_MVDR_PF,
+    ORACLE_MB_MVDR_SOUDEN,
+    SOUDEN_ORACLE_SCM
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -547,16 +548,16 @@ if __name__ == "__main__":
     }
 
     processors_dict = {
-        "NM-MVDR_alpha_1_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1),
-        "NM-MVDR_alpha_0.99_ref" : DTLN_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99),
+        "NM-MVDR_alpha_1_ref" : NM_MVDR(min_loading =1e-6, alpha = 1),
+        "NM-MVDR_alpha_0.99_ref" : NM_MVDR(min_loading =1e-6, alpha = 0.99),
         # Cota superior agnostica al modelo: misma cadena Souden pero con mascara ideal.
         # SOFT (sharpen_exp=1.0, IRM continua) y HARD-EDGE (sharpen_exp=4.0, == **4 del DTLN).
-        "Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
-        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
-        "Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
-        "Oracle-MVDR_hard_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN_Processor(min_loading =1e-6, alpha = 0.99, sharpen_exp=4.0),
-        "Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW_Processor(),
-        "Specsub" : DTLN_Souden_Specsub_Processor(smooth=1.0, min_loading=1e-6),
+        "Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
+        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
+        "Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
+        "Oracle-MVDR_hard_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=4.0),
+        "Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW(),
+        "NM-MVDR_PF" : NM_MVDR_PF(smooth=0.33, min_loading=1e-6),
     }
 
     df_final = run_grid_search(

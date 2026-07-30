@@ -21,7 +21,7 @@ from beamforming.MWF.onlineMWF import online_mwf_numba
 
 import numpy as np
 from beamforming.MVDR.base import MVDR_recursive
-class MVDR_Processor:
+class MVDR:
     """
     Object-oriented wrapper for the recursive MVDR beamformer.
     It retrieves the oracle VAD mask from the scene configuration.
@@ -42,7 +42,7 @@ class MVDR_Processor:
         
         # Saftey check to ensure VAD was successfully passed
         if vad is None:
-            raise ValueError("MVDR_Processor requires a valid VAD array in scene_config['vad'].")
+            raise ValueError("MVDR requires a valid VAD array in scene_config['vad'].")
 
         # 2. Transform Time to Frequency domain (STFT)
         freqs, times, X_stft = sig.stft(
@@ -78,7 +78,7 @@ class MVDR_Processor:
         return y_time, weights
 
     
-class MPDR_WPE_Processor:
+class MPDR_WPE:
     """
     Object-oriented wrapper to interface the time-domain benchmark 
     with the frequency-domain Numba MPDR-WPE implementation.
@@ -415,8 +415,8 @@ if __name__ == "__main__":
 
     processors_dict = {
         
-        #"Delay_and_Sum": DS_Processor(nperseg=1024, noverlap=768),
-        "MPDR_WPE_Test": MPDR_WPE_Processor(
+        #"Delay_and_Sum": DS(nperseg=1024, noverlap=768),
+        "MPDR_WPE_Test": MPDR_WPE(
             L=20, 
             Delta=4, 
             alpha=0.994, 
@@ -425,7 +425,7 @@ if __name__ == "__main__":
             diag_load=1e-14)
         ,
 
-        "MVDR_Oracle_VAD": MVDR_Processor(
+        "MVDR_Oracle_VAD": MVDR(
             nperseg=1024, 
             noverlap=768, 
             min_loading=1e-6
@@ -434,7 +434,7 @@ if __name__ == "__main__":
         
 
 
-        #"MWF_Test": MWF_Processor(alpha=0.95, diag_load=1e-3, nperseg=1024, noverlap=768)
+        #"MWF_Test": MWF(alpha=0.95, diag_load=1e-3, nperseg=1024, noverlap=768)
     
 
 

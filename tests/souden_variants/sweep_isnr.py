@@ -25,7 +25,7 @@ import scipy.signal as sig
 import tensorflow as tf
 from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
 from evaluation.full_benchmark_real import (
-    DTLN_Souden_MVDR_Processor, DTLN_Souden_BAN_MVDR_Processor,
+    DTLN_Souden_MVDR, DTLN_Souden_BAN_MVDR,
     build_placeholder_geometry, energy_vad, DTLN_MODEL_1, DTLN_MODEL_2,
 )
 from beamforming.mask.dtln_masks import get_dtln_masks_sharpen
@@ -53,7 +53,7 @@ def run_all(mix_cf, cfg, i1, i2):
     out = {"ref_mic_raw": ref}
     with quiet():
         out["dtln_mono"] = apply_dtln_post_tflite_realtime(i1, i2, ref)
-        y_s, _ = DTLN_Souden_MVDR_Processor(sharpen_exp=4.0, alpha=0.99).process(mix_cf, cfg)
+        y_s, _ = DTLN_Souden_MVDR(sharpen_exp=4.0, alpha=0.99).process(mix_cf, cfg)
         out["dtln_souden_mvdr"] = y_s
         # variante FIXED (loading relativo + Hermitiana + solve) sobre la misma mascara/STFT
         ms, mn = get_dtln_masks_sharpen(mix_cf, cfg["ref_mic_idx"], cfg["dtln_model_path"],
@@ -84,7 +84,7 @@ def run_all(mix_cf, cfg, i1, i2):
                                                   alpha=0.99, smooth=0.5)
         _, y_ss5 = sig.istft(Yss5, fs=cfg["fs"], window="hamming", nperseg=512, noverlap=384, nfft=512)
         out["dtln_souden_specsub_s05"] = y_ss5[:mix_cf.shape[1]]
-        y_ban, _ = DTLN_Souden_BAN_MVDR_Processor(sharpen_exp=4.0, alpha=0.99).process(mix_cf, cfg)
+        y_ban, _ = DTLN_Souden_BAN_MVDR(sharpen_exp=4.0, alpha=0.99).process(mix_cf, cfg)
         out["dtln_souden_ban_mvdr"] = y_ban
         out["dtln_souden_ban_then_dtln"] = apply_dtln_post_tflite_realtime(i1, i2, y_ban)
         out["dtln_mvdr_then_dtln"] = apply_dtln_post_tflite_realtime(i1, i2, y_mvdr)
