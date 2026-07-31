@@ -166,7 +166,7 @@ def evaluate_all_references(refs_dict, deg_sig, fs, interf_early, interf_late, t
     return combined_metrics
 
 
-def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None):
+def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None, save_catalog=True):
     os.makedirs(output_dir, exist_ok=True)
 
     # --- BACKWARD-COMPAT: promote wpe_taps/wpe_delay to grid axes ---
@@ -626,7 +626,10 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             all_metrics_results.append(row_data)
 
             # --- TOP-K / BOTTOM-K CHECKPOINTING (Strictly anchored to 'early') ---
-            for m_name in tracked_metrics:
+            # Skipped when save_catalog=False (bulk metric runs): the per-case polar
+            # spatial-response computation (precompute_quantized_spatial_response) is
+            # expensive and only feeds the dashboard, not the metrics parquet/csv.
+            for m_name in (tracked_metrics if save_catalog else []):
                 eval_key = f"{m_name}_early"
                 current_val = delta_tot_metrics.get(eval_key, np.nan)
 
