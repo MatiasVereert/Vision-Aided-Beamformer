@@ -166,7 +166,7 @@ def evaluate_all_references(refs_dict, deg_sig, fs, interf_early, interf_late, t
     return combined_metrics
 
 
-def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None, save_catalog=True):
+def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None, save_catalog=True, apply_dtln_post=True):
     os.makedirs(output_dir, exist_ok=True)
 
     # --- BACKWARD-COMPAT: promote wpe_taps/wpe_delay to grid axes ---
@@ -555,7 +555,10 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             # ---------------------------------------------------------
             y_post_dtln = None
             dtln_post_metrics = {}
-            if use_dtln:
+            # DTLN-completo como post-filtro (2do nucleo). Descartado del sistema
+            # (demasiadas cascadas). apply_dtln_post=False lo saltea SIN afectar el
+            # baseline DTLN-mono (Node 4.5), que sigue vivo para la comparacion de P4.
+            if use_dtln and apply_dtln_post:
                 tqdm.write(f"   -> [NODE 6] Applying DTLN post {proc_name}...")
                 y_post_dtln = apply_dtln_post_tflite_realtime(
                     interpreter_1=interpreter_1, interpreter_2=interpreter_2,
