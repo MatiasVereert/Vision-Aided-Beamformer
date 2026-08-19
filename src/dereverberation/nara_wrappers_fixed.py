@@ -229,40 +229,61 @@ def _stable_positive_inverse_fixed(power: np.ndarray, cfg: FixedPointConfig,
 
 def online_wpe_step_fixed(input_buffer, power_estimate, inv_cov, filter_taps,
                           alpha, taps, delay, cfg: FixedPointConfig,
-                          stats: Optional[FxStats] = None):
-    """One fixed-point Online-WPE step.
+                          stats: Optional[FxStats] = None, n_iter: int = 1,
+                          refine_floor: float = 0.0):
+    """One fixed-point Online-WPE step, with optional per-frame variance
+    refinement (``n_iter`` > 1).
 
-    Index/einsum conventions are copied verbatim from nara_wpe so the float
-    reference (cfg.float_ref) reproduces nara exactly.
+    n_iter == 1 reproduces the standard online WPE (power estimated from the
+    observed signal) and, with cfg.float_ref(), matches nara_wpe exactly.
+
+    n_iter > 1 emulates the batch WPE outer loop *locally, within a frame*:
+    it alternates  predict Z (with the current tentative filter) -> re-estimate
+    the variance from the DEREVERBERATED output Z -> re-derive the filter from
+    the (unchanged) previous covariance P_prev with that better variance.
+    The covariance update is committed ONCE at the end (P is a running estimate;
+    re-applying it per inner iteration would corrupt the recursion). This costs
+    only extra COMPUTE per frame (no look-ahead / no buffering) -> zero added
+    algorithmic latency, which is exactly what a fast FPGA clock can absorb.
     """
     rnd, sat = cfg.rounding, cfg.saturate
     F, D = input_buffer.shape[-2:]
+    Y_t = input_buffer[-1]
 
     # ---- build the (causal) prediction window --------------------------------
     window = input_buffer[:-delay - 1][::-1]
     window = window.transpose(1, 2, 0).reshape((F, taps * D))
     window = cfg.f("in").q(window, rnd, sat, stats)
 
-    # ---- prediction error  pred = Y_t - conj(G)^T . window -------------------
-    g_contrib = np.einsum('fid,fi->fd', np.conjugate(filter_taps), window)
-    pred = input_buffer[-1] - g_contrib
-    pred = cfg.f("pred").q(pred, rnd, sat, stats)
-
-    # ---- nominator = P . window (block-float: keeps w^H P w >= 0) ------------
+    # ---- nominator = P . window : depends only on P & window (compute once) --
     nominator = np.einsum('fij,fj->fi', inv_cov, window)
     nominator = cfg.nom_fx.q(nominator, rnd, sat, stats)
+    wHn = np.einsum('fi,fi->f', np.conjugate(window), nominator).real  # w^H P w >= 0
 
-    # ---- denominator = alpha*power + window^H . nominator   (real scalar) ----
-    denom = (alpha * power_estimate).astype(window.dtype)
-    denom = denom + np.einsum('fi,fi->f', np.conjugate(window), nominator)
-    denom = denom.real                       # Hermitian form => real
-    inv_denom = _stable_positive_inverse_fixed(denom, cfg, stats)
+    # ---- per-frame refinement loop (transient datapath, block-float) ---------
+    g_cur = filter_taps            # tentative filter, re-derived from P_prev each iter
+    kalman_gain = None
+    pred = None
+    for it in range(max(1, n_iter)):
+        # prediction with the current tentative filter
+        pred = Y_t - np.einsum('fid,fi->fd', np.conjugate(g_cur), window)
+        # variance: iter 0 uses the observed-signal estimate (baseline);
+        # later iters re-estimate it from the dereverberated output Z.
+        if it == 0:
+            power = power_estimate
+        else:
+            power = np.mean(np.abs(pred) ** 2, axis=-1)     # mean over channels of |Z|^2
+            if refine_floor > 0.0:                          # stabiliser: floor at ratio*baseline
+                power = np.maximum(power, refine_floor * power_estimate)
+            power = cfg.pow_fx.q(power, rnd, sat, stats)
+        denom = (alpha * power).astype(window.dtype).real + wHn
+        inv_denom = _stable_positive_inverse_fixed(denom, cfg, stats)
+        kalman_gain = nominator * inv_denom[:, None]
+        kalman_gain = cfg.k_fx.q(kalman_gain, rnd, sat, stats)
+        # re-derive the filter from the ORIGINAL committed filter (not compounding)
+        g_cur = filter_taps + np.einsum('fi,fm->fim', kalman_gain, np.conjugate(pred))
 
-    # ---- Kalman gain (block-float datapath by default) -----------------------
-    kalman_gain = nominator * inv_denom[:, None]
-    kalman_gain = cfg.k_fx.q(kalman_gain, rnd, sat, stats)
-
-    # ---- inv_cov update:  P <- (P - k .(window^H P)) / alpha -----------------
+    # ---- commit inv_cov update ONCE:  P <- (P - k .(w^H P)) / alpha ----------
     wH_P = np.einsum('fj,fjm->fm', np.conjugate(window), inv_cov)
     update = np.einsum('fi,fm->fim', kalman_gain, wH_P)
     inv_cov_k = (inv_cov - update) / alpha
@@ -270,15 +291,17 @@ def online_wpe_step_fixed(input_buffer, power_estimate, inv_cov, filter_taps,
         inv_cov_k = 0.5 * (inv_cov_k + np.conjugate(np.swapaxes(inv_cov_k, -1, -2)))
     inv_cov_k = cfg.f("p").q(inv_cov_k, rnd, sat, stats)
 
-    # ---- filter update:  G <- G + k . conj(pred) -----------------------------
-    filter_taps_k = filter_taps + np.einsum('fi,fm->fim', kalman_gain, np.conjugate(pred))
-    filter_taps_k = cfg.f("g").q(filter_taps_k, rnd, sat, stats)
+    # ---- commit filter; output = last in-loop prediction ---------------------
+    # (with n_iter=1 this is exactly nara's pred, computed with the pre-update
+    #  filter; with n_iter>1 it used the most-refined filter available.)
+    filter_taps_k = cfg.f("g").q(g_cur, rnd, sat, stats)
+    pred_out = cfg.f("pred").q(pred, rnd, sat, stats)
 
     if stats is not None:
         stats.max_absP = max(stats.max_absP, float(np.max(np.abs(inv_cov_k))))
         stats.max_absG = max(stats.max_absG, float(np.max(np.abs(filter_taps_k))))
 
-    return pred, inv_cov_k, filter_taps_k
+    return pred_out, inv_cov_k, filter_taps_k
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +310,8 @@ def online_wpe_step_fixed(input_buffer, power_estimate, inv_cov, filter_taps,
 def process_wpe_online_fixed(u, taps=5, delay=1, alpha=0.9999,
                              stft_size=256, stft_shift=64,
                              fp_cfg: Optional[FixedPointConfig] = None,
-                             return_stats: bool = False):
+                             return_stats: bool = False, n_iter: int = 1,
+                             refine_floor: float = 0.0):
     """Fixed-point Online-WPE dereverberation, drop-in for ``process_wpe_online``.
 
     Parameters
@@ -348,6 +372,7 @@ def process_wpe_online_fixed(u, taps=5, delay=1, alpha=0.9999,
         Z_frame, Q, G = online_wpe_step_fixed(
             Y_step, power, Q, G,
             alpha=alpha, taps=taps, delay=delay, cfg=fp_cfg, stats=stats,
+            n_iter=n_iter, refine_floor=refine_floor,
         )
         Z_list.append(Z_frame)
         buffer.pop(0)

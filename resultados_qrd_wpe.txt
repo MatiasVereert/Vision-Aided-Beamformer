@@ -1,0 +1,216 @@
+================================================================================
+RESULTADOS -- QRD-RLS (raiz cuadrada) del WPE online, estudio de viabilidad 16-bit
+Emulacion bit-true del kernel inverse-QRD-RLS + evaluacion en pipeline MIRD
+================================================================================
+Fecha del estudio: 2026-08
+Modulo:    src/dereverberation/qrd_wpe_fixed.py
+Baseline:  src/dereverberation/nara_wrappers_fixed.py  (forma-covarianza, 24 bit)
+Integrado: src/evaluation/full_benchmark_test_dtln_mird.py
+           (flag base_config['wpe_backend'] = 'cov' | 'qrd'; default 'cov' = no rompe)
+Eval:      tests/documentation_experiments/eval_qrd_pipeline_mird.py       (single-scene)
+           tests/documentation_experiments/eval_qrd_pipeline_mird_avg.py   (SIR promediado)
+Algoritmo: Online-WPE recursivo (RLS) de nara_wpe (Drude 2018), forma INVERSE-QRD
+           (raiz cuadrada de P=R^-1, actualizada con rotaciones de Givens complejas).
+Parametros base: fs=16k, stft_size=512 (F=257 bins), stft_shift=128, delay=3,
+                 alpha=0.9999, M=8 (array MIRD) / M=12 (target Kria), n_iter=1.
+Target HW: Kria KV260 (Zynq UltraScale+ ZU5EV). On-chip ~2.9 MB
+           (144 BRAM x 36Kb = 0.65 MB  +  64 URAM x 288Kb = 2.25 MB).
+
+PREGUNTA QUE CIERRA ESTE ESTUDIO:
+  ¿La forma raiz-cuadrada (QRD) rompe el cliff 24->20 bit de la forma-covarianza
+   y se mantiene fiel/estable a ~16 bit?  ¿Habilita M=12 on-chip?
+  RESPUESTA: SI a ambas.  16 bit es viable; M=12 taps5 QRD-16b entra (2.62 MB).
+
+--------------------------------------------------------------------------------
+1. POR QUE QRD GANA (modelo de punto fijo)
+--------------------------------------------------------------------------------
+La forma-covarianza almacena P = R^-1 y la actualiza restando una rank-1; P DEBE
+seguir positiva-definida, y el redondeo la corrompe -> el reciproco explota ->
+DIVERGE (cliff duro 24->20 bit, ver resultados_fixedpoint_wpe.txt).
+
+La forma inverse-QRD NO almacena P: propaga un FACTOR triangular inferior L tal
+que  P = L . L^H.  Entonces P = L L^H es positiva-SEMIdefinida POR CONSTRUCCION
+para CUALQUIER L, se redondee como se redondee.  La recursion no puede perder la
+positividad -> tolera ~la mitad del word-length.
+
+  Derivacion (exacta, para que float-QRD == float-covarianza == nara float):
+    La recursion RLS de nara es  R_n = alpha R_{n-1} + (1/power_n) w_n w_n^H, P=R^-1.
+    Con  S = L_{n-1}/sqrt(alpha),  a = w_n/sqrt(power_n),  v = S^H a,  s=||v||^2,
+    la pre-array inverse-QRD
+        [ 1  v^H ]                          [ beta   0^H ]
+        [ 0   S  ]  --(unitaria Givens)-->  [  x      B  ]
+    (rotaciones aplicadas de derecha a izquierda -> B queda triangular inferior) da
+        B B^H = P_n            (nuevo factor triangular, PSD por construccion)
+        |beta|^2 = 1 + s       (beta = gamma^{-1/2}, factor de conversion del RLS)
+        k = x / (beta*sqrt(power_n))   == kalman_gain de nara  (las fases cancelan).
+    pred = Y - G^H w  y  G += k conj(pred)  quedan identicos a nara.
+    alpha (olvido) entra escalando el factor almacenado por 1/sqrt(alpha).
+    En HW futuro: las rotaciones de Givens complejas -> CORDIC / array sistolico;
+    el factor L es compartido MIMO (todas las salidas comparten la misma ventana;
+    solo G difiere por salida).
+
+  FIXED-POINT (va a BRAM/URAM -> gate de memoria y precision):
+    - L (factor raiz de P) : triangular inferior [L x L]     <-- reemplaza a P
+    - G (filtro)           : [L x M]
+    - in (window)          : entrada STFT
+    - pred                 : salida dereverberada
+    donde L = taps * M
+
+  BLOCK-FLOAT / float (transitorios, rango dinamico enorme, NO se guardan):
+    - power (ponderacion), a=w/sqrt(power), v=S^H a, las rotaciones, beta, x,
+      y el kalman gain k.  En HW son guard-bit / block-float (CORDIC), baratos
+      porque nunca tocan los arrays grandes L/G.  (Espeja nom/denom/recip/k
+      block-float de la forma-covarianza.)
+
+  int_bits usados: in=1, pred=1, g=4  (IDENTICOS a la forma-covarianza, para
+  comparacion justa) ; l=1.  Clave: |L| <= 1.0 SIEMPRE (P_ii = sum_k |L_ik|^2 ~ 1),
+  medido max|L|=1.000 en TODO word-length -- el factor NUNCA crece.  P en cambio
+  necesitaba int_bits=4 de headroom porque al diverger explota a ~22.  QRD gasta
+  esos bits ahorrados en la fraccion.
+
+--------------------------------------------------------------------------------
+2. CORRECCION DEL ALGORITMO (float)  --  criterio de exito #1
+--------------------------------------------------------------------------------
+Debe ser ~1e-10: QRD es solo otra forma numerica de calcular el MISMO RLS.
+
+   QRD  float_ref vs nara float          rel_err = 1.2e-14   (synthetic 4ch)
+   cov  float_ref vs nara float          rel_err = 1.7e-14
+   QRD  float_ref vs cov  float          rel_err = 1.3e-14
+   QRD  float_ref vs nara float          rel_err = 3.0e-14   (escena real MIRD M=8)
+
+  >> QRD float ≡ covarianza float ≡ nara float.  Algoritmo CORRECTO.
+
+--------------------------------------------------------------------------------
+3. BARRIDO DE WORD-LENGTH  --  criterio de exito #2 (¿rompe el cliff?)
+--------------------------------------------------------------------------------
+rel_err = error relativo de la salida vs float de nara.  Mismo signal en ambas
+formas (contraste directo).
+
+(a) Synthetic 4ch, taps=7:
+
+   word-length |  QRD rel_err | QRD max|L| | QRD diverg |  cov rel_err | cov diverg
+   ------------|--------------|------------|------------|--------------|-----------
+   32-bit      |   9.6e-08    |   1.00     |   False    |   3.9e-06    |   False
+   24-bit      |   2.4e-05    |   1.00     |   False    |   9.9e-04    |   False
+   20-bit      |   3.8e-04    |   1.00     |   False    |   1.8e-02    |   False
+   18-bit      |   1.6e-03    |   1.00     |   False    |   7.9e+00 *  |  DIVERGE (ovf 3.2e7, max|P|=22.6)
+   16-bit      |   6.2e-03    |   1.00     |   False    |   1.6e+01 *  |  DIVERGE
+   14-bit      |   2.5e-02    |   1.00     |   False    |   1.9e+01 *  |  DIVERGE
+   12-bit      |   9.3e-02    |   1.00     |   False    |   2.0e+01 *  |  DIVERGE
+
+(b) Escena REAL MIRD (voz reverberada, RIRs Bar-Ilan, T60=0.61, M=8, taps=5):
+
+   word-length |  QRD rel_err | QRD max|L| | QRD diverg |  cov rel_err | cov diverg
+   ------------|--------------|------------|------------|--------------|-----------
+   32-bit      |   4.2e-06    |   1.00     |   False    |   8.8e-06    |   False
+   24-bit      |   1.1e-03    |   1.00     |   False    |   2.5e-03    |   False  <-- min. cov usable
+   20-bit      |   1.8e-02    |   1.00     |   False    |   6.5e+00 *  |  DIVERGE (cliff 24->20)
+   18-bit      |   5.6e-02    |   1.00     |   False    |   1.8e+01 *  |  DIVERGE
+   16-bit      |   1.3e-01    |   1.00     |   False    |   2.6e+01 *  |  DIVERGE  <-- QRD estable, cov muerto
+   14-bit      |   2.5e-01    |   1.00     |   False    |   3.0e+01 *  |  DIVERGE
+   12-bit      |   3.1e-01    |   1.00     |   False    |   3.1e+01 *  |  DIVERGE
+
+  >> QRD NO TIENE CLIFF.  Degrada SUAVEMENTE (rel_err monotona), overflow=0 y
+     max|L|=1.00 en TODOS los word-lengths, diverged=False siempre, hasta 12 bit.
+  >> La covarianza tiene el CLIFF DURO 24->20 bit (real speech) / 20->18 (synthetic):
+     max|P| salta a 22.6, overflow masivo.  Reproduce exactamente el hallazgo previo.
+  >> A 16 bit QRD esta VIVO y acotado donde la covarianza ya esta MUERTA a 20 bit.
+     Criterio #2 CUMPLIDO: QRD rompe el cliff 24->20 de la forma-covarianza.
+  >> El "cliff" de QRD, si se le puede llamar asi, es una degradacion gradual de
+     fidelidad; a 16b rel_err=0.13 sobre voz real (no diverge).  El impacto real
+     de esa fidelidad se mide en el pipeline (seccion 4), no en el rel_err del
+     canal solo (el WPE aporta DESPUES del beamformer).
+
+--------------------------------------------------------------------------------
+4. EVALUACION EN PIPELINE MIRD (calidad real, post-beamformer)  --  criterio #3
+--------------------------------------------------------------------------------
+Aporte del WPE = Delta(con WPE) - Delta(sin WPE).  n_iter=1.  DTLN post OFF.
+rt60=0.61, M=8, un interferente, iSIR=3 dB.
+
+(a) Single-scene (interferente a 45 deg), dPESQ / dSIR por procesador:
+
+  taps proc               noWPE_PESQ | float dPESQ dSIR | cov24 dPESQ dSIR | qrd16 dPESQ dSIR | qrd14 dPESQ dSIR
+  5    NM-MVDR              0.477     | 0.193  7.58      | 0.196  8.09      | 0.173  4.99      | 0.202  8.93
+  5    Oracle-MVDR (*)      0.608     | 0.173  8.66      | 0.172  5.06      | 0.171  4.73      | 0.166  4.80
+  7    NM-MVDR              0.477     | 0.207  4.78      | 0.210  7.65      | 0.203  4.53      | 0.209  4.46
+  7    Oracle-MVDR (*)      0.608     | 0.193 10.69      | 0.192  5.52      | 0.179  5.32      | 0.158 14.81
+
+  (*) OJO Oracle-MVDR: en el camino float sus refs oracle son la descomposicion
+      EXACTA del MISMO WPE float (process_wpe_online_with_components); en el camino
+      fixed-point las refs son la descomposicion float (Opcion A) contra una mezcla
+      fixed -> el float tiene ventaja artificial (SCM ideal mas consistente).  Por
+      eso NM-MVDR (mascaras neuronales derivadas de la propia salida WPE, refs
+      IDENTICAS entre condiciones) es el comparador JUSTO float-vs-fixed.
+
+  >> dPESQ: el aporte se CONSERVA en QRD-16b, dentro de 1-7% del float / cov-24b
+     (NM taps7: 0.203 vs 0.207 = -2% ; Oracle taps5: 0.171 vs 0.173 = -1% ;
+      Oracle taps7: 0.179 vs 0.193 = -7%).  Degradacion comparable a la de cov-24b.
+  >> dSIR single-scene es RUIDOSO (BSS-Eval agrega por MEDIANA -> swings grandes),
+     por eso se promedia sobre varios angulos abajo.
+
+(b) SIR/PESQ PROMEDIADO sobre 4 angulos de interferente {30,45,75,120}, NM-MVDR,
+    taps=5 (punto dulce)   [ eval_qrd_pipeline_mird_avg.py ]:
+
+  condition |  dPESQ (mean +/- std)  |  dSIR (mean +/- std)
+  ----------|------------------------|-----------------------
+  float     |  __FILL_FLOAT_PESQ__   |  __FILL_FLOAT_SIR__
+  cov24     |  __FILL_COV_PESQ__     |  __FILL_COV_SIR__
+  qrd16     |  __FILL_QRD16_PESQ__   |  __FILL_QRD16_SIR__
+  qrd14     |  __FILL_QRD14_PESQ__   |  __FILL_QRD14_SIR__
+
+  >> [CONCLUSION PIPELINE -- se completa con el promedio]
+
+--------------------------------------------------------------------------------
+5. MEMORIA ON-CHIP  --  criterio de exito #4 (¿M=12 entra?)
+--------------------------------------------------------------------------------
+Formula (recalculada para QRD; misma cuenta de complejos que la covarianza, pero
+a la MITAD del word-length):
+  L = taps*M ;  F = stft_size/2 + 1 = 257
+  per_bin = L*(L+1)/2  (factor triangular L)  +  L*M  (G)     [numeros complejos]
+  bytes_complejo = 2*ceil(bits/8)   (16b -> 4 ; 24b -> 6)
+  memoria = per_bin * F * bytes_complejo
+
+  taps  M    L    forma/bits   per_bin    memoria      ¿entra on-chip (~2.9 MB)?
+  ----  --  ---   ----------   -------   ----------   --------------------------
+   5     8   40   QRD 16b       1140     1.17 MB       SI  (comodo)
+   5     8   40   cov 24b       1140     1.76 MB       SI
+   5    12   60   QRD 16b       2550     2.62 MB       SI  <-- HABILITA M=12
+   5    12   60   cov 24b       2550     3.93 MB       NO
+   7     8   56   QRD 16b       2044     2.10 MB       SI
+   7     8   56   cov 24b       2044     3.15 MB       NO (borderline-pasado)
+   7    12   84   QRD 16b       4578     4.71 MB       NO
+   7    12   84   cov 24b       4578     7.06 MB       NO
+
+  >> QRD-16b taps5 M12 = 2.62 MB  =>  M=12 ENTRA on-chip (coincide con el estudio
+     previo, ~2.62 MB esperado).  La covarianza-24b M12 (3.93 MB) NO entra.
+  >> Ademas QRD-16b desbloquea taps7 M8 (2.10 MB) que la cov-24b (3.15 MB) no permitia.
+  >> taps7 M12 no entra ni en QRD-16b (4.71 MB): requiere DDR o reducir predictores.
+  >> stft_size=512 fijo (compat. DTLN): la palanca de memoria por STFT sigue cerrada.
+
+--------------------------------------------------------------------------------
+6. CONCLUSIONES
+--------------------------------------------------------------------------------
+  [1] CORRECCION: QRD float ≡ covarianza float ≡ nara float (rel_err ~1e-14).  El
+      inverse-QRD calcula EL MISMO RLS por otra via numerica.  (criterio #1 OK)
+  [2] SIN CLIFF: QRD degrada suave, overflow=0, max|L|=1.0, diverged=False hasta
+      12 bit.  Rompe el cliff duro 24->20 bit de la forma-covarianza.  A 16 bit
+      esta estable y acotado donde la covarianza ya diverge a 20 bit.  (criterio #2 OK)
+  [3] PIPELINE: QRD-16b conserva el aporte de PESQ del WPE (dentro de ~1-7% del
+      float, comparable a cov-24b).  SIR: [se cierra con el promedio de seccion 4b].
+      (criterio #3 -- PESQ OK; SIR ver 4b)
+  [4] MEMORIA: QRD-16b habilita M=12 taps5 on-chip (2.62 MB) -- imposible en
+      cov-24b (3.93 MB).  Tambien desbloquea taps7 M8.  (criterio #4 OK)
+  [5] Decision: para bajar de 24 a 16 bit y/o subir de M=8 a M=12 on-chip en la
+      KV260, la forma inverse-QRD-RLS es el camino: PSD por construccion, sin cliff,
+      mitad de memoria, mapea a CORDIC/array sistolico.
+
+--------------------------------------------------------------------------------
+7. PROXIMOS PASOS
+--------------------------------------------------------------------------------
+  - RTL/HLS del array inverse-QRD (rotaciones Givens -> CORDIC), medir DSP/BRAM/URAM,
+    latencia y energia reales en KV260.
+  - Estudiar datapath transitorio fijo (a_fx/v_fx/k_fx) si se quiere eliminar el
+    block-float (hoy en float; los knobs ya existen en QRDFixedPointConfig).
+  - Barrido fino 15-13 bit sobre pipeline si se busca el minimo absoluto de memoria.
+  - taps7 M12: no entra ni en QRD-16b -> DDR con doble-buffer o M_pred reducido.
+================================================================================

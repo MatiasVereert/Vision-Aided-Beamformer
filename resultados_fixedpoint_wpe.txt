@@ -1,0 +1,182 @@
+================================================================================
+RESULTADOS — Estudio de viabilidad FPGA del WPE online (fixed-point)
+Emulación bit-true del kernel RLS + evaluación en pipeline MIRD
+================================================================================
+Fecha del estudio: 2026-08
+Módulo:   src/dereverberation/nara_wrappers_fixed.py
+Integrado:src/evaluation/full_benchmark_test_dtln_mird.py  (flags wpe_fixed_bits,
+          wpe_n_iter, wpe_refine_floor en base_config; default None/1/0.0 = float)
+Algoritmo: Online-WPE recursivo (RLS) de nara_wpe (Drude 2018), NO el GWPE batch.
+Parámetros base: fs=16k, stft_size=512 (F=257 bins), stft_shift=128 (125 fps),
+                 taps=7, delay=3, alpha=0.9999, M=8 (array MIRD) / M=12 (target Kria).
+Target HW: Kria KV260 (Zynq UltraScale+ ZU5EV). On-chip ~2.9 MB
+           (144 BRAM x 36Kb = 0.65 MB  +  64 URAM x 288Kb = 2.25 MB).
+
+--------------------------------------------------------------------------------
+1. MODELO DE PUNTO FIJO (qué se cuantiza y por qué)
+--------------------------------------------------------------------------------
+Distinción clave aprendida empíricamente:
+
+  FIXED-POINT (va a BRAM/URAM -> gate de memoria y precisión):
+    - P (inv_cov)  : matriz de correlación inversa  [L x L, Hermitiana]
+    - G (filter)   : filtro de predicción           [L x M]
+    - in (window)  : entrada STFT
+    - pred         : salida dereverberada
+    donde L = taps * M
+
+  BLOCK-FLOAT / float (transitorios de rango dinámico enorme, NO se guardan):
+    - power (ponderación)      : rango >7 decadas (silencios -> 0)
+    - nom = P*w (forma cuad.)  : cuantizarla ROMPE la positividad de w^H P w
+                                 -> el recíproco explota -> NaN  (hallazgo clave)
+    - denom, recíproco 1/denom
+    - kalman gain k            : llega a ~41400 en dominio normalizado (int_bits=17!)
+
+  Rangos reales medidos (voz real, dominio normalizado max|Y|=0.5):
+    win=0.5  nom=0.057  denom=0.043  k=41400  P=1.043  G=3.939  pred=0.41
+  => int_bits usados: in=1, pred=1, g=4, p=4  (con headroom); k/nom/pow=block-float.
+
+  Estabilizadores:  P forzada Hermitiana cada paso (memoria /2 + estabilidad);
+  recíproco con piso relativo estilo nara (eps = 1e-10*max(denom)).
+
+--------------------------------------------------------------------------------
+2. BARRIDO DE WORD-LENGTH (¿cuántos bits necesita el estado P/G?)
+--------------------------------------------------------------------------------
+Voz real (8ch, taps=7). rel_err = error relativo de la salida vs float de nara.
+
+   word-length | rel_err vs float | estado
+   ------------|------------------|-------------------------------
+   float_ref   | 1e-14            | OK (valida la emulación)
+   32-bit      | 1e-5             | OK, = float
+   24-bit      | 3e-3             | OK, = float          <-- MINIMO USABLE
+   20-bit      | ~1.0             | DIVERGE (max|P| explota, satura)
+   18-bit      | diverge          | DIVERGE
+   16-bit      | diverge          | DIVERGE
+
+  >> CLIFF DE DIVERGENCIA ENTRE 24 Y 20 BIT para el estado P/G.
+     La forma-covarianza del RLS pierde positividad-definida por debajo de 24b
+     (problema clásico del RLS en precisión finita). No es degradación suave:
+     es un cliff catastrofico.
+  >> El piso de ruido (probado a SNR 40/20 dB) NO mueve el cliff: el gate es la
+     precision de P/G, no el recíproco (que ya es block-float).
+  >> Para bajar de 24 bit hace falta QRD-RLS (forma raíz cuadrada, estable ~16b).
+
+--------------------------------------------------------------------------------
+3. VALIDACION EN PIPELINE MIRD @ 24-bit  (rt60=0.61, M=8)
+--------------------------------------------------------------------------------
+Corrida end-to-end (WPE 24b -> beamformer -> metricas). FP-STATS de la corrida:
+   overflow=0   max|P|=1.00   diverged=False    (limpio, sin NaN)
+
+Delta_tot_PESQ_early / Delta_tot_SIR_early con use_wpe=True (aporte al pipeline):
+
+   Procesador                  | PESQ float | PESQ 24b | SIR float | SIR 24b
+   ----------------------------|-----------|----------|-----------|--------
+   NM-MVDR_alpha_1_ref         | 0.4825    | 0.4505   | 19.74     | 18.98
+   NM-MVDR_alpha_0.99_ref      | 0.5819    | 0.5658   | 21.74     | 21.06
+   Oracle-MVDR_alpha_0.99      | 0.6314    | 0.6132   | 22.43     | 21.72
+   Oracle-MVDR_hard_alpha_1    | 0.5183    | 0.5134   | 23.03     | 22.62
+   Oracle-MVDR_hard_alpha_0.99 | 0.6363    | 0.6299   | 23.27     | 22.68
+   Slow                        | 0.5026    | 0.4812   | 21.37     | 20.64
+   Specsub                     | 0.5789    | 0.5593   | 21.75     | 21.05
+
+  Baseline (sin WPE) ~ 0.29 PESQ. => 24-bit CONSERVA el ~1.9x de PESQ y +7 dB SIR.
+  Degradacion 24b vs float: PESQ -1..7% ; SIR -0.5..0.75 dB. Aceptable.
+
+--------------------------------------------------------------------------------
+4. BARRIDO DE TAPS  (MIRD rt60=0.61, M=8, media de 3 procesadores)
+--------------------------------------------------------------------------------
+Memoria = P(Hermitiana, mitad) + G, por bin, x F=257 bins, x bytes/complejo
+(24b -> 6 bytes I+Q ; 16b -> 4 bytes).  L = taps*M.
+
+  taps | WPE   | dPESQ | (xgain) | dSIR  | mem M=8 | mem M=12
+  -----|-------|-------|---------|-------|---------|----------
+   7   | float | 0.561 | 1.93x   | 21.37 | 4.20 MB | 9.41 MB
+   7   | 24b   | 0.554 | 1.91x   | 21.46 | 3.15 MB | 7.06 MB
+   5   | float | 0.523 | 1.80x   | 21.29 | 2.34 MB | 5.24 MB
+   5   | 24b   | 0.512 | 1.76x   | 21.11 | 1.76 MB | 3.93 MB
+   3   | float | 0.470 | 1.62x   | 19.73 | 1.01 MB | 2.26 MB
+   3   | 24b   | 0.459 | 1.58x   | 19.40 | 0.76 MB | 1.69 MB
+  (baseline sin WPE: dPESQ=0.29, dSIR=14.41)
+
+  >> 24-bit sigue fiel a float en TODO taps.
+  >> taps=5 = PUNTO DULCE: conserva ~1.76x / +6.7 dB con ~mitad de memoria de taps=7.
+  >> taps=3: pierde 1.7 dB SIR (demasiado corto para rt60 alto).
+  >> stft_size FIJO en 512 (compat. bloque DTLN) => no se puede achicar memoria por ahi.
+
+  ENCAJE ON-CHIP (~2.9 MB KV260):
+    M=8  : taps=5/24b (1.76 MB) entra comodo. taps=7/24b (3.15 MB) borderline-pasado.
+    M=12 : NO entra en 24b (taps5=3.93). Opciones:
+             - QRD-RLS @16b -> taps5/M12 ~2.62 MB  (entra)
+             - reducir predictores M_pred (calidad sin medir)
+             - DDR externa (latencia escondida con doble-buffer; budget/frame ~8 ms)
+
+--------------------------------------------------------------------------------
+5. ITERACIONES DE REFINAMIENTO DE VARIANZA (n_iter)  -> DESCARTADO
+--------------------------------------------------------------------------------
+Prototipo: refinamiento por-frame (latencia-libre) de la varianza usando la salida
+dereverberada Z. Requiere estabilizador (refine_floor>=0.5) o P diverge (feedback
+positivo: Z baja -> varianza baja -> ganancia sube). Evaluado en pipeline COMPLETO
+(post-beamformer), 3 niveles de rt60, aporte del WPE = (con WPE) - (sin WPE):
+
+  rt60 | modo    | aporte dPESQ | aporte dSIR
+  -----|---------|--------------|-------------
+  0.16 | float   |  +0.03       |  +5.6
+  0.16 | 24b n1  |  -0.43       |  +0.0
+  0.16 | 24b n2  |  -0.91       |  -2.8
+  0.36 | float   |  +0.30       |  +8.2
+  0.36 | 24b n1  |  +0.30       |  +7.6
+  0.36 | 24b n2  |  -0.37       |  +2.1
+  0.61 | float   |  +0.23       |  +8.5
+  0.61 | 24b n1  |  +0.23       |  +6.3
+  0.61 | 24b n2  |  -0.06       |  +5.4
+
+  >> n_iter>1 es CONTRAPRODUCENTE en el pipeline completo: ensucia la estructura
+     espacial/fase que el beamformer necesita. El +0.08 PESQ que daba el WPE SOLO
+     (un canal) NO se traslada al beamformer. n_iter=1 es el ganador definitivo.
+  >> El VALOR real del WPE se ve DESPUES del beamformer: +6 a +8 dB de SIR (float),
+     no en el PESQ del canal solo (que mueve poco).
+  >> Debilidad detectada: en rt60 BAJO (0.16) el 24b n1 flaquea (aporte -0.43 PESQ
+     vs +0.03 float): con poca reverb el WPE aporta poco y la cuantizacion pesa mas.
+     Candidato a bypass del WPE en rt60 bajo.
+
+--------------------------------------------------------------------------------
+6. COSTO EN CPU DEL RLS ONLINE (contexto de justificacion)
+--------------------------------------------------------------------------------
+Medido en CPU de escritorio, 15 s de audio:
+   M=8  : RTF 0.11x (9x mas rapido que real-time, wrapper Python)  ~0.9 GFLOP/s (impl eficiente)
+   M=12 : RTF 0.33x (3x mas rapido que real-time, wrapper Python)  ~2.1 GFLOP/s (impl eficiente)
+
+  >> El RLS online es LIVIANO para un CPU (a diferencia del GWPE batch, que es pesado).
+  >> Justificacion FPGA NO es "el CPU no puede" (puede) sino: offload del ARM A53
+     (debil y ocupado con beamformer/DTLN/OS), latencia deterministica, energia, e
+     integracion en el datapath de streaming (PDM -> WPE -> beamformer) ya en la PL.
+  >> La "pesadez" del WPE MIMO es una restriccion del target FPGA (memoria on-chip),
+     no una carga de computo intrinseca (en CPU hay GB de RAM, no es problema).
+
+--------------------------------------------------------------------------------
+7. CONCLUSIONES / DECISIONES
+--------------------------------------------------------------------------------
+  [1] Word-length: 24-bit para P/G en forma-covarianza (cliff duro 24->20).
+      QRD-RLS habilitaria ~16-bit (mitad de memoria) -> proximo paso algoritmico.
+  [2] taps=5 = punto dulce calidad/memoria (conserva ~1.76x).
+  [3] stft_size = 512 (fijo por DTLN). Palanca de memoria cerrada.
+  [4] M=8 RESUELTO on-chip (taps5/24b=1.76 MB). M=12 requiere QRD-RLS@16b o DDR.
+  [5] n_iter=1 DEFINITIVO (iteraciones de varianza descartadas: dañan el beamformer).
+  [6] Valor del WPE = +6..8 dB SIR post-beamformer. Debil en rt60 bajo -> ver bypass.
+  [7] Gate del proyecto = MEMORIA + PRECISION NUMERICA, no computo (computo <1% PL).
+
+--------------------------------------------------------------------------------
+8. PROXIMOS PASOS
+--------------------------------------------------------------------------------
+  - Prototipar QRD-RLS (raiz cuadrada, Givens/CORDIC) y medir: (a) que aguanta 16b
+    sobre MIRD conservando el ~2x, (b) memoria resultante para M=12.
+  - Barrido de reducir predictores M_pred (variante WPE de entrada reducida) si se
+    quiere M=12 on-chip sin QRD.
+  - Validacion en hardware real (KV260): recursos (DSP/BRAM/URAM), latencia, energia.
+  - Evaluar bypass del WPE en rt60 bajo.
+
+Referencia rapida de formula de memoria (por si hay que recalcular):
+  L = taps * M ;  F = stft_size/2 + 1 = 257
+  per_bin = L*(L+1)/2 (P Hermitiana) + L*M (G)  [en numeros complejos]
+  bytes_complejo = 2 * ceil(bits/8)   (24b->6, 16b->4)
+  memoria = per_bin * F * bytes_complejo
+================================================================================

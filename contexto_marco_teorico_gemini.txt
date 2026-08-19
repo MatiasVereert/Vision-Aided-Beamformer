@@ -1,0 +1,225 @@
+================================================================================
+CONTEXTO DE PROYECTO — Marco teórico de un IP de dereverberación WPE para FPGA
+(Documento de traspaso para asistente LLM. Autocontenido. Español + términos técnicos en inglés.)
+================================================================================
+
+--------------------------------------------------------------------------------
+0. QUÉ NECESITO DE VOS (leer primero)
+--------------------------------------------------------------------------------
+Estoy en la etapa de ESTUDIAR EL ALGORITMO y ESCRIBIR EL MARCO TEÓRICO de mi
+tesis, ANTES de desarrollar el IP en FPGA. No quiero código todavía: quiero
+entender la matemática a fondo y redactar un marco teórico sólido y bien citado.
+
+Ayudame a:
+  (a) entender en profundidad el algoritmo (derivaciones, intuición, supuestos),
+  (b) redactar el marco teórico en español, riguroso y con hilo conductor claro,
+  (c) conectar la teoría (modelo WPE) con la implementación (RLS online causal)
+      y con las restricciones de hardware (punto fijo, memoria).
+
+Trabajá en español. Podés pedirme que te aclare cualquier cosa del contexto.
+
+--------------------------------------------------------------------------------
+1. EL PROYECTO
+--------------------------------------------------------------------------------
+Tesis de ingeniería: sistema de captura y procesamiento de audio con un array de
+micrófonos MEMS PDM (12 micrófonos) sobre una plataforma AMD/Xilinx Kria KV260
+(SoC Zynq UltraScale+ MPSoC, ZU5EV: procesador ARM Cortex-A53 "PS" + lógica
+programable "PL"). El objetivo del sistema es BEAMFORMING (realce espacial de una
+fuente de voz) en entornos reverberantes y con ruido.
+
+El sub-proyecto de esta etapa: diseñar un IP (bloque de hardware en la FPGA) de
+DEREVERBERACIÓN MIMO que actúe como PREPROCESADOR del beamformer. Es decir:
+   micrófonos -> [DEREVERB WPE] -> [BEAMFORMER MVDR] -> voz realzada
+La dereverberación limpia la señal ANTES del beamformer, mejorando la estimación
+espacial y por ende el resultado final.
+
+Justificación empírica (ya medida en simulación con RIRs reales del dataset MIRD,
+Bar-Ilan, rt60=0.61 s): agregar WPE prácticamente DUPLICA la mejora de PESQ del
+beamformer (ΔPESQ ~0.29 -> ~0.55) y suma +7 dB de SIR. No es una ganancia
+marginal; por eso vale la pena implementarlo en hardware.
+
+--------------------------------------------------------------------------------
+2. EL ALGORITMO — WPE (Weighted Prediction Error)
+--------------------------------------------------------------------------------
+WPE es un método de dereverberación ciega (no necesita conocer la respuesta
+impulsiva de la sala) basado en PREDICCIÓN LINEAL RETARDADA. Idea central: la voz
+limpia está casi incorrelacionada en el tiempo a lags largos; la reverberación
+introduce correlación temporal de cola larga. WPE estima un filtro de predicción
+lineal multicanal que predice (y resta) la parte reverberante tardía, usando un
+RETARDO (delay Δ) para NO tocar la voz directa y las primeras reflexiones.
+
+Trabaja en el dominio STFT (subbandas): cada bin de frecuencia se procesa
+independientemente. El costo se pondera por la varianza instantánea de la señal
+(de ahí "Weighted"), explotando la no-estacionariedad de la voz.
+
+Propiedades clave (importantes para el beamforming):
+  - Produce la MISMA cantidad de salidas que micrófonos (MIMO): M salidas
+    dereverberadas, no una sola. Esto lo necesita el beamformer.
+  - Conserva las diferencias de tiempo de llegada (TDOAs) entre micrófonos ->
+    preserva la información espacial que el beamformer usa.
+  - No requiere conocer el número de fuentes.
+
+*** DISTINCIÓN CRÍTICA PARA EL MARCO TEÓRICO: dos variantes de WPE ***
+
+  (A) GWPE BATCH (Generalized WPE) — Yoshioka & Nakatani, 2012.
+      Es la generalización MIMO/subbandas del WPE, con una función de costo
+      basada en la "Hadamard-Fischer mutual correlation". Se resuelve OFFLINE,
+      de forma ITERATIVA (auxiliary-function optimization), procesando todo el
+      buffer de la señal y resolviendo sistemas lineales grandes.
+      -> Aporta el MODELO y la TEORÍA (por qué funciona, formalización MIMO,
+         condiciones que debe cumplir un dereverberador para servir de
+         preprocesador de arrays). ES EL FUNDAMENTO TEÓRICO.
+      -> PERO no es implementable en tiempo real en FPGA (es batch, no causal,
+         con inversión de matrices grandes).
+
+  (B) ONLINE WPE (recursivo, RLS) — implementado en el paquete nara_wpe
+      (Drude, Heymann, Boeddeker, Haeb-Umbach, 2018).
+      Es la versión CAUSAL, frame-a-frame, del mismo modelo WPE, resuelta por
+      RECURSIVE LEAST SQUARES (RLS) con factor de olvido exponencial (alpha).
+      No hay inversión de matrices explícita: usa el lema de inversión de
+      matrices (Sherman-Morrison / ganancia de Kalman) para actualizar
+      recursivamente la matriz de correlación inversa.
+      -> ES LA VARIANTE QUE SE VA A IMPLEMENTAR EN EL IP, porque es causal,
+         de baja latencia y computacionalmente liviana.
+
+ENCUADRE SUGERIDO PARA LA TESIS: presentar (A) como el fundamento teórico del
+modelo MIMO de dereverberación, y (B) como su realización online/causal que hace
+el modelo implementable en tiempo real. El IP implementa (B).
+
+--------------------------------------------------------------------------------
+3. EL KERNEL RLS (lo que se implementa) — ecuaciones por frame y por bin
+--------------------------------------------------------------------------------
+Notación (por cada bin de frecuencia f, en cada frame t):
+  M            = nº de canales (micrófonos)
+  taps (K)     = nº de coeficientes del filtro de predicción por canal
+  delay (Δ)    = retardo de predicción (frames) para no tocar la voz directa
+  L = taps*M   = dimensión del vector de predicción (window) y de la matriz P
+  alpha        = factor de olvido exponencial (~0.9999)
+  Y_t          = vector STFT del frame actual (M canales)          [tamaño M]
+  window (w)   = historia apilada de los M canales, retardada Δ    [tamaño L]
+  G            = filtro de predicción (estado)                     [L x M]
+  P (inv_cov)  = matriz de correlación inversa (estado)            [L x L, Hermitiana]
+
+Paso RLS (una iteración por frame por bin):
+  1) Predicción (salida dereverberada):   Z = Y_t - Gᴴ · w
+  2) Numerador:                           n = P · w
+  3) Potencia (peso):                     power = promedio de |Y|² (escalar por bin)
+  4) Denominador (ESCALAR REAL > 0):      d = alpha·power + wᴴ · n
+  5) Ganancia de Kalman:                  k = n / d
+  6) Update de P:                         P = (P - k · (wᴴ P)) / alpha
+  7) Update del filtro:                   G = G + k · Zᴴ
+
+Observaciones importantes:
+  - w usa SOLO frames pasados (por el retardo Δ) => el algoritmo es CAUSAL.
+  - d es un ESCALAR REAL positivo (forma cuadrática wᴴPw >= 0) => la única
+    división es un recíproco real por bin (no hay inversión de matriz).
+  - P es Hermitiana => se puede almacenar sólo la mitad (triángulo superior).
+  - El update de P es un "downdate" rank-1 (estructura de RLS estándar).
+  - Los bins de frecuencia son INDEPENDIENTES => paralelizables.
+  - La recursión (dependencia entre frames) existe sólo dentro de un mismo bin.
+
+--------------------------------------------------------------------------------
+4. HALLAZGOS DE FACTIBILIDAD FPGA (para que entiendas el destino del algoritmo)
+--------------------------------------------------------------------------------
+Ya se hizo un estudio de viabilidad con una emulación en punto fijo (bit-true) del
+kernel RLS, corrida sobre el pipeline de simulación con RIRs reales (MIRD).
+Resultados que el marco teórico debería poder explicar:
+
+  - El CÓMPUTO no es el cuello de botella (~1% de la capacidad de la PL). El gate
+    es la MEMORIA (almacenar la matriz P por cada bin) y la PRECISIÓN NUMÉRICA.
+
+  - Punto fijo: se debe distinguir qué va a memoria vs qué es transitorio:
+      * P, G, entrada (window), salida (pred): PUNTO FIJO (van a BRAM/URAM). Es
+        el gate de memoria.
+      * power, numerador n, denominador d, recíproco, ganancia de Kalman k:
+        rango dinámico ENORME (por los silencios: power->0 => recíproco enorme).
+        Se modelan en BLOCK-FLOATING-POINT / float (son transitorios, no se
+        guardan en los arrays grandes; llevar exponente es barato).
+      * Cuantizar n rompe la positividad de wᴴPw => el recíproco explota (NaN).
+        Por eso n va en block-float. (Hallazgo empírico clave.)
+
+  - Cliff de precisión: la forma-covarianza del RLS (la de nara) necesita ~24 bit
+    para el estado P/G. A 20 bit o menos DIVERGE catastróficamente (P pierde su
+    positividad-definida). Esto es un problema clásico del RLS en precisión finita.
+
+  - A 24 bit, el fixed-point CONSERVA prácticamente toda la ganancia (~1.9x de
+    PESQ, +7 dB SIR) sobre datos MIRD reales, sin overflow ni divergencia.
+
+  - Memoria (P Hermitiana + G, stft_size=512 => 257 bins, 24 bit):
+      M=8:  taps=7 -> 3.15 MB ; taps=5 -> 1.76 MB
+      M=12: taps=7 -> 7.06 MB ; taps=5 -> 3.93 MB ; taps=3 -> 1.69 MB
+    On-chip del KV260 ~2.9 MB (144 BRAM x 36Kb + 64 URAM x 288Kb). Alternativa:
+    DDR externa (la latencia se esconde con doble-buffer, porque el presupuesto
+    por frame es ~8 ms y el cómputo <1 ms).
+
+  - stft_size está FIJO en 512/128 por compatibilidad con el bloque del DTLN
+    (una red neuronal usada aguas abajo para las máscaras del beamformer).
+
+  - PRÓXIMO PASO ALGORÍTMICO: QRD-RLS (RLS en forma raíz cuadrada, con rotaciones
+    de Givens / array sistólico). No baja FLOPs, pero es NUMÉRICAMENTE ESTABLE a
+    ~16 bit (donde la forma-covarianza diverge) => HALVES la memoria. Es la
+    optimización correcta porque ataca el gate real (memoria/bits), no el cómputo.
+    NOTA: el "Fast RLS" (FTF/lattice, O(L²)->O(L)) NO sirve acá: optimiza cómputo
+    (que no es el gate) y es aún más inestable en punto fijo.
+
+--------------------------------------------------------------------------------
+5. PARÁMETROS CONCRETOS DEL SISTEMA
+--------------------------------------------------------------------------------
+  fs = 16 kHz
+  stft_size = 512, stft_shift = 128  (=> 257 bins, 125 frames/s, ventana=32 ms)
+  taps = 7, delay = 3, alpha = 0.9999
+  M = 8 (array del dataset MIRD usado en simulación) ; M = 12 (target Kria)
+  Latencia algorítmica ~ 32-64 ms (ventana STFT + overlap-add del ISTFT).
+  Beamformer aguas abajo: MVDR mask-based (Souden) con máscaras de una red DTLN.
+
+--------------------------------------------------------------------------------
+6. BIBLIOGRAFÍA (marco teórico) — organizada por capas
+--------------------------------------------------------------------------------
+Capa 1 — Modelo WPE (teoría):
+  * Nakatani, Yoshioka, Kinoshita, Miyoshi, Juang (2010), "Speech Dereverberation
+    Based on Variance-Normalized Delayed Linear Prediction", IEEE TASLP 18(7):
+    1717-1731.  [PAPER FUNDACIONAL DE WPE — empezar por acá]
+  * Yoshioka & Nakatani (2012), "Generalization of Multi-Channel Linear Prediction
+    Methods for Blind MIMO Impulse Response Shortening", IEEE TASLP 20(10).
+    [GWPE — generalización MIMO/subbandas; fundamento teórico del modelo]
+
+Capa 2 — Algoritmo online/RLS (lo que se implementa):
+  * Drude, Heymann, Boeddeker, Haeb-Umbach (2018), "NARA-WPE: A Python package for
+    weighted prediction error dereverberation in Numpy and Tensorflow for online
+    and offline processing", ITG Sprachkommunikation. [EL paper del código base;
+    describe la variante frame-online]
+
+Capa 3 — RLS / filtrado adaptativo (el kernel):
+  * Haykin, "Adaptive Filter Theory" — capítulos de RLS (lema de inversión de
+    matrices, forgetting factor exponencial, y comportamiento en precisión finita).
+  * Sayed, "Adaptive Filters" (Wiley) — complemento.
+
+Capa 4 — RLS estable para hardware (QRD-RLS):
+  * McWhirter (1983), "Recursive Least-Squares Minimization Using a Systolic Array".
+  * Gentleman & Kung (1981), "Matrix Triangularization by Systolic Arrays".
+
+Capa 5 — Punto fijo / FPGA:
+  * Meyer-Baese, "Digital Signal Processing with Field-Programmable Gate Arrays"
+    (aritmética punto fijo, saturación/redondeo, block-floating-point, CORDIC).
+
+Capa 6 — Contexto beamforming (la cascada):
+  * Souden, Benesty, Affes (2010) — MVDR usado aguas abajo.
+  * Sistemas ganadores de REVERB Challenge / CHiME (Yoshioka et al.) — evidencia
+    empírica de la cascada WPE -> beamformer -> ASR.
+
+--------------------------------------------------------------------------------
+7. GLOSARIO RÁPIDO
+--------------------------------------------------------------------------------
+  WPE = Weighted Prediction Error (dereverberación por predicción lineal)
+  GWPE = Generalized WPE (versión MIMO batch, Yoshioka 2012)
+  RLS = Recursive Least Squares
+  QRD-RLS = RLS en forma raíz cuadrada vía descomposición QR (Givens)
+  STFT/ISTFT = Short-Time Fourier Transform (directa/inversa)
+  RIR = Room Impulse Response
+  MIRD = dataset de RIRs medidas (Bar-Ilan, array lineal)
+  PESQ/STOI/SIR/SDR = métricas de calidad/inteligibilidad/separación
+  MVDR = Minimum Variance Distortionless Response (beamformer)
+  PL/PS = Programmable Logic / Processing System (partes de la Zynq MPSoC)
+  BRAM/URAM = memorias on-chip de la FPGA
+  block-floating-point = representación con exponente compartido (rango dinámico)
+================================================================================

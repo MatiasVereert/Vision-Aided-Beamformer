@@ -1,0 +1,160 @@
+================================================================================
+CONTEXTO — Diseño experimental de la tesis (batería de pruebas)
+Carpeta: tests/documentation_experiments/
+Repo: /home/matias/Documents/Tesis/Vision-Aided-Beamformer
+================================================================================
+
+Tesis (UNTREF, Ing. en Sonido): sistema de realce de voz en HW.
+Sistema propuesto = NM-MVDR (Neural-Mask MVDR):
+  audio 8 mics -> WPE (dereverb, corre en FPGA) -> máscara DTLN (1er núcleo)
+  -> Souden MVDR recursivo -> post-filtro opcional (BAN / PF sustracción espectral)
+  -> salida mono.
+fs=16 kHz, STFT ventana 512 / hop 128. Arreglo lineal 8 mics, dataset MIRD
+(spacing "3-3-3-8-3-3-3"), RT60 disponibles {160,360,610} ms. Ángulos MIRD válidos:
+{0,±15,±30,±45,±60,±75,±90} (arco frontal), distancias {1,2} m. Negativos se
+envuelven con %360 en el loader.
+HW: Kria KV260 (MPSoC), latencia <50 ms, WPE taps=5 FIJOS por memoria FPGA.
+
+MOTIVO DEL REDISEÑO: un bug importaba mal las RIRs de MIRD (colapsaban a delta ~3
+muestras) -> todo corría casi anecoico -> las Figs 6-10 viejas quedaron
+invalidadas y se DESCARTÓ mal el WPE. Bug corregido; con RT real la reverberación
+degrada y el WPE SÍ hace falta. Se rehízo todo el diseño experimental.
+
+DESCARTADO: usar el DTLN COMPLETO (2do núcleo) como post-procesador (demasiadas
+cascadas, ineficiente). El post del sistema es BAN/PF (sustracción espectral).
+Falta sacar el DTLN-completo-post de la Fig. 3 de la tesis (pendiente doc).
+
+--------------------------------------------------------------------------------
+NARRATIVA / BATERÍA (orden lógico): beam -> WPE+beam -> WPE+beam+post -> general
+--------------------------------------------------------------------------------
+1) Prueba_1_robustez_neural_vs_geo.ipynb  — ¿por qué máscara neuronal vs geométrico?
+   SIN WPE. Procs: DS, MVDR-geo (MVDR_Recursive), NM-MVDR. Sub-corridas:
+   2a = error de DOA (error_angle_deg [0,2,5,10,15], mismatch 0),
+   2b = mismatch de sensor (dos barridos 1D: gain [0,1,2,3] dB / phase [0,3,6,10]°).
+   RT=360, iSIR=0, target broadside 0°/1m, 2 targets, 3 interferentes simultáneos
+   (techno@30, secadora@-15, taladro@45). Muestra que el geométrico se rompe
+   (autocancelación por WNG) y el ciego aguanta. Figuras: curvas 1D con el "cruce".
+   NO usa oracle. Salidas Drive: P1_robustez_2a_doa / _2b_gain / _2b_phase.
+
+2) Prueba_2_calibracion_wpe.ipynb  — calibración de WPE (taps × delay × RT).
+   Proc: NM-MVDR. Grid: rt60 {160,360,610} × wpe_taps [3,5,7,10] × wpe_delay [1,2,3].
+   RESULTADO YA OBTENIDO: taps=5, delay=1 (mejor en todas las métricas; taps=10 NO
+   supera a taps=5 -> honestidad de la restricción HW). t_early=8ms FIJO.
+
+3) Prueba_3_efecto_wpe.ipynb  — efecto de WPE on/off.
+   Procs: DS, NM-MVDR, ORACLE-SCM (SOUDEN_ORACLE_SCM). Ejes: rt60 × use_wpe{T,F} ×
+   iSIR × targets × interf. Grid REDUCIDO por tiempo: 2 targets, iSIR [0,10], 3
+   interf, DURATION=10. Figura estrella: Δ vs RT60 con curvas on/off + Delta_wpe.
+
+4) Prueba_4_mono_y_postfiltro.ipynb  — selección del post-filtro (smooth*).
+   10 procs: NM-MVDR, BAN, PF_{s}, BANPF_{s} con SMOOTHS=[0.2,0.33,0.5,0.66].
+   DTLN-mono automático. apply_dtln_post=False. Trade-off scatter -> elegir smooth*.
+   (El usuario le agregó iSIR=-5.)
+
+5) Prueba_5_sistema_vs_mono.ipynb  — comparación general (boxplots). NUEVA.
+   UN solo grid combinado: iSIR [-6,-3,0,3,6,9,12] × RT {160,360,610} × 3 targets ×
+   8 interf_configs (esquema NESTED: conteo k+1 = k + una fuente, 2 rotaciones
+   espejo, lados alternados, audios rotados -> controla el sesgo espacial del eje
+   nº-interferentes). Procs: NM-MVDR (base) + "Sistema" (NM_MVDR_BAN_PF smooth*).
+   Mono automático. Figuras: boxplots MARGINALES (métrica vs iSIR / vs RT / vs
+   N_interferences, marginalizando sobre el resto) + boxplots de DIFERENCIA pareada
+   (BF - mono). Poner SYSTEM_SMOOTH = smooth* de P4.
+
+analisis_figuras.ipynb  — notebook LOCAL de análisis (camino elegido: Colab solo
+   corre+guarda; las figuras finales se hacen local y rápido). Carga los parquets con
+   load_latest(prefix) RECURSIVO (maneja el doble-anidado que crea la descarga de
+   carpetas de Google Drive). RESULTS_DIR = carpeta local con los subdirs bajados.
+   Usa SI-SDR (no SDR). Los notebooks de Colab quedaron con sus figuras (sirven de
+   verificación al terminar cada run).
+
+(Prueba_A/B/C_mird.ipynb son maquetas viejas, ignorar.)
+
+--------------------------------------------------------------------------------
+CONVENCIONES DE CONFIG (todas las pruebas)
+--------------------------------------------------------------------------------
+- t_early = 0.008 (8 ms), FIJO y desacoplado de wpe_delay.
+- eval_references = ['early'] (solo early, por velocidad).
+- snr_db = 60. WPE taps=5, delay=1 (de P2). mird_spacing "3-3-3-8-3-3-3".
+- save_catalog=False (saltea el guardado best/worst en H5 con polar plots, que era el
+  cuello de ~442 s/celda; solo alimenta el dashboard).
+- apply_dtln_post=False en P4/P5 (saltea el Node 6 DTLN-post descartado, mantiene el
+  DTLN-mono baseline del Node 4.5).
+- Interferentes SIEMPRE NO-VOCALES (DTLN es supresión de ruido, no separación de
+  hablantes; el alcance excluye múltiples locutores). Pool: techno, flute,
+  hairdryer_07, drill_07, ruido_rosa_16k, vacuum_02.
+- Targets: locutores EARS (p002, p008, p011, p014, p017). Verificar géneros (idealmente
+  varón+mujer donde haya 2).
+
+--------------------------------------------------------------------------------
+MÉTRICAS
+--------------------------------------------------------------------------------
+- src/evaluation/metrics.py (evaluate_full_pipeline) devuelve: PESQ, STOI, SI-SDR,
+  SDR, SIR, SAR (+ SINR=NaN, CD). Usa pb_bss.OutputMetrics.
+- DECISIÓN: graficar SI-SDR en vez del SDR clásico (más fiel, Le Roux 2019). El
+  SI-SDR YA se computa (columna ..._SI-SDR_early, con guion).
+- SIR: el usuario corrigió un bug menor -> hay que RE-CORRER P1/P2/P3 si se corrieron
+  antes del fix.
+- Columnas del parquet: Delta_tot_{M}_early = proc - base (BEAMFORMER, sin DTLN-post).
+  Delta_wpe_* = WPE solo. Delta_tot_pipeline_* = CON DTLN-post (NO usar). proc_{M}_early
+  y dtln_alone_{M}_early = absolutos (sistema vs mono en P5).
+- PENDIENTE: acelerar metrics.py. El cuello es mir_eval_sdr/sir/sar (lento). Candidato:
+  fast_bss_eval (mismo BSS-Eval, mucho más rápido). Hay un prompt de auditoría de
+  metrics.py + propuesta de aceleración ya redactado (revisar cómo se entrega la
+  referencia al SI-SDR).
+
+--------------------------------------------------------------------------------
+CAMBIOS DE CÓDIGO YA HECHOS (repo local; hay que PUSHEAR para Colab)
+--------------------------------------------------------------------------------
+src/evaluation/full_benchmark_test_dtln_mird.py (orquestador run_mird_grid_search):
+  - t_early leído FIJO de scene_base_config['t_early'] (antes = hop*delay/fs -> movía
+    la referencia y sesgaba el barrido de delay). Corrección "A1".
+  - source_path es EJE DEL GRID (variedad de locutor); backward-compat si no se pasa.
+  - Refs del ORACLE (oracle_target/oracle_noise) se construyen en Node 4 a partir de
+    las componentes limpias propagadas por el MISMO front-end (HW mismatch + WPE), vía
+    process_wpe_online_with_components -> dominio consistente con la señal filtrada.
+    (Antes salían de la señal limpia PRE-WPE -> el oracle no era cota superior válida.)
+    Verificado: oracle >= NM-MVDR en todas las celdas.
+  - Flag save_catalog=True (default). Flag apply_dtln_post=True (default; guarda Node 6).
+
+src/dereverberation/nara_wrappers.py:
+  - WPE online ACELERADO con numba. Agregada process_wpe_online_with_components (filtra
+    mezcla + componentes con el MISMO G -> descomposición exacta para el oracle).
+    Verificado numéricamente idéntico a la versión previa (tests/test_frontend_
+    decomposition.py y tests/oracle_refs_check.py).
+
+src/evaluation/bf_wrappers.py:
+  - Clases con nombres NUEVOS: DS, MVDR_Recursive, NM_MVDR, SOUDEN_ORACLE_SCM,
+    ORACLE_MB_MVDR_SOUDEN, DTLN_MB_MVDR_SOUDEN_BAN, NM_MVDR_PF, NM_MVDR_BAN_PF.
+    (La versión commiteada VIEJA tenía sufijo _Processor -> por eso hay que pushear.)
+
+src/evaluation/metrics.py: fix del SIR (por el usuario).
+
+--------------------------------------------------------------------------------
+WORKFLOW COLAB
+--------------------------------------------------------------------------------
+- Celda de instalación = WHEEL-CACHE en Drive con manifest (auto-reconstruye si cambia
+  la lista de paquetes). Paquetes: noisereduce, mir_eval, pystoi, pesq, paderbox,
+  ai_edge_litert, + git: pb_bss, pyroomacoustics, nara_wpe, fast_bss_eval.
+  (pysepm SACADO: no se usa y chocaba con pb_bss por srmrpy. numba/h5py/pyarrow/
+  tensorflow ya vienen en Colab.)
+- Cache en /content/drive/MyDrive/colab_wheels. Si falla un import tras update de
+  Python: borrar esa carpeta y se reconstruye.
+- PUSHEAR JUNTOS antes de correr: bf_wrappers.py, full_benchmark_test_dtln_mird.py,
+  nara_wrappers.py, metrics.py + los notebooks. (El orquestador importa bf_wrappers a
+  nivel módulo -> si no está la versión nueva, rompe.)
+- Datos -> Drive MyDrive/Tesis_Beamformers/results/P{n}_..._{RUN_TAG}/.
+- Correr celdas EN ORDEN (Setup -> ...); si aparece "No module named 'evaluation'"
+  después de clonar, es cache de import viejo: importlib.invalidate_caches() o Restart.
+
+--------------------------------------------------------------------------------
+ESTADO / PENDIENTES
+--------------------------------------------------------------------------------
+- P2 lista: taps=5, delay=1.
+- P4 corriendo (o corrida) con metrics ya arreglado -> válida para elegir smooth*.
+- RE-CORRER P1/P2/P3 con el fix de SIR (si se corrieron antes).
+- Correr P5 (poner SYSTEM_SMOOTH = smooth* de P4).
+- Acelerar metrics.py (fast_bss_eval) — prompt de auditoría pendiente.
+- Doc tesis: sacar DTLN-completo-post de la Fig. 3; actualizar arquitectura para
+  incluir el WPE (Fig. 3 / Fig. 13 no lo mostraban).
+- Datos ya bajados a tests/documentation_experiments/results/ (P1,P2,P3,P4; P5 no).
+================================================================================

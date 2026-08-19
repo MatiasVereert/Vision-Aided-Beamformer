@@ -16,6 +16,7 @@ from propagation.simulate_acoustics_v1 import SimAcoustic
 from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array
 from dereverberation.nara_wrappers import process_wpe_online, process_wpe_online_with_components
 from dereverberation.nara_wrappers_fixed import process_wpe_online_fixed, FixedPointConfig
+from dereverberation.qrd_wpe_fixed import process_qrd_wpe_online_fixed, QRDFixedPointConfig
 from evaluation.metrics import evaluate_full_pipeline
 
 from evaluation.bf_wrappers import (
@@ -437,16 +438,37 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                         components=[hw_oracle_target, hw_oracle_noise], **wpe_kw
                     )
                 else:
-                    tqdm.write(f" -> [NODE 4] Applying WPE pre-processing (FIXED-POINT {fixed_bits}-bit, FPGA emulation)...")
-                    fp_cfg = FixedPointConfig.wordlength(
-                        fixed_bits, rounding=scene_base_config.get('wpe_fixed_round', 'nearest')
-                    )
-                    mic_signals_ready, fp_stats = process_wpe_online_fixed(
-                        u=mic_signals_degraded, taps=exp['wpe_taps'], delay=exp['wpe_delay'],
-                        alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'],
-                        stft_shift=scene_base_config['wpe_stft_shift'], fp_cfg=fp_cfg, return_stats=True
-                    )
-                    tqdm.write(f"    [FP-STATS] overflow={fp_stats.overflow} max|P|={fp_stats.max_absP:.2e} "
+                    # Back-end selector: 'cov' = covariance-form RLS (default, needs
+                    # 24 bit); 'qrd' = inverse-QRD square-root RLS (stable ~16 bit).
+                    # Both share the same drop-in signature and fixed-point stats.
+                    wpe_backend = scene_base_config.get('wpe_backend', 'cov')
+                    tqdm.write(f" -> [NODE 4] Applying WPE pre-processing (FIXED-POINT {fixed_bits}-bit, "
+                               f"backend={wpe_backend.upper()}, FPGA emulation)...")
+                    if wpe_backend == 'qrd':
+                        fp_cfg = QRDFixedPointConfig.wordlength(
+                            fixed_bits, rounding=scene_base_config.get('wpe_fixed_round', 'nearest')
+                        )
+                        mic_signals_ready, fp_stats = process_qrd_wpe_online_fixed(
+                            u=mic_signals_degraded, taps=exp['wpe_taps'], delay=exp['wpe_delay'],
+                            alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'],
+                            stft_shift=scene_base_config['wpe_stft_shift'], fp_cfg=fp_cfg, return_stats=True,
+                            n_iter=scene_base_config.get('wpe_n_iter', 1),
+                            refine_floor=scene_base_config.get('wpe_refine_floor', 0.0),
+                        )
+                    else:
+                        fp_cfg = FixedPointConfig.wordlength(
+                            fixed_bits, rounding=scene_base_config.get('wpe_fixed_round', 'nearest')
+                        )
+                        mic_signals_ready, fp_stats = process_wpe_online_fixed(
+                            u=mic_signals_degraded, taps=exp['wpe_taps'], delay=exp['wpe_delay'],
+                            alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'],
+                            stft_shift=scene_base_config['wpe_stft_shift'], fp_cfg=fp_cfg, return_stats=True,
+                            n_iter=scene_base_config.get('wpe_n_iter', 1),
+                            refine_floor=scene_base_config.get('wpe_refine_floor', 0.0),
+                        )
+                    # NOTE: for the QRD backend max|P| below is really max|L| (the
+                    # stored triangular factor); FxStats reuses the same field.
+                    tqdm.write(f"    [FP-STATS] overflow={fp_stats.overflow} max|P/L|={fp_stats.max_absP:.2e} "
                                f"max|G|={fp_stats.max_absG:.2e} diverged={fp_stats.diverged}")
                     # OPCION A (aproximacion documentada): el front-end fixed-point es NO
                     # lineal, asi que no admite descomposicion exacta. Las refs del oracle
@@ -698,7 +720,7 @@ if __name__ == "__main__":
     base_config = {
         'fs': 16000,
         'duration': 15,
-        't_early': 0.050,  # (50 ms)
+        't_early': 0.008,  # (50 ms)
         'array_center': [3.0, 3.0, 1.2], # Virtual translation anchor for SimAcoustic
         'mird_spacing': "3-3-3-8-3-3-3", # Target linear array spacing in the dataset
 
@@ -720,6 +742,10 @@ if __name__ == "__main__":
         # Change this value and re-run to sweep word length against MIRD metrics.
         'wpe_fixed_bits': None,   # <-- set to 24 (safe) / 20 / 18 to emulate fixed-point FPGA WPE
         'wpe_fixed_round': 'nearest',   # 'nearest' | 'floor'
+        # RLS back-end for the fixed-point path:
+        #   'cov' = covariance form R^-1 (default; hard cliff, needs 24 bit)
+        #   'qrd' = inverse-QRD square-root form (PSD-by-construction, stable ~16 bit)
+        'wpe_backend': 'cov',
 
         'stft_window': 512,
         'stft_overlap': 384,
@@ -758,16 +784,10 @@ if __name__ == "__main__":
     }
 
     processors_dict = {
-        "NM-MVDR_alpha_1_ref" : NM_MVDR(min_loading =1e-6, alpha = 1),
         "NM-MVDR_alpha_0.99_ref" : NM_MVDR(min_loading =1e-6, alpha = 0.99),
-        # Cota superior agnostica al modelo: misma cadena Souden pero con mascara ideal.
-        # SOFT (sharpen_exp=1.0, IRM continua) y HARD-EDGE (sharpen_exp=4.0, == **4 del DTLN).
-        "Oracle-MVDR_alpha_1" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 1, sharpen_exp=1.0),
+
         "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
-        "Oracle-MVDR_hard_alpha_1" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 1, sharpen_exp=4.0),
-        "Oracle-MVDR_hard_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=4.0),
-        "Slow"  : DTLN_MB_MVDR_SOUDEN_SLOW(),
-        "NM-MVDR_PF" : NM_MVDR_PF(smooth=0.33, min_loading=1e-6),
+
     }
 
 
@@ -776,7 +796,7 @@ if __name__ == "__main__":
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/with_ds",
+        output_dir="tests/dataset_out/ref_9ms",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )

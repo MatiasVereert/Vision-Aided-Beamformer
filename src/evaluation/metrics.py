@@ -178,9 +178,12 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                 sdr, sir, sar = _fast_sdr_sir_sar(speech_source, speech_prediction)
             except Exception:
                 sdr = sir = sar = np.nan
-            results['SDR'] = sdr
-            results['SIR'] = sir
-            results['SAR'] = sar
+            # BSS-Eval degenera a +/-inf cuando la interferencia (SIR) o los artefactos
+            # (SAR) se anulan exactamente -- casos casi perfectos a RT bajo. inf rompe
+            # las agregaciones (media/Delta), asi que se colapsan a NaN en la fuente.
+            results['SDR'] = sdr if np.isfinite(sdr) else np.nan
+            results['SIR'] = sir if np.isfinite(sir) else np.nan
+            results['SAR'] = sar if np.isfinite(sar) else np.nan
 
         else:
             # Fallback to single-source evaluation if secondary components are missing
@@ -202,8 +205,8 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
                 sdr, _sir_inf, sar = _fast_sdr_sir_sar(ref_crop[np.newaxis, :], deg_crop[np.newaxis, :])
             except Exception:
                 sdr = sar = np.nan
-            results['SDR'] = sdr
-            results['SAR'] = sar
+            results['SDR'] = sdr if np.isfinite(sdr) else np.nan
+            results['SAR'] = sar if np.isfinite(sar) else np.nan
             results['SIR'] = np.nan
 
     except Exception:
