@@ -40,7 +40,13 @@ from typing import Dict, Optional
 import numpy as np
 
 from nara_wpe.utils import stft, istft
-from nara_wpe.wpe import get_power_online
+from nara_wpe.wpe import (
+    get_power_online, build_y_tilde, get_power_inverse,
+    get_correlations_v6, perform_filter_operation_v5, hermite,
+)
+# Solve float del block (Hermitianiza + carga diagonal + LAPACK); lo reusamos
+# como nucleo del solve fixed (la parte de storage-precision la modelamos afuera).
+from dereverberation.nara_wrappers import _block_cholesky_solve, _block_load, block_wpe_warmup
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +165,32 @@ class FixedPointConfig:
     denom_fx: Fx = field(default_factory=Fx)   # scalar denominator format (default float / block-float)
     recip_fx: Fx = field(default_factory=Fx)   # reciprocal format      (default float / block-float)
     k_fx: Fx = field(default_factory=Fx)       # Kalman gain format     (default float / block-float)
+
+    # ---- BLOCK-FLOAT del BUFFER (path block-online / HLS) --------------------
+    # El buffer de L tramas es lo que domina la memoria on-chip. En vez de
+    # fixed uniforme (f("in")), que desperdicia bits en headroom por el enorme
+    # rango dinamico del STFT, se guarda block-float: un exponente COMPARTIDO
+    # entre los M microfonos de cada (t,f) + mantisa baja. Recupera el rango
+    # dinamico "gratis" y todos los bits de mantisa son precision util.
+    buffer_blockfloat: bool = False            # si True, el buffer se guarda block-float
+    buffer_mant_bits: Optional[int] = None     # bits de mantisa (signed) por componente I/Q
+    buffer_exp_bits: Optional[int] = None      # ancho del exponente compartido (None=ilimitado)
+
+    # ---- BLOCK-FLOAT del FILTRO G (otro storage persistente: se aplica cada frame) --
+    # G es (F, taps*M, M). Exponente compartido por (bin, canal de salida) sobre los
+    # taps*M coeficientes -> axis=1. OJO: G no es promediado como R y esta mal-
+    # condicionado (cond(R)^2), asi que tolera MENOS bajada de mantisa que el buffer.
+    g_blockfloat: bool = False
+    g_mant_bits: Optional[int] = None
+    g_exp_bits: Optional[int] = None
+
+    # ---- DATAPATH del SOLVE (factorizacion Cholesky + sustitucion) -----------
+    # Ancho de palabra INTERNO del solver (donde muerde cond(R)^2). None = float
+    # (usa el solve LAPACK del path float). Con un Fx real -> _block_cholesky_solve_fixed.
+    solve_fx: Fx = field(default_factory=Fx)
+    # Algoritmo del solve: "cholesky" (sobre R=A^H A, cond^2) o "qr" (Householder
+    # sobre la matriz de datos A, cond(A)=sqrt(cond(R)) -> ~la mitad de bits).
+    solve_method: str = "cholesky"
 
     # ---- factory helpers ---------------------------------------------------
     @classmethod
@@ -391,6 +423,351 @@ def process_wpe_online_fixed(u, taps=5, delay=1, alpha=0.9999,
     if gnorm != 1.0:
         z_time = z_time / gnorm
 
+    return (z_time, stats) if return_stats else z_time
+
+
+# ===========================================================================
+#  FIXED-POINT BLOCK-ONLINE WPE  (Opcion B: Cholesky por bloque)
+# ---------------------------------------------------------------------------
+# A diferencia del RLS, el block NO tiene estado recursivo (P). Lo que un FPGA
+# ALMACENA on-chip y define la precision/memoria es:
+#   * el BUFFER de ventana (STFT observado, L frames) -> formato cfg.f("in")
+#   * el filtro G (se aplica cada frame)               -> formato cfg.f("g")
+#   * (R es SCRATCH: se rearma por re-solve; su precision de datapath -> f("p"))
+#   * la salida/pred                                    -> formato cfg.f("pred")
+# Reusa la MISMA FixedPointConfig que el path online. Como el buffer se promedia
+# sobre L frames al formar R (~sqrt(L) de atenuacion de ruido) y el solve es
+# independiente + carga diagonal, el buffer tolera muchos MENOS bits que el audio
+# -> se puede poner cfg.f("in") a 8-10 bits y cfg.f("g") mas alto, y asi meter L
+# grande on-chip sin DDR. El solve/Cholesky se hace en float (modelamos la
+# precision de ALMACENAMIENTO, que es la que muerde memoria; no el datapath del
+# sqrt, que es guard-bit/block-float como en el online).
+# ===========================================================================
+
+
+def blockfloat_quantize(x, mant_bits, axis, exp_bits=None, stats=None):
+    """Cuantizacion block-floating-point de un arreglo complejo ``x``.
+
+    Un UNICO exponente (peso del LSB) se comparte sobre el grupo que se obtiene
+    reduciendo ``axis`` (p.ej. el eje de microfonos), independiente para cada
+    indice restante -> por cada (t,f) los M mics comparten exponente. Cada
+    componente real (I y Q) se guarda con ``mant_bits`` de mantisa signed en
+    complemento a 2; el exponente compartido corre la coma.
+
+    Modela EXACTAMENTE lo que se almacena on-chip: 2*M mantisas de ``mant_bits``
+    + 1 exponente por grupo. El aritmetico (outer products para R) sigue afuera
+    en el scratch ancho -> esto solo cambia el STORAGE, transparente al rebuild
+    de R y a las iteraciones.
+
+    Parameters
+    ----------
+    x : complex ndarray
+    mant_bits : int      -- bits de mantisa signed por componente (None = passthrough).
+    axis : int           -- eje a reducir para el exponente compartido (mics).
+    exp_bits : int|None  -- ancho del exponente almacenado; acota el rango de
+                            exponentes a 2**exp_bits pasos anclados al maximo
+                            global (modela la memoria del exponente). None = ilimitado.
+    stats : FxStats|None  -- cuenta saturaciones de mantisa (deberian ser ~0).
+    """
+    if mant_bits is None:
+        return x
+    re, im = x.real, x.imag
+    mag = np.maximum(np.abs(re), np.abs(im))
+    amax = np.max(mag, axis=axis, keepdims=True)                 # pico por grupo (t,f)
+    # Peso del LSB por grupo: el pico mapea a fondo de escala 2**(mant_bits-1).
+    with np.errstate(divide="ignore"):
+        e = np.ceil(np.log2(amax)) - (mant_bits - 1)
+    e = np.where(amax > 0, e, 0.0)
+    if exp_bits is not None:                                     # acota el rango del exponente
+        emax = float(np.max(e))
+        emin = emax - (2 ** exp_bits - 1)
+        e = np.clip(e, emin, emax)
+    scale = 2.0 ** (-e)
+    hi = 2.0 ** (mant_bits - 1) - 1.0
+    lo = -(2.0 ** (mant_bits - 1))
+
+    def _q(v):
+        vi = np.round(v * scale)
+        if stats is not None:
+            n = int(np.count_nonzero((vi > hi) | (vi < lo)))
+            if n:
+                stats.overflow += n
+        return np.clip(vi, lo, hi) / scale
+
+    return _q(re) + 1j * _q(im)
+
+
+def blockfloat_bits_per_complex(mant_bits, group_size, exp_bits):
+    """Bits/muestra-compleja del storage block-float: 2 mantisas + exp/grupo."""
+    return 2 * mant_bits + (exp_bits or 0) / float(group_size)
+
+
+def _block_cholesky_solve_fixed(R, P, reg, fx, rounding="nearest", saturate=True, stats=None):
+    """Resuelve R G = P por Cholesky con el DATAPATH INTERNO en punto fijo ``fx``.
+
+    Modela el ancho de palabra de la FACTORIZACION + SUSTITUCION (donde muerde
+    cond(R)^2), NO el storage de G (eso es aparte, en _estimate_block_filter_fixed).
+
+    Estructura fiel a HLS:
+      * Carga diagonal (reg) + Hermitianizacion en float (pre-datapath).
+      * ESCALA block-float por bin (potencia de 2 sobre diag_mean) -> mete R,P en
+        rango O(1). G es invariante al escalado (s.R)G=(s.P), asi que el escalado
+        NO cambia la solucion: solo separa RANGO (exponente) de SIGNIFICANCIA. El
+        `frac` de ``fx`` es entonces el knob puro de significancia -> revela el
+        piso por cond^2 (lo que block-float NO puede rescatar).
+      * k-sums acumuladas en float ancho (acumulador DSP); se cuantiza cada
+        L/z/G escrito (lo que iria a registro/BRAM ap_fixed) + las entradas R,P.
+      * sqrt/division cuantizadas al mismo formato (unidad CORDIC/recip del solve).
+
+    R:(F,N,N) Herm, P:(F,N,M). Devuelve G:(F,N,M).
+    """
+    F, N, _ = R.shape
+    M = P.shape[-1]
+    R = _block_load(R, reg, N)                              # Herm + carga diagonal (float)
+
+    # --- escala block-float por bin: diag_mean -> 2^-e para llevar R,P a O(1) ---
+    diag_mean = np.einsum('fii->f', R).real / N
+    e = np.where(diag_mean > 0, np.round(np.log2(np.maximum(diag_mean, 1e-30))), 0.0)
+    s = (2.0 ** (-e))[:, None, None]
+    Rs = fx.q(R * s, rounding, saturate, stats)            # R escalado y cuantizado al datapath
+    Ps = fx.q(P * s, rounding, saturate, stats)
+
+    def q(x):  return fx.q(x, rounding, saturate, stats)
+    def qr(x): return fx.q_real(x, rounding, saturate, stats)
+
+    # --- Cholesky (columna a columna, vectorizado sobre F) : Rs = L L^H ---
+    L = np.zeros((F, N, N), dtype=Rs.dtype)
+    for j in range(N):
+        if j > 0:
+            sd = Rs[:, j, j].real - (np.abs(L[:, j, :j]) ** 2).sum(axis=1)
+        else:
+            sd = Rs[:, j, j].real
+        res = fx.resolution()                              # 1 LSB del datapath
+        Ljj = qr(np.sqrt(np.maximum(sd, res * res)))       # cancelacion cond^2 -> aca duele
+        Ljj = np.maximum(Ljj, res)                         # piso de pivote (HW no divide por 0)
+        L[:, j, j] = Ljj
+        if j + 1 < N:
+            if j > 0:
+                acc = np.einsum('fik,fk->fi', L[:, j + 1:, :j], np.conjugate(L[:, j, :j]))
+            else:
+                acc = 0.0
+            L[:, j + 1:, j] = q((Rs[:, j + 1:, j] - acc) / Ljj[:, None])
+
+    # --- sustitucion adelante  L z = Ps ---
+    Z = np.zeros((F, N, M), dtype=Rs.dtype)
+    for i in range(N):
+        acc = np.einsum('fk,fkm->fm', L[:, i, :i], Z[:, :i, :]) if i > 0 else 0.0
+        Z[:, i, :] = q((Ps[:, i, :] - acc) / L[:, i, i][:, None])
+
+    # --- sustitucion atras  L^H G = z   (L^H[i,k] = conj(L[k,i])) ---
+    G = np.zeros((F, N, M), dtype=Rs.dtype)
+    for i in range(N - 1, -1, -1):
+        if i + 1 < N:
+            acc = np.einsum('fk,fkm->fm', np.conjugate(L[:, i + 1:, i]), G[:, i + 1:, :])
+        else:
+            acc = 0.0
+        G[:, i, :] = q((Z[:, i, :] - acc) / np.conjugate(L[:, i, i])[:, None])
+    # G resuelve (s.R)G=(s.P) == R G = P  -> NO hay que des-escalar.
+    return G
+
+
+def _block_qr_solve_fixed(A, B, reg, fx, rounding="nearest", saturate=True, stats=None):
+    """Resuelve min ||A G - B|| (== R G = P con R=A^H A, P=A^H B) por QR de
+    HOUSEHOLDER con datapath fijo ``fx``, en vez de Cholesky sobre R.
+
+    Ventaja clave: nunca forma R=A^H A, asi que trabaja en cond(A)=sqrt(cond(R))
+    -> ~la mitad de los bits que el Cholesky para el mismo reg. Las reflexiones
+    son ortogonales (preservan norma) => rango dinamico acotado, amigable a fixed.
+
+    A:(F,T,N) alto (T = ventana [+ N filas de regularizacion]), B:(F,T,M).
+    Devuelve G:(F,N,M).
+
+    Regularizacion: se AUMENTA A con N filas ``sqrt(load).I`` (y B con ceros),
+    load = reg * mean_k ||A[:,:,k]||^2 -> resuelve el mismo sistema Tikhonov que
+    el ``_block_load`` del Cholesky (R+load.I), pero sin elevar cond al cuadrado.
+
+    Fidelidad HLS: se cuantiza el vector de Householder ``v``, la fila triangular
+    finalizada de R y la fila transformada de B (lo que la QRD systolica carga en
+    fixed). Los acumuladores de la reflexion van en float ancho (celda DSP).
+    """
+    F, T, N = A.shape
+    Mm = B.shape[2]
+    on = fx.bits is not None
+    def q(x):  return fx.q(x, rounding, saturate, stats) if on else x
+    def qr_(x): return fx.q_real(x, rounding, saturate, stats) if on else x
+
+    # --- escala block-float por bin (rango O(1); G invariante al escalado) ---
+    rms = np.sqrt(np.mean(np.abs(A) ** 2, axis=(1, 2)))                 # (F,)
+    e = np.where(rms > 0, np.round(np.log2(np.maximum(rms, 1e-30))), 0.0)
+    s = (2.0 ** (-e))[:, None, None]
+    A = A * s
+    B = B * s
+
+    # --- filas de regularizacion sqrt(load).I (Tikhonov via QR) ---
+    load = reg * (np.abs(A) ** 2).sum(axis=1).mean(axis=1)              # (F,)
+    Ireg = np.sqrt(load)[:, None, None] * np.eye(N, dtype=A.dtype)[None]
+    R = q(np.concatenate([A, Ireg], axis=1))                           # (F, T+N, N)
+    Bt = q(np.concatenate([B, np.zeros((F, N, Mm), dtype=B.dtype)], axis=1))
+    Tt = T + N
+
+    # --- QR de Householder (por columna, vectorizado sobre F) ---
+    for k in range(N):
+        x = R[:, k:, k]                                                # (F, Tt-k)
+        nrm = np.sqrt((np.abs(x) ** 2).sum(axis=1))                    # (F,)
+        x0 = x[:, 0]
+        phase = np.where(np.abs(x0) > 1e-30, x0 / np.maximum(np.abs(x0), 1e-30), 1.0 + 0j)
+        alpha = -phase * nrm                                           # (F,) : |alpha|=||x||
+        v = x.copy()
+        v[:, 0] = x0 - alpha
+        vn2 = (np.abs(v) ** 2).sum(axis=1)                            # (F,)
+        beta = np.where(vn2 > 0, 2.0 / np.where(vn2 > 0, vn2, 1.0), 0.0)
+        v = q(v)
+        # reflexion H = I - beta v v^H aplicada al bloque restante y a B
+        w = np.einsum('ft,ftn->fn', np.conjugate(v), R[:, k:, k:])
+        R[:, k:, k:] -= beta[:, None, None] * v[:, :, None] * w[:, None, :]
+        wb = np.einsum('ft,ftm->fm', np.conjugate(v), Bt[:, k:, :])
+        Bt[:, k:, :] -= beta[:, None, None] * v[:, :, None] * wb[:, None, :]
+        # finalizar + cuantizar la fila triangular de R y la fila de B
+        R[:, k, k] = q(alpha)
+        if k + 1 < N:
+            R[:, k, k + 1:] = q(R[:, k, k + 1:])
+        R[:, k + 1:, k] = 0.0
+        Bt[:, k, :] = q(Bt[:, k, :])
+
+    # --- sustitucion atras: R[:N,:N] G = Bt[:N] ---
+    G = np.zeros((F, N, Mm), dtype=R.dtype)
+    for i in range(N - 1, -1, -1):
+        acc = np.einsum('fk,fkm->fm', R[:, i, i + 1:N], G[:, i + 1:, :]) if i + 1 < N else 0.0
+        G[:, i, :] = q((Bt[:, i, :] - acc) / R[:, i, i][:, None])
+    return G
+
+
+def _build_weighted_AB(Y_win, Y_tilde_win, inverse_power):
+    """Matriz de datos ponderada para el QR: A(F,T,N), B(F,T,M) tal que
+    A^H A = R y A^H B = P (mismos R,P que get_correlations_v6)."""
+    w = np.sqrt(np.maximum(inverse_power, 0.0))                        # (F, T)
+    A = (w[:, None, :] * np.conjugate(Y_tilde_win)).transpose(0, 2, 1)  # (F, T, KM)
+    B = (w[:, None, :] * np.conjugate(Y_win)).transpose(0, 2, 1)        # (F, T, D)
+    return np.ascontiguousarray(A), np.ascontiguousarray(B)
+
+
+def _estimate_block_filter_fixed(Y_win, Y_tilde_win, iterations, reg, cfg, stats):
+    rnd, sat = cfg.rounding, cfg.saturate
+    X = Y_win
+    G_float = None
+    
+    # We must calculate a noise floor relative to the LSB of the input format
+    # to prevent amplifying quantization noise during the inverse power weighting.
+    in_res = cfg.f("in").resolution()
+    power_floor = (in_res ** 2) * 10.0  # Guard margin above pure quantization noise
+    
+    use_qr = (cfg.solve_method == "qr")
+    for it in range(iterations):
+        # Calculate raw power, then apply the noise floor stabilization
+        power = np.mean(np.abs(X) ** 2, axis=-2)
+        power = np.maximum(power, power_floor)
+        inverse_power = 1.0 / power
+
+        if use_qr:
+            # QR sobre la matriz de datos ponderada (no forma R=A^H A -> cond(A)=sqrt(cond(R))).
+            A, B = _build_weighted_AB(Y_win, Y_tilde_win, inverse_power)
+            G_float = _block_qr_solve_fixed(A, B, reg, cfg.solve_fx,
+                                            rounding=rnd, saturate=sat, stats=stats)
+        else:
+            R, P = get_correlations_v6(Y_win, Y_tilde_win, inverse_power)
+            if stats is not None:
+                stats.max_absP = max(stats.max_absP, float(np.max(np.abs(R))) if R.size else 0.0)
+            # Solve: float (LAPACK) o datapath fijo (factorizacion Cholesky en fx).
+            if cfg.solve_fx.bits is not None:
+                G_float = _block_cholesky_solve_fixed(R, P, reg, cfg.solve_fx,
+                                                      rounding=rnd, saturate=sat, stats=stats)
+            else:
+                G_float = _block_cholesky_solve(R, P, reg=reg)
+        
+        # Keep G in float (or block-float datapath) for the intermediate target signal 
+        # to allow statistical convergence. Only the final G gets hard-quantized for BRAM.
+        if it < iterations - 1:
+            X = perform_filter_operation_v5(Y=Y_win, Y_tilde=Y_tilde_win, filter_matrix=G_float)
+            
+    # Apply storage precision quantization only once the filter has converged.
+    # G es storage persistente (se aplica cada frame) -> block-float opcional, con
+    # exponente compartido por (bin, canal de salida) sobre los taps*M coeficientes.
+    if cfg.g_blockfloat:
+        G_quantized = blockfloat_quantize(G_float, cfg.g_mant_bits, axis=1,
+                                          exp_bits=cfg.g_exp_bits, stats=stats)
+    else:
+        G_quantized = cfg.f("g").q(G_float, rnd, sat, stats)
+    
+    if stats is not None:
+        stats.max_absG = max(stats.max_absG, float(np.max(np.abs(G_quantized))) if G_quantized.size else 0.0)
+        
+    return G_quantized
+
+def process_wpe_block_online_fixed(u, taps=5, delay=1, L=256, block_shift=32,
+                                   iterations=3, reg=1e-6, stft_size=512, stft_shift=128,
+                                   fp_cfg: Optional[FixedPointConfig] = None,
+                                   return_stats: bool = False):
+    """Block-online WPE en punto fijo, drop-in de ``process_wpe_block_online``.
+
+    fp_cfg : precision de las cantidades ALMACENADAS (buffer f("in"), filtro
+    f("g"), correlacion f("p"), salida f("pred")). Usar por ej.
+    ``FixedPointConfig.wordlength(16)`` (uniforme) o construir una config con
+    f("in") mas baja que f("g") para estudiar buffer a 8-10 bits (la idea que
+    mete L=512 on-chip).
+    """
+    if fp_cfg is None:
+        fp_cfg = FixedPointConfig.wordlength(16)
+    stats = FxStats() if return_stats else None
+    rnd, sat = fp_cfg.rounding, fp_cfg.saturate
+
+    if u.ndim == 1:
+        u = u[np.newaxis, :]
+
+    Y = np.ascontiguousarray(stft(u, size=stft_size, shift=stft_shift).transpose(2, 0, 1))
+    F, D, T = Y.shape
+    warmup = taps + delay
+    if T < warmup + 1:
+        print("Warning: Signal is too short for block WPE with given taps and delay.")
+        return (u, stats) if return_stats else u
+
+    # Normalizacion de front-end (rangos fixed transferibles) + cuantizacion del
+    # BUFFER a f("in"): esta es la precision que domina la memoria on-chip.
+    gnorm = 1.0
+    if fp_cfg.normalize_target and fp_cfg.normalize_target > 0:
+        peak = float(np.max(np.abs(Y))) + 1e-12
+        gnorm = fp_cfg.normalize_target / peak
+        Y = Y * gnorm
+    # Cuantizacion del BUFFER (lo que domina la memoria on-chip). Y es (F, D, T),
+    # asi que axis=1 comparte exponente ENTRE MICROFONOS por cada (t,f).
+    if fp_cfg.buffer_blockfloat:
+        Y = blockfloat_quantize(Y, fp_cfg.buffer_mant_bits, axis=1,
+                                exp_bits=fp_cfg.buffer_exp_bits, stats=stats)
+    else:
+        Y = fp_cfg.f("in").q(Y, rnd, sat, stats)      # fixed uniforme (baseline)
+
+    Y_tilde = build_y_tilde(Y, taps, delay)
+    X = Y.copy()
+
+    min_window = max(warmup + 8, 4 * taps)
+    G_current = None
+    for t_r in range(warmup, T, block_shift):
+        lo = max(0, t_r - L)
+        if (t_r - lo) >= min_window:
+            G_current = _estimate_block_filter_fixed(
+                Y[:, :, lo:t_r], Y_tilde[:, :, lo:t_r], iterations, reg, fp_cfg, stats)
+        hi = min(t_r + block_shift, T)
+        if G_current is not None:
+            Xb = perform_filter_operation_v5(
+                Y=Y[:, :, t_r:hi], Y_tilde=Y_tilde[:, :, t_r:hi], filter_matrix=G_current)
+            X[:, :, t_r:hi] = fp_cfg.f("pred").q(Xb, rnd, sat, stats)
+
+    if stats is not None and not np.all(np.isfinite(X)):
+        stats.diverged = True
+
+    z_time = istft(X.transpose(1, 2, 0), size=stft_size, shift=stft_shift)
+    z_time = z_time[:, :u.shape[1]]
+    if gnorm != 1.0:
+        z_time = z_time / gnorm
     return (z_time, stats) if return_stats else z_time
 
 
