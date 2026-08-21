@@ -19,6 +19,29 @@ import numpy as np
 from numba import njit, prange
 # Asumo que importas stft, istft, online_wpe_step y get_power de nara_wpe
 
+# --- Control de threads BLAS para el block-online ---------------------------
+# Gancho opcional para limitar threads BLAS alrededor del loop pesado. Por
+# defecto None = NO tocar (se midio que en esta maquina el multithreading de
+# OpenBLAS ayuda para F=257 bins; forzar 1 thread perjudica). Se deja el gancho
+# por si en otra maquina/entorno la contencion invierte el balance.
+BLOCK_BLAS_THREADS = None
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except Exception:  # pragma: no cover
+    _threadpool_limits = None
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _blas_threads(n):
+    """Limita threads BLAS a n dentro del bloque (no-op si n es None o falta lib)."""
+    if n is None or _threadpool_limits is None:
+        yield
+    else:
+        with _threadpool_limits(limits=n):
+            yield
+
 
 # =====================================================================
 # CORE RECURSIVO (Numba). Reimplementa online_wpe_step frame-a-frame.
@@ -575,28 +598,42 @@ def _process_wpe_online_with_components_ref(u, components, taps=5, delay=1, alph
 # =====================================================================
 
 
-def _block_cholesky_solve(R, P, reg=1e-6):
-    """Resuelve R G = P por bin con Cholesky batcheado + carga diagonal.
+def _block_load(R, reg, N):
+    """Hermitianiza R y le suma carga diagonal relativa ``reg*mean(diag(R))``.
 
-    R: (F, N, N) Hermitiana (semi)definida-positiva.  P: (F, N, M).
-    Devuelve G: (F, N, M).
+    Garantiza definida-positividad (para el Cholesky) y condiciona R -equivalente
+    al diagonal loading del camino FPGA-. Con reg pequeno el efecto en float es
+    despreciable; su rol es robustez numerica.
+    """
+    R = 0.5 * (R + hermite(R))
+    diag_mean = np.einsum('fii->f', R).real / N
+    load = (reg * np.maximum(diag_mean, 1e-30))[:, None, None]
+    return R + load * np.eye(N, dtype=R.dtype)[None]
 
-    reg: carga diagonal RELATIVA. Se suma ``reg * mean(diag(R))`` a la diagonal
-    de cada bin -> garantiza definida-positividad para el Cholesky y condiciona
-    R (equivalente al diagonal loading del camino FPGA). Con reg pequeno el
-    efecto en float es despreciable; su rol es robustez numerica.
+
+def _block_cholesky_solve(R, P, reg=1e-6, explicit=False):
+    """Resuelve R G = P por bin con carga diagonal. R:(F,N,N) Herm PD, P:(F,N,M).
+
+    explicit=False (default, RAPIDO): np.linalg.solve batcheado (LAPACK). En float
+    es IDENTICO al Cholesky (R es PD por construccion tras la carga) y ~10x mas
+    rapido que la sustitucion explicita en un loop de muchas ventanas.
+
+    explicit=True (FIDELIDAD FPGA / debug): factoriza R = L L^H (Cholesky) y hace
+    sustitucion adelante/atras vectorizada -> hace literal el camino de hardware.
     """
     F, N, _ = R.shape
-    # Hermitianiza (limpia asimetrias por redondeo) y carga la diagonal.
-    R = 0.5 * (R + hermite(R))
-    diag_mean = np.einsum('fii->f', R).real / N          # traza/N por bin
-    load = (reg * np.maximum(diag_mean, 1e-30))[:, None, None]
-    R = R + load * np.eye(N, dtype=R.dtype)[None]
+    R = _block_load(R, reg, N)
 
+    if not explicit:
+        try:
+            return np.linalg.solve(R, P)
+        except np.linalg.LinAlgError:
+            return _stable_solve(R, P)
+
+    # --- Camino explicito: R = L L^H + sustitucion (mas lento) ---
     try:
         L = np.linalg.cholesky(R)                        # (F, N, N) triangular inferior
     except np.linalg.LinAlgError:
-        # Algun bin no quedo PD (ventana muy corta/singular): fallback robusto.
         return _stable_solve(R, P)
 
     # Sustitucion hacia adelante: L z = P   (L inferior)
@@ -620,24 +657,127 @@ def _block_cholesky_solve(R, P, reg=1e-6):
     return G
 
 
-def _estimate_block_filter(Y_win, Y_tilde_win, iterations, reg, solver):
+def _estimate_block_filter(Y_win, Y_tilde_win, iterations, reg, solver, G_init=None):
     """Estima el filtro WPE G sobre una ventana (F, D, Tw).
 
     Corre ``iterations`` pasos tipo-offline sobre la ventana: en cada uno
     re-estima 1/lambda desde el X actual, arma R,P (get_correlations_v6) y
-    resuelve R G = P. Devuelve G: (F, taps*D, D).
+    resuelve R G = P. Devuelve G: (F, taps*D, D). ``G_init`` (opcional) hace
+    warm-start de la potencia con el filtro del bloque anterior.
+
+    solver: "cholesky"/"lu" -> solve rapido LAPACK (mismo resultado en float);
+            "cholesky_explicit" -> Cholesky explicito + sustitucion (fidelidad FPGA).
     """
-    X = Y_win
+    explicit = (solver == "cholesky_explicit")
+    # WARM-START: si viene G_init (filtro del bloque anterior), la potencia de la
+    # 1ra iteracion se estima de la ventana YA dereverberada con ese filtro, en vez
+    # del reverberante crudo. En escena cuasi-estacionaria esto acerca iters=1 a la
+    # calidad de iters altos (la iteracion "continua" desde el bloque previo).
+    if G_init is not None:
+        X = perform_filter_operation_v5(Y=Y_win, Y_tilde=Y_tilde_win, filter_matrix=G_init)
+    else:
+        X = Y_win
     G = None
-    for _ in range(iterations):
+    for it in range(iterations):
         inverse_power = get_power_inverse(X)                     # (F, Tw)
         R, P = get_correlations_v6(Y_win, Y_tilde_win, inverse_power)
-        if solver == "cholesky":
-            G = _block_cholesky_solve(R, P, reg=reg)
-        else:
-            G = _stable_solve(R, P)
-        X = perform_filter_operation_v5(Y=Y_win, Y_tilde=Y_tilde_win, filter_matrix=G)
+        G = _block_cholesky_solve(R, P, reg=reg, explicit=explicit)
+        # El filtrado de la ventana solo sirve para re-estimar la potencia de la
+        # SIGUIENTE iteracion. En la ultima iteracion X se descarta (devolvemos G),
+        # asi que lo omitimos (ahorra ~25% del costo por-resolve, todo si iters=1).
+        if it < iterations - 1:
+            X = perform_filter_operation_v5(Y=Y_win, Y_tilde=Y_tilde_win, filter_matrix=G)
     return G
+
+
+def _block_filters(Y, Y_tilde, taps, delay, L, block_shift, iterations, reg, solver,
+                   warm_start=False):
+    """Scheduling de la Opcion B: lista de bloques (t_r, hi, G) sobre el eje T.
+
+    Para cada ancla ``t_r`` (en ``taps+delay, +block_shift, ...``) estima G a
+    partir de la ventana trailing ``[max(0,t_r-L), t_r)`` (SOLO de la mezcla Y) y
+    lo asocia al rango de salida ``[t_r, hi)``. Si la ventana todavia es mas corta
+    que ``min_window`` (arranque en frio) devuelve ``G=None`` para ese rango ->
+    bypass. El filtro se congela (reusa el ultimo G) hasta el proximo re-solve.
+
+    warm_start: si True, la estimacion de cada bloque arranca la potencia con el
+    filtro G del bloque ANTERIOR (continua la iteracion en vez de arrancar en
+    frio del reverberante). Barato y suele acercar iters=1 a iters altos.
+
+    Se factoriza aparte para que la version mezcla-sola y la version con
+    componentes compartan EXACTAMENTE el mismo G por bloque (garantiza
+    WPE(target)+WPE(ruido)==WPE(mezcla), igual que el par online).
+    """
+    F, D, T = Y.shape
+    warmup = taps + delay
+    min_window = max(warmup + 8, 4 * taps)
+    blocks = []
+    G_current = None
+    with _blas_threads(BLOCK_BLAS_THREADS):
+        for t_r in range(warmup, T, block_shift):
+            lo = max(0, t_r - L)
+            if (t_r - lo) >= min_window:
+                G_current = _estimate_block_filter(
+                    Y[:, :, lo:t_r], Y_tilde[:, :, lo:t_r],
+                    iterations=iterations, reg=reg, solver=solver,
+                    G_init=(G_current if warm_start else None),
+                )
+            hi = min(t_r + block_shift, T)
+            blocks.append((t_r, hi, G_current))
+    return blocks
+
+
+def _block_filters_sliding(Y, Y_tilde, taps, delay, L, block_shift, reg, solver):
+    """Version RAPIDA del scheduling: R,P por VENTANA DESLIZANTE con updates
+    incrementales O(block_shift) en vez de recomputar la correlacion sobre L
+    frames en cada ancla. Clave para barrer block_shift chico (a block_shift=2 y
+    L=256 evita ~128x de trabajo redundante en la correlacion).
+
+    Aproxima ``_block_filters`` con iterations=1 y potencia GLOBAL (una sola
+    estimacion de 1/lambda sobre toda la senal, en vez de por-ventana). La unica
+    diferencia con iterations=1 exacto es la normalizacion eps de la potencia
+    (despreciable, ~1e-6). NO soporta iterations>1 (el reweight por iteracion
+    rompe el sliding).
+
+    Deriva incremental en float64: R acumula terminos O(1) sobre ~L frames, el
+    add/sub por ancla introduce error relativo ~1e-16/op -> despreciable sobre
+    miles de anclas.
+    """
+    F, D, T = Y.shape
+    KM = taps * D
+    warmup = taps + delay
+    min_window = max(warmup + 8, 4 * taps)
+    explicit = (solver == "cholesky_explicit")
+
+    ip = get_power_inverse(Y)                     # (F, T) potencia inversa GLOBAL
+
+    def contrib(a, b):
+        """Suma de contribuciones a R,P sobre frames [a, b) (b>a)."""
+        W = Y_tilde[:, :, a:b] * ip[:, None, a:b]           # (F, KM, b-a)
+        R_ab = np.matmul(W, hermite(Y_tilde[:, :, a:b]))    # (F, KM, KM)
+        P_ab = np.matmul(W, hermite(Y[:, :, a:b]))          # (F, KM, D)
+        return R_ab, P_ab
+
+    R = np.zeros((F, KM, KM), dtype=Y.dtype)
+    P = np.zeros((F, KM, D), dtype=Y.dtype)
+    blocks = []
+    G_current = None
+    prev_lo = prev_hi = 0
+    with _blas_threads(BLOCK_BLAS_THREADS):
+        for t_r in range(warmup, T, block_shift):
+            lo = max(0, t_r - L)
+            # Deslizar la ventana: sumar frames nuevos [prev_hi, t_r), restar
+            # los que salieron [prev_lo, lo).
+            if t_r > prev_hi:
+                dR, dP = contrib(prev_hi, t_r); R += dR; P += dP
+            if lo > prev_lo:
+                dR, dP = contrib(prev_lo, lo); R -= dR; P -= dP
+            prev_lo, prev_hi = lo, t_r
+            if (t_r - lo) >= min_window:
+                G_current = _block_cholesky_solve(R, P, reg=reg, explicit=explicit)
+            hi = min(t_r + block_shift, T)
+            blocks.append((t_r, hi, G_current))
+    return blocks
 
 
 def block_wpe_warmup(taps, delay, L, block_shift, stft_shift):
@@ -670,9 +810,22 @@ def block_wpe_warmup(taps, delay, L, block_shift, stft_shift):
     return warm_frame, warm_frame * stft_shift
 
 
+def _dispatch_block_filters(Y, Y_tilde, taps, delay, L, block_shift,
+                            iterations, reg, solver, mode, warm_start=False):
+    """Elige el scheduler: 'resolve' (exacto, iterations>=1) o 'sliding' (rapido,
+    iterations=1 con potencia global e updates incrementales de R,P)."""
+    if mode == "sliding":
+        # sliding usa potencia global (iters=1); el warm-start por-bloque no aplica.
+        return _block_filters_sliding(Y, Y_tilde, taps, delay, L, block_shift,
+                                      reg, solver)
+    return _block_filters(Y, Y_tilde, taps, delay, L, block_shift,
+                          iterations, reg, solver, warm_start=warm_start)
+
+
 def process_wpe_block_online(u, taps=5, delay=1, L=256, block_shift=32,
                              iterations=3, reg=1e-6, solver="cholesky",
-                             stft_size=512, stft_shift=128, return_warmup=False):
+                             stft_size=512, stft_shift=128, return_warmup=False,
+                             mode="resolve", warm_start=False):
     """Block-online WPE (Opcion B) sobre senal multicanal en tiempo (M, N).
 
     Estima G resolviendo las ecuaciones normales sobre una ventana trailing de
@@ -686,20 +839,22 @@ def process_wpe_block_online(u, taps=5, delay=1, L=256, block_shift=32,
     taps, delay                -- orden del filtro de prediccion y retardo (guard).
     L : int                    -- largo de la ventana trailing de estadistica [frames].
     block_shift : int          -- cada cuantos frames se re-estima G [frames].
-    iterations : int           -- iteraciones tipo-offline por re-solve (>=1).
+    iterations : int           -- iteraciones tipo-offline por re-solve (>=1; solo mode='resolve').
     reg : float                -- carga diagonal relativa para el Cholesky.
-    solver : {"cholesky","lu"} -- metodo de solve (float: mismo resultado).
+    solver : {"cholesky","lu","cholesky_explicit"} -- solve LAPACK rapido vs Cholesky explicito (fidelidad FPGA).
     stft_size, stft_shift      -- parametros STFT (nara).
-    return_warmup : bool       -- si True, devuelve tambien la muestra de warmup
-                                  (primer frame con ventana llena de L). Descarta
-                                  ``z_time[:, :warmup]`` antes de medir metricas.
+    return_warmup : bool       -- si True, devuelve tambien la muestra de warmup.
+    mode : {"resolve","sliding"} -- 'resolve' recomputa la correlacion sobre L en
+                                  cada ancla (exacto, permite iterations>1).
+                                  'sliding' mantiene R,P por ventana deslizante
+                                  con updates O(block_shift) -> MUCHO mas rapido
+                                  para block_shift chico; equivale a iterations=1
+                                  con potencia global (aprox ~1e-6).
 
     Returns
     -------
     z_time : (M, N) real       -- mezcla dereverberada, recortada a la entrada.
-    warmup_sample : int        -- (solo si return_warmup) muestra desde la cual la
-                                  salida esta en regimen (ventana llena); ver
-                                  ``block_wpe_warmup``.
+    warmup_sample : int        -- (solo si return_warmup) muestra en regimen.
     """
     if u.ndim == 1:
         u = u[np.newaxis, :]
@@ -719,28 +874,14 @@ def process_wpe_block_online(u, taps=5, delay=1, L=256, block_shift=32,
 
     X = Y.copy()   # salida en STFT; arranca como copia (bypass en frio).
 
-    # Ventana minima para intentar un re-solve con sentido (algunos terminos
-    # validos por encima del arranque del regresor).
-    min_window = max(warmup + 8, 4 * taps)
-
-    G_current = None
-    # Anclas de re-solve: warmup, warmup+block_shift, ...
-    for t_r in range(warmup, T, block_shift):
-        lo = max(0, t_r - L)
-        win_len = t_r - lo
-        if win_len >= min_window:
-            G_current = _estimate_block_filter(
-                Y[:, :, lo:t_r], Y_tilde[:, :, lo:t_r],
-                iterations=iterations, reg=reg, solver=solver,
-            )
-        # Aplicar G (congelado) a los frames del bloque [t_r, t_r+block_shift).
-        hi = min(t_r + block_shift, T)
-        if G_current is not None:
+    # Bloques (t_r, hi, G) con G estimado sobre la ventana trailing de la mezcla.
+    for t_r, hi, G in _dispatch_block_filters(Y, Y_tilde, taps, delay, L, block_shift,
+                                              iterations, reg, solver, mode, warm_start):
+        if G is not None:
             X[:, :, t_r:hi] = perform_filter_operation_v5(
-                Y=Y[:, :, t_r:hi], Y_tilde=Y_tilde[:, :, t_r:hi],
-                filter_matrix=G_current,
+                Y=Y[:, :, t_r:hi], Y_tilde=Y_tilde[:, :, t_r:hi], filter_matrix=G,
             )
-        # si G_current es None (todavia sin ventana): X ya es copia de Y (bypass).
+        # si G es None (todavia sin ventana): X ya es copia de Y (bypass).
 
     # (F, M, T) -> (M, T, F) para istft, recortado a la entrada.
     z_time = istft(X.transpose(1, 2, 0), size=stft_size, shift=stft_shift)
@@ -749,3 +890,79 @@ def process_wpe_block_online(u, taps=5, delay=1, L=256, block_shift=32,
         _, warmup_sample = block_wpe_warmup(taps, delay, L, block_shift, stft_shift)
         return z_time, min(warmup_sample, z_time.shape[1])
     return z_time
+
+
+def process_wpe_block_online_with_components(u, components, taps=5, delay=1,
+                                             L=256, block_shift=32, iterations=3,
+                                             reg=1e-6, solver="cholesky",
+                                             stft_size=512, stft_shift=128,
+                                             mode="resolve", warm_start=False):
+    """Block-online WPE sobre ``u`` que ademas filtra cada senal de ``components``
+    con el MISMO filtro G por bloque estimado desde ``u`` (la mezcla).
+
+    Analogo block de ``process_wpe_online_with_components``. Como el filtro se
+    congela por bloque y su aplicacion (X = Y - G^H y_tilde) es LINEAL en la
+    entrada dado G, aplicar el mismo G (por bloque) al target y al ruido da una
+    descomposicion EXACTA: ``WPE(target)+WPE(ruido) == WPE(mezcla)`` (incluido el
+    arranque en frio, que copia sin procesar en mezcla y componentes por igual).
+    z_u es IDENTICO a ``process_wpe_block_online(u, ...)``.
+
+    Parameters
+    ----------
+    u : (M, N) real            -- mezcla multicanal en el dominio del tiempo.
+    components : list[(M, N)]   -- senales (target, ruido, ...) a filtrar con el G de u.
+    (resto de parametros: idem process_wpe_block_online)
+
+    Returns
+    -------
+    (z_u (M, N), [z_comp (M, N), ...])
+    """
+    if u.ndim == 1:
+        u = u[np.newaxis, :]
+
+    # STFT mezcla y componentes -> convencion batcheada (F, D, T).
+    Y = np.ascontiguousarray(stft(u, size=stft_size, shift=stft_shift).transpose(2, 0, 1))
+    Cs = [np.ascontiguousarray(stft(c, size=stft_size, shift=stft_shift).transpose(2, 0, 1))
+          for c in components]
+    F, D, T = Y.shape
+    T = min([T] + [C.shape[2] for C in Cs])
+    Y = Y[:, :, :T]
+    Cs = [C[:, :, :T] for C in Cs]
+
+    warmup = taps + delay
+    if T < warmup + 1:
+        print("Warning: Signal is too short for block WPE with given taps and delay.")
+        return u, list(components)
+
+    if len(Cs) == 0:
+        z_u = process_wpe_block_online(u, taps=taps, delay=delay, L=L,
+                                       block_shift=block_shift, iterations=iterations,
+                                       reg=reg, solver=solver, stft_size=stft_size,
+                                       stft_shift=stft_shift, mode=mode, warm_start=warm_start)
+        return z_u, []
+
+    # Regresores apilados (mezcla + cada componente), mismos taps/delay.
+    Y_tilde = build_y_tilde(Y, taps, delay)
+    Cs_tilde = [build_y_tilde(C, taps, delay) for C in Cs]
+
+    X = Y.copy()
+    Xc = [C.copy() for C in Cs]
+
+    # G se estima SOLO de la mezcla (Y); se aplica congelado a mezcla y componentes.
+    for t_r, hi, G in _dispatch_block_filters(Y, Y_tilde, taps, delay, L, block_shift,
+                                              iterations, reg, solver, mode, warm_start):
+        if G is None:
+            continue
+        X[:, :, t_r:hi] = perform_filter_operation_v5(
+            Y=Y[:, :, t_r:hi], Y_tilde=Y_tilde[:, :, t_r:hi], filter_matrix=G)
+        for k in range(len(Cs)):
+            Xc[k][:, :, t_r:hi] = perform_filter_operation_v5(
+                Y=Cs[k][:, :, t_r:hi], Y_tilde=Cs_tilde[k][:, :, t_r:hi], filter_matrix=G)
+
+    def _to_time(Xarr):
+        z = istft(Xarr.transpose(1, 2, 0), size=stft_size, shift=stft_shift)
+        return z[:, :u.shape[1]]
+
+    z_u = _to_time(X)
+    z_components = [_to_time(Xc[k]) for k in range(len(Xc))]
+    return z_u, z_components

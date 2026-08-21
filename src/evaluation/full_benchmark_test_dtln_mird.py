@@ -2,6 +2,7 @@ import os
 import time
 import itertools
 import hashlib
+from dataclasses import replace
 import h5py
 import pandas as pd
 import numpy as np
@@ -14,8 +15,13 @@ from evaluation.polar_plots import precompute_quantized_spatial_response, subsam
 from beamforming.array.microphone import Microphone
 from propagation.simulate_acoustics_v1 import SimAcoustic
 from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array
-from dereverberation.nara_wrappers import process_wpe_online, process_wpe_online_with_components
-from dereverberation.nara_wrappers_fixed import process_wpe_online_fixed, FixedPointConfig
+from dereverberation.nara_wrappers import (
+    process_wpe_online, process_wpe_online_with_components,
+    process_wpe_block_online_with_components, block_wpe_warmup,
+)
+from dereverberation.nara_wrappers_fixed import (
+    process_wpe_online_fixed, FixedPointConfig, Fx, process_wpe_block_online_fixed,
+)
 from dereverberation.qrd_wpe_fixed import process_qrd_wpe_online_fixed, QRDFixedPointConfig
 from evaluation.metrics import evaluate_full_pipeline
 
@@ -180,6 +186,20 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         grid_params['wpe_taps'] = [scene_base_config['wpe_taps']]
     if 'wpe_delay' not in grid_params:
         grid_params['wpe_delay'] = [scene_base_config['wpe_delay']]
+    # wpe_method selecciona el back-end del WPE: 'online' = RLS recursivo por-frame
+    # (default, comportamiento previo), 'block' = block-online con Cholesky por
+    # ventana trailing (Opcion B). Es un EJE de grilla mas (no reemplaza online):
+    # se pueden correr ambos en la misma corrida para compararlos.
+    if 'wpe_method' not in grid_params:
+        grid_params['wpe_method'] = [scene_base_config.get('wpe_method', 'online')]
+    # Sub-parametros del block-online (Opcion B) como ejes de grilla barreables:
+    # wpe_block_L (largo de la ventana trailing) y wpe_block_shift (refresco de G).
+    # Solo afectan a las celdas con wpe_method='block'; en las online se colapsan al
+    # default y se deduplican mas abajo (para no repetir corridas online identicas).
+    if 'wpe_block_L' not in grid_params:
+        grid_params['wpe_block_L'] = [scene_base_config.get('wpe_block_L', 512)]
+    if 'wpe_block_shift' not in grid_params:
+        grid_params['wpe_block_shift'] = [scene_base_config.get('wpe_block_shift', 64)]
     # source_path is now a grid axis too (target-speaker variety). Callers that do
     # not sweep it (E0, notebooks A/B/C) keep passing the scalar in scene_base_config;
     # promote it to a single-value list so every experiment dict carries it.
@@ -190,12 +210,30 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     keys, values = zip(*grid_params.items())
     experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
+    # 1b. DEDUP de sub-parametros condicionales del block. wpe_block_L/shift solo
+    # tienen sentido si wpe_method='block'; en las celdas online el producto
+    # cartesiano genera duplicados que solo difieren en esos campos irrelevantes.
+    # Se colapsan al default y se deduplica -> no se re-corren celdas online iguales.
+    _blk_L_def = scene_base_config.get('wpe_block_L', 512)
+    _blk_S_def = scene_base_config.get('wpe_block_shift', 64)
+    _seen, _dedup = set(), []
+    for e in experiments:
+        if e.get('wpe_method', 'online') != 'block':
+            e['wpe_block_L'] = _blk_L_def
+            e['wpe_block_shift'] = _blk_S_def
+        key = tuple(sorted((k, str(v)) for k, v in e.items()))
+        if key not in _seen:
+            _seen.add(key)
+            _dedup.append(e)
+    experiments = _dedup
+
     # 2. STRATEGIC SORTING (Crucial for cascaded caching adapted to MIRD)
     experiments.sort(key=lambda x: (
         x['rt60'], x['target_dist'], x['target_angle'], str(x['interf_configs']), x['source_path'], # Node 1: Physical Environment
         x['isir_db'],                                                             # Node 2: Mixture
         x['mismatch_gain'], x['mismatch_phase'],                                  # Node 3: Hardware
-        x['use_wpe'], x['wpe_taps'], x['wpe_delay'],                              # Node 4: Pre-processing (WPE; wpe_delay no longer feeds t_early)
+        x['use_wpe'], x['wpe_method'], x['wpe_taps'], x['wpe_delay'],             # Node 4: Pre-processing (WPE; wpe_delay no longer feeds t_early)
+        x['wpe_block_L'], x['wpe_block_shift'],                                   # Node 4: block sub-params
         x.get('error_angle_deg', 0.0), x.get('error_distance_m', 0.0)             # Node 5: Misinformation
     ))
 
@@ -226,7 +264,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     # --- CASCADING STATE VARIABLES ---
     current_rt60, current_target_dist, current_target_angle, current_interf_configs = None, None, None, None
     current_isir_db, current_gain_mismatch, current_phase_mismatch, current_use_wpe = None, None, None, None
-    current_wpe_taps, current_wpe_delay = None, None
+    current_wpe_taps, current_wpe_delay, current_wpe_method = None, None, None
+    current_wpe_block_L, current_wpe_block_shift = None, None
     current_source_path = None
 
     acoustic_scene, scene_data, mic_signals_degraded, mic_signals_ready = None, None, None, None
@@ -270,8 +309,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         recalc_hardware = recalc_mixture or (exp['mismatch_gain'] != current_gain_mismatch or
                                              exp['mismatch_phase'] != current_phase_mismatch)
         recalc_wpe = recalc_hardware or (exp['use_wpe'] != current_use_wpe or
+                                         exp.get('wpe_method', 'online') != current_wpe_method or
                                          exp['wpe_taps'] != current_wpe_taps or
-                                         exp['wpe_delay'] != current_wpe_delay)
+                                         exp['wpe_delay'] != current_wpe_delay or
+                                         exp.get('wpe_block_L') != current_wpe_block_L or
+                                         exp.get('wpe_block_shift') != current_wpe_block_shift)
 
         # ---------------------------------------------------------
         # NODE 1: GEOMETRY AND PHYSICS (MIRD DATASET IMPORT)
@@ -425,8 +467,104 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 stft_shift=scene_base_config['wpe_stft_shift'],
             )
             if exp['use_wpe']:
+                wpe_method = exp.get('wpe_method', 'online')
                 fixed_bits = scene_base_config.get('wpe_fixed_bits', None)
-                if fixed_bits is None:
+                if wpe_method == 'block':
+                    # ---- OPCION B: BLOCK-ONLINE con Cholesky (float) ----
+                    # Estima G resolviendo las ecuaciones normales sobre una ventana
+                    # trailing de L frames pasados, refresca cada block_shift, y aplica
+                    # G causal congelado. La descomposicion del oracle es EXACTA (el
+                    # block es lineal dado G): usa el _with_components analogo al online.
+                    # L y block_shift vienen del experimento (ejes de grilla
+                    # barreables); iters/reg/solver siguen siendo escalares de config.
+                    _L = exp.get('wpe_block_L', scene_base_config.get('wpe_block_L', 512))
+                    _bs = exp.get('wpe_block_shift', scene_base_config.get('wpe_block_shift', 64))
+                    _iters = scene_base_config.get('wpe_block_iters', 3)
+                    _reg = scene_base_config.get('wpe_block_reg', 1e-6)
+                    _stft = dict(stft_size=scene_base_config['wpe_stft_size'],
+                                 stft_shift=scene_base_config['wpe_stft_shift'])
+                    if fixed_bits is None:
+                        block_kw = dict(
+                            L=_L, block_shift=_bs, iterations=_iters, reg=_reg,
+                            solver=scene_base_config.get('wpe_block_solver', 'cholesky'),
+                            mode=scene_base_config.get('wpe_block_mode', 'resolve'),
+                            warm_start=scene_base_config.get('wpe_block_warm_start', False),
+                        )
+                        tqdm.write(f" -> [NODE 4] Applying BLOCK-online WPE (float): "
+                                   f"taps={exp['wpe_taps']} delay={exp['wpe_delay']} {block_kw}...")
+                        mic_signals_ready, (oracle_target, oracle_noise) = process_wpe_block_online_with_components(
+                            u=mic_signals_degraded,
+                            components=[hw_oracle_target, hw_oracle_noise],
+                            taps=exp['wpe_taps'], delay=exp['wpe_delay'], **_stft, **block_kw)
+                    else:
+                        # ---- BLOCK FIXED-POINT: cuantiza buffer(in)/filtro(g)/salida(pred).
+                        # g/p necesitan headroom (G del block ~1-2 con reg alto; sube reg
+                        # p/ acotar G -> usar wpe_block_reg~1e-2 en el fixed). window_bits
+                        # opcional baja SOLO el buffer (idea on-chip para L grande).
+                        ibits = scene_base_config.get('wpe_block_int_bits', {'in': 1, 'pred': 1, 'g': 6, 'p': 6})
+                        fp_cfg = FixedPointConfig.wordlength(fixed_bits, int_bits=ibits)
+                        # BLOCK-FLOAT del buffer (exponente compartido entre mics): idea HLS
+                        # para igualar float+L512 con menos memoria. Tiene prioridad sobre wb.
+                        bf_mant = scene_base_config.get('wpe_block_window_mant', None)
+                        wb = scene_base_config.get('wpe_block_window_bits', None)
+                        if bf_mant is not None:
+                            fp_cfg = replace(fp_cfg, buffer_blockfloat=True,
+                                             buffer_mant_bits=bf_mant,
+                                             buffer_exp_bits=scene_base_config.get('wpe_block_window_exp', None))
+                            buf_desc = f"bf-mant{bf_mant}"
+                        elif wb is not None:
+                            fmts = dict(fp_cfg.formats)
+                            fmts['in'] = Fx(wb, max(0, wb - 1 - ibits['in']))
+                            fp_cfg = replace(fp_cfg, formats=fmts)
+                            buf_desc = f"{wb}b"
+                        else:
+                            buf_desc = f"{fixed_bits}b"
+                        # BLOCK-FLOAT del filtro G (storage persistente aparte del buffer).
+                        g_mant = scene_base_config.get('wpe_block_g_mant', None)
+                        if g_mant is not None:
+                            fp_cfg = replace(fp_cfg, g_blockfloat=True, g_mant_bits=g_mant,
+                                             g_exp_bits=scene_base_config.get('wpe_block_g_exp', None))
+                            g_desc = f"bf-mant{g_mant}"
+                        else:
+                            g_desc = f"{fixed_bits}b"
+                        # DATAPATH del SOLVE (Cholesky interno) en punto fijo.
+                        sb = scene_base_config.get('wpe_block_solve_bits', None)
+                        smeth = scene_base_config.get('wpe_block_solve_method', 'cholesky')
+                        if sb is not None:
+                            si = scene_base_config.get('wpe_block_solve_int', 12)
+                            fp_cfg = replace(fp_cfg, solve_fx=Fx(sb, max(0, sb - 1 - si)),
+                                             solve_method=smeth)
+                            s_desc = f"{smeth}/{sb}b(int{si})"
+                        else:
+                            fp_cfg = replace(fp_cfg, solve_method=smeth)
+                            s_desc = f"{smeth}/float"
+                        tqdm.write(f" -> [NODE 4] Applying BLOCK-online WPE (FIXED {fixed_bits}b, "
+                                   f"buffer={buf_desc}, G={g_desc}, solve={s_desc}, reg={_reg:.0e}): taps={exp['wpe_taps']}...")
+                        mic_signals_ready, fp_stats = process_wpe_block_online_fixed(
+                            u=mic_signals_degraded, taps=exp['wpe_taps'], delay=exp['wpe_delay'],
+                            L=_L, block_shift=_bs, iterations=_iters, reg=_reg,
+                            fp_cfg=fp_cfg, return_stats=True, **_stft)
+                        tqdm.write(f"    [FP-STATS block] overflow={fp_stats.overflow} "
+                                   f"max|G|={fp_stats.max_absG:.2e} diverged={fp_stats.diverged}")
+                        # Oracle refs por descomposicion FLOAT (Opcion A, como el online fixed).
+                        _, (oracle_target, oracle_noise) = process_wpe_block_online_with_components(
+                            u=mic_signals_degraded,
+                            components=[hw_oracle_target, hw_oracle_noise],
+                            taps=exp['wpe_taps'], delay=exp['wpe_delay'], reg=_reg,
+                            L=_L, block_shift=_bs, iterations=_iters, **_stft)
+                    block_kw = dict(L=_L, block_shift=_bs)  # para el warmup check de abajo
+                    # La ventana de metricas (eval_start_s) debe empezar DESPUES del
+                    # warmup del block (primera ventana llena de L frames), o el
+                    # transitorio en frio contamina las metricas.
+                    _, warm_s = block_wpe_warmup(exp['wpe_taps'], exp['wpe_delay'],
+                                                 block_kw['L'], block_kw['block_shift'],
+                                                 scene_base_config['wpe_stft_shift'])
+                    warm_t = warm_s / scene_base_config['fs']
+                    if warm_t > eval_start_s:
+                        tqdm.write(f"    [WARN] warmup del block {warm_t:.2f}s > eval_start "
+                                   f"{eval_start_s:.2f}s: subi 'duration'/eval_start o baja "
+                                   f"wpe_block_L para no medir el arranque en frio.")
+                elif fixed_bits is None:
                     tqdm.write(" -> [NODE 4] Applying WPE pre-processing (float)...")
                     # Un solo pase de WPE que devuelve la mezcla dereverberada Y las
                     # componentes target/ruido filtradas con el MISMO G (estimado de la
@@ -509,8 +647,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             scene_base_config['oracle_noise'] = oracle_noise
 
             current_use_wpe = exp['use_wpe']
+            current_wpe_method = exp.get('wpe_method', 'online')
             current_wpe_taps = exp['wpe_taps']
             current_wpe_delay = exp['wpe_delay']  # tracked here now that t_early is fixed
+            current_wpe_block_L = exp.get('wpe_block_L')
+            current_wpe_block_shift = exp.get('wpe_block_shift')
 
             # ---------------------------------------------------------
             # NODE 4.5: SINGLE-MIC DTLN
@@ -605,9 +746,15 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 "mismatch_gain": exp['mismatch_gain'],
                 "mismatch_phase": exp['mismatch_phase'],
                 "use_wpe": exp['use_wpe'],
+                "wpe_method": exp.get('wpe_method', 'online'),
                 "wpe_taps": exp['wpe_taps'],
                 "wpe_delay": exp['wpe_delay'],
                 "wpe_bits": scene_base_config.get('wpe_fixed_bits', None),
+                # Sub-parametros del block (desde el experimento; None si online).
+                "wpe_block_L": (exp.get('wpe_block_L')
+                                if exp.get('wpe_method', 'online') == 'block' else None),
+                "wpe_block_shift": (exp.get('wpe_block_shift')
+                                    if exp.get('wpe_method', 'online') == 'block' else None),
                 "error_angle_deg": err_ang,
                 "error_distance_m": err_dist,
                 "t_early_s": t_early_dynamic,
@@ -747,6 +894,21 @@ if __name__ == "__main__":
         #   'qrd' = inverse-QRD square-root form (PSD-by-construction, stable ~16 bit)
         'wpe_backend': 'cov',
 
+        # --- Block-online (Opcion B) sub-parametros (solo se usan si wpe_method='block') ---
+        # Estos son escalares (constantes en toda la corrida). Para barrerlos habria que
+        # promoverlos a ejes de grilla como wpe_taps/wpe_delay. OJO: el warmup del block
+        # (~L frames = wpe_block_L*shift muestras) debe caer DENTRO de eval_start_s
+        # (=min(5s, 0.3*duration)); con L=512 son ~4.2s < 4.5s -> ok con duration>=15.
+        'wpe_block_L': 512,          # ventana trailing de estadistica [frames]
+        'wpe_block_shift':2,       # refresco de G [frames]
+        'wpe_block_iters': 2,        # iteraciones tipo-offline por re-solve (solo mode='resolve')
+        'wpe_block_reg': 1e-6,       # carga diagonal relativa (Cholesky)
+        'wpe_block_solver': 'cholesky',   # 'cholesky'/'lu'=solve LAPACK rapido; 'cholesky_explicit'=fidelidad FPGA
+        # mode: 'resolve' (exacto, respeta wpe_block_iters) | 'sliding' (MUCHO mas
+        # rapido para block_shift chico; equivale a iters=1 con potencia global).
+        # Recomendado 'sliding' para barridos de block_shift chico.
+        'wpe_block_mode': 'resolve',
+
         'stft_window': 512,
         'stft_overlap': 384,
 
@@ -773,11 +935,23 @@ if __name__ == "__main__":
         'mismatch_phase': [0],
         'use_wpe': [True],
 
+        # Back-end del WPE como eje de grilla: corre 'online' (RLS) y 'block'
+        # (Opcion B, Cholesky) en la MISMA corrida para compararlos. Si se omite,
+        # cae al escalar de base_config ('wpe_method', default 'online').
+        'wpe_method': ['online', 'block'],
+
+        # Sub-parametros del block como ejes barreables (solo afectan celdas 'block';
+        # en 'online' se colapsan al default de base_config y se deduplican). Ej. para
+        # barrer el largo de ventana y buscar el minimo que entra en memoria interna:
+        #   'wpe_block_L': [512, 256, 128, 96, 64],
+        #   'wpe_block_shift': [20],
+        # Si se omiten, caen a los escalares de base_config (wpe_block_L/shift).
+
         # WPE hyper-parameter sweep (NEW grid axes).
         # If omitted, run_mird_grid_search falls back to the scalar values in
         # base_config (wpe_taps / wpe_delay), preserving old A/B/C behaviour.
-        'wpe_taps': [3, 7, 10],
-        'wpe_delay': [1, 2, 3],
+        'wpe_taps': [10],
+        'wpe_delay': [ 2],
 
         'error_angle_deg': [0.0],
         'error_distance_m': [0.0]
@@ -786,7 +960,7 @@ if __name__ == "__main__":
     processors_dict = {
         "NM-MVDR_alpha_0.99_ref" : NM_MVDR(min_loading =1e-6, alpha = 0.99),
 
-        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
+       # "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
 
     }
 
@@ -796,7 +970,7 @@ if __name__ == "__main__":
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/ref_9ms",
+        output_dir="tests/dataset_out/block_wpe",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )
@@ -805,7 +979,7 @@ if __name__ == "__main__":
 
     cols_to_show = [
         "processor", "rt60", "target_angle", "interf_configs", "use_wpe",
-        "wpe_taps", "wpe_delay",
+        "wpe_method", "wpe_taps", "wpe_delay",
         "error_angle_deg", "Delta_tot_PESQ_early", "Delta_tot_SIR_early"
     ]
 
