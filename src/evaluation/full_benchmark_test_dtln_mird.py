@@ -867,7 +867,7 @@ if __name__ == "__main__":
     base_config = {
         'fs': 16000,
         'duration': 15,
-        't_early': 0.008,  # (50 ms)
+        't_early': 0.050,  # (50 ms)
         'array_center': [3.0, 3.0, 1.2], # Virtual translation anchor for SimAcoustic
         'mird_spacing': "3-3-3-8-3-3-3", # Target linear array spacing in the dataset
 
@@ -930,15 +930,15 @@ if __name__ == "__main__":
             [(45, 1.0)],
         ],
 
-        'isir_db': [3],
+        'isir_db': [-5],
         'mismatch_gain': [0],
         'mismatch_phase': [0],
-        'use_wpe': [True],
+        'use_wpe': [True, False],
 
         # Back-end del WPE como eje de grilla: corre 'online' (RLS) y 'block'
         # (Opcion B, Cholesky) en la MISMA corrida para compararlos. Si se omite,
         # cae al escalar de base_config ('wpe_method', default 'online').
-        'wpe_method': ['online', 'block'],
+        'wpe_method': ['online'],
 
         # Sub-parametros del block como ejes barreables (solo afectan celdas 'block';
         # en 'online' se colapsan al default de base_config y se deduplican). Ej. para
@@ -950,7 +950,7 @@ if __name__ == "__main__":
         # WPE hyper-parameter sweep (NEW grid axes).
         # If omitted, run_mird_grid_search falls back to the scalar values in
         # base_config (wpe_taps / wpe_delay), preserving old A/B/C behaviour.
-        'wpe_taps': [10],
+        'wpe_taps': [7],
         'wpe_delay': [ 2],
 
         'error_angle_deg': [0.0],
@@ -958,9 +958,12 @@ if __name__ == "__main__":
     }
 
     processors_dict = {
-        "NM-MVDR_alpha_0.99_ref" : NM_MVDR(min_loading =1e-6, alpha = 0.99),
+        "DS" :DS(),
+        "NM-MVDR_alpha_0.99_ref_1e-9" : NM_MVDR(min_loading =1e-6, alpha = 0.99),
+        "NM-MVDR_alpha_0.99_ref_1e-3" : NM_MVDR(min_loading =1e-3, alpha = 0.99),
+        "NM-MVDR_alpha_0.99_ref_1e-2" : NM_MVDR(min_loading =1e-2, alpha = 0.99),
 
-       # "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
+       "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
 
     }
 
@@ -970,7 +973,7 @@ if __name__ == "__main__":
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/block_wpe",
+        output_dir="tests/dataset_out/loading_low_snr",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )

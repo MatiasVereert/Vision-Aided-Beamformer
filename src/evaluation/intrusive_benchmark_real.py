@@ -52,6 +52,19 @@ from evaluation.bf_wrappers import (
     SOUDEN_ORACLE_SCM,
 )
 
+# --- WPE block-online orientado a HW (modulo standalone, fuera del arbol src) ---
+# Es el WPE hardware-oriented que se quiere validar contra el online RLS ya presente.
+# Agrega g_delay_blocks (latencia del pipeline HW) sobre el block de nara_wrappers.
+WPE_BLOCK_DIR = os.environ.get(
+    "WPE_BLOCK_PY", "/home/matias/Documents/Tesis/wpe/wpe_block/python")
+if WPE_BLOCK_DIR not in sys.path:
+    sys.path.insert(0, WPE_BLOCK_DIR)
+from wpe_block_float import (  # noqa: E402
+    process_wpe_block_online_with_components as process_wpe_block_hw,
+    process_wpe_block_online as process_wpe_block_hw_mix,
+    block_wpe_warmup as block_wpe_warmup_hw,
+)
+
 
 def load_multi(path):
     data, fs = sf.read(path, dtype="float64", always_2d=True)  # (N, M)
@@ -78,7 +91,62 @@ def default_base_config(fs):
         # None => float. 24/20/18 => emulacion fixed-point FPGA.
         "wpe_fixed_bits": None,
         "wpe_fixed_round": "nearest",
+
+        # --- Backend del WPE: 'online' = RLS recursivo por-frame (nara), 'block'
+        #     = block-online orientado a HW (wpe_block_float, Opcion B). ---
+        "wpe_method": "online",
+        # sub-parametros del block (solo se usan si wpe_method='block'):
+        "wpe_block_L": 512,          # ventana trailing de estadistica [frames]
+        "wpe_block_shift": 64,       # cada cuantos frames se re-estima G [frames]
+        "wpe_block_iters": 3,        # iteraciones tipo-offline por re-solve (mode='resolve')
+        "wpe_block_reg": 1e-6,       # carga diagonal relativa del Cholesky
+        "wpe_block_solver": "cholesky",   # cholesky | lu | cholesky_explicit
+        "wpe_block_mode": "resolve",      # resolve (exacto) | sliding (aprox rapido)
+        "wpe_block_warm_start": False,    # warm-start de la potencia con el G previo
+        "wpe_block_g_delay": 0,      # latencia del pipeline HW en bloques (0=batch, 1=piso real)
     }
+
+
+def _wpe_decompose(u, components, base_config):
+    """Aplica WPE (con descomposicion de componentes) segun ``wpe_method``.
+
+    Estima G desde la mezcla ``u`` y filtra ``u`` + cada componente con el MISMO G
+    (Opcion B: descomposicion exacta). Despacha al RLS online de nara o al
+    block-online HW (wpe_block_float) segun ``base_config['wpe_method']``.
+
+    Returns (mix_wpe (M,N), [comp_wpe (M,N), ...], warm_sample) donde warm_sample
+    es la primera muestra en regimen (0 para el online; frontera del block).
+    """
+    method = base_config.get("wpe_method", "online")
+    common = dict(
+        taps=base_config["wpe_taps"], delay=base_config["wpe_delay"],
+        stft_size=base_config["wpe_stft_size"], stft_shift=base_config["wpe_stft_shift"],
+    )
+    if method == "block":
+        L = base_config.get("wpe_block_L", 512)
+        bs = base_config.get("wpe_block_shift", 64)
+        g_delay = base_config.get("wpe_block_g_delay", 0)
+        block_kw = dict(
+            L=L, block_shift=bs,
+            iterations=base_config.get("wpe_block_iters", 3),
+            reg=base_config.get("wpe_block_reg", 1e-6),
+            solver=base_config.get("wpe_block_solver", "cholesky"),
+            mode=base_config.get("wpe_block_mode", "resolve"),
+            warm_start=base_config.get("wpe_block_warm_start", False),
+            g_delay_blocks=g_delay,
+        )
+        print(f"[*] [WPE] BLOCK-online HW (float): taps={common['taps']} "
+              f"delay={common['delay']} {block_kw}")
+        mix, comps = process_wpe_block_hw(u=u, components=components, **common, **block_kw)
+        _, warm_sample = block_wpe_warmup_hw(
+            common["taps"], common["delay"], L, bs, common["stft_shift"], g_delay)
+        return mix, comps, warm_sample
+
+    print(f"[*] [WPE] ONLINE RLS (float): taps={common['taps']} delay={common['delay']} "
+          f"alpha={base_config['wpe_alpha']}")
+    mix, comps = process_wpe_online_with_components(
+        u=u, components=components, alpha=base_config["wpe_alpha"], **common)
+    return mix, comps, 0
 
 
 def apply_wpe(mixture_nm, base_config, label="la mezcla multicanal"):
@@ -91,7 +159,26 @@ def apply_wpe(mixture_nm, base_config, label="la mezcla multicanal"):
     """
     u = mixture_nm.T  # (M, N)
     fixed_bits = base_config.get("wpe_fixed_bits", None)
+    method = base_config.get("wpe_method", "online")
     if fixed_bits is None:
+        if method == "block":
+            print(f"[*] [WPE] Aplicando BLOCK-online HW (float) sobre {label}...")
+            y = process_wpe_block_hw_mix(
+                u=u,
+                taps=base_config["wpe_taps"], delay=base_config["wpe_delay"],
+                L=base_config.get("wpe_block_L", 512),
+                block_shift=base_config.get("wpe_block_shift", 64),
+                iterations=base_config.get("wpe_block_iters", 3),
+                reg=base_config.get("wpe_block_reg", 1e-6),
+                solver=base_config.get("wpe_block_solver", "cholesky"),
+                mode=base_config.get("wpe_block_mode", "resolve"),
+                warm_start=base_config.get("wpe_block_warm_start", False),
+                g_delay_blocks=base_config.get("wpe_block_g_delay", 0),
+                stft_size=base_config["wpe_stft_size"],
+                stft_shift=base_config["wpe_stft_shift"],
+            )
+            fp_stats = None
+            return y.T, fp_stats
         print(f"[*] [WPE] Aplicando WPE (float) sobre {label}...")
         y = process_wpe_online(
             u=u,
@@ -101,6 +188,11 @@ def apply_wpe(mixture_nm, base_config, label="la mezcla multicanal"):
         )
         fp_stats = None
     else:
+        if method == "block":
+            raise NotImplementedError(
+                "WPE block-online en fixed-point no esta cableado en este benchmark "
+                "(usar wpe_method='online' para el front-end fixed, o wpe_method='block' "
+                "solo en float con --wpe sin --wpe-bits).")
         print(f"[*] [WPE] Aplicando WPE (FIXED-POINT {fixed_bits}-bit, emulacion FPGA) sobre {label}...")
         fp_cfg = FixedPointConfig.wordlength(
             fixed_bits, rounding=base_config.get("wpe_fixed_round", "nearest")
@@ -224,21 +316,28 @@ def run_intrusive_benchmark(senal_path, ruido_path, output_dir="intrusive_out",
     #    evaluacion es 'wpe' (comun a ambas ramas). Se estima G sobre la mezcla CRUDA y
     #    se aplica el mismo filtro al target/ruido (Opcion B, descomposicion exacta).
     want_wpe_target = use_wpe or (eval_ref_mode == "wpe")
+    wpe_method = base_config.get("wpe_method", "online")
     ref_wpe = None
     tgt_wpe = noi_wpe = mix_wpe = None
     if want_wpe_target:
         if fixed_bits is not None:
             print("[!] [WPE] eval_ref_mode='wpe'/float-only: la descomposicion consistente es "
                   "float; el target de referencia se computa en float aunque el front-end sea fixed.")
-        print("[*] [WPE] WPE float con descomposicion consistente (mezcla + target/ruido)...")
-        _mix_wpe_mn, (tgt_wpe, noi_wpe) = process_wpe_online_with_components(
-            u=mixture.T, components=[oracle_target, oracle_noise],
-            taps=base_config["wpe_taps"], delay=base_config["wpe_delay"],
-            alpha=base_config["wpe_alpha"], stft_size=base_config["wpe_stft_size"],
-            stft_shift=base_config["wpe_stft_shift"],
-        )
+        print(f"[*] [WPE] WPE float ({wpe_method}) con descomposicion consistente (mezcla + target/ruido)...")
+        _mix_wpe_mn, (tgt_wpe, noi_wpe), wpe_warm_sample = _wpe_decompose(
+            u=mixture.T, components=[oracle_target, oracle_noise], base_config=base_config)
         mix_wpe = _mix_wpe_mn.T  # (N, M)
         ref_wpe = np.ascontiguousarray(tgt_wpe[ref_mic], dtype=np.float64)
+
+        # El block tiene un transitorio de warmup (primera ventana llena de L frames,
+        # + latencia g_delay). Si eval_start_s cae antes de esa frontera, el arranque
+        # en frio contamina las metricas -> se corre eval_start_s al warmup del block.
+        if wpe_method == "block" and wpe_warm_sample > 0:
+            warm_s = wpe_warm_sample / fs
+            if warm_s > eval_start_s:
+                print(f"[*] [WPE block] eval_start_s {eval_start_s:.2f}s -> {warm_s:.2f}s "
+                      f"(frontera de warmup del block; muestra {wpe_warm_sample})")
+                eval_start_s = warm_s
 
     # Mezcla que consumen los beamformers + refs oracle EN EL MISMO DOMINIO que esa mezcla.
     fp_stats = None
@@ -388,6 +487,27 @@ def main():
                     help="modo de redondeo fixed-point de la WPE (default nearest)")
     ap.add_argument("--wpe-taps", type=int, default=7, help="taps de la WPE (default 7)")
     ap.add_argument("--wpe-delay", type=int, default=3, help="delay de la WPE (default 3)")
+    ap.add_argument("--wpe-method", default="online", choices=["online", "block"],
+                    help="backend WPE: 'online' (RLS recursivo, nara) o 'block' "
+                         "(block-online HW, wpe_block_float). default online")
+    # --- sub-parametros del block-online (solo con --wpe-method block) ---
+    ap.add_argument("--wpe-block-L", type=int, default=512,
+                    help="[block] ventana trailing de estadistica en frames (default 512)")
+    ap.add_argument("--wpe-block-shift", type=int, default=64,
+                    help="[block] cada cuantos frames se re-estima G (default 64)")
+    ap.add_argument("--wpe-block-iters", type=int, default=3,
+                    help="[block] iteraciones tipo-offline por re-solve (default 3)")
+    ap.add_argument("--wpe-block-reg", type=float, default=1e-6,
+                    help="[block] carga diagonal relativa del Cholesky (default 1e-6)")
+    ap.add_argument("--wpe-block-solver", default="cholesky",
+                    choices=["cholesky", "lu", "cholesky_explicit"],
+                    help="[block] solver del sistema R G = P (default cholesky)")
+    ap.add_argument("--wpe-block-mode", default="resolve", choices=["resolve", "sliding"],
+                    help="[block] resolve (exacto, iters>1) o sliding (aprox rapido). default resolve")
+    ap.add_argument("--wpe-block-warm-start", action="store_true",
+                    help="[block] warm-start de la potencia con el G del bloque previo")
+    ap.add_argument("--wpe-block-g-delay", type=int, default=0,
+                    help="[block] latencia del pipeline HW en bloques (0=batch, 1=piso real). default 0")
     ap.add_argument("--eval-ref", default="domain", choices=["domain", "wpe"],
                     help="referencia de evaluacion: 'domain' (cada uno vs su dominio) o "
                          "'wpe' (target dereverberado comun a ambas ramas). default domain")
@@ -410,6 +530,15 @@ def main():
     base_config["wpe_fixed_round"] = args.wpe_round
     base_config["wpe_taps"] = args.wpe_taps
     base_config["wpe_delay"] = args.wpe_delay
+    base_config["wpe_method"] = args.wpe_method
+    base_config["wpe_block_L"] = args.wpe_block_L
+    base_config["wpe_block_shift"] = args.wpe_block_shift
+    base_config["wpe_block_iters"] = args.wpe_block_iters
+    base_config["wpe_block_reg"] = args.wpe_block_reg
+    base_config["wpe_block_solver"] = args.wpe_block_solver
+    base_config["wpe_block_mode"] = args.wpe_block_mode
+    base_config["wpe_block_warm_start"] = args.wpe_block_warm_start
+    base_config["wpe_block_g_delay"] = args.wpe_block_g_delay
 
     run_intrusive_benchmark(
         senal_path=args.senal,
