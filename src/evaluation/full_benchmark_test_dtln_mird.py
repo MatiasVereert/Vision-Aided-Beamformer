@@ -14,7 +14,7 @@ from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
 from evaluation.polar_plots import precompute_quantized_spatial_response, subsample_weights
 from beamforming.array.microphone import Microphone
 from propagation.simulate_acoustics_v1 import SimAcoustic
-from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array
+from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array, generate_mird_linear_array_from_spacing
 from dereverberation.nara_wrappers import (
     process_wpe_online, process_wpe_online_with_components,
     process_wpe_block_online_with_components, block_wpe_warmup,
@@ -321,8 +321,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         if recalc_physics:
             tqdm.write(" -> [NODE 1] Physical setup changed. Extracting MIRD RIRs...")
 
-            # Setup array coordinates globally (fixed 8-channel linear for MIRD)
-            base_array = generate_mird_linear_array()
+            # Setup array coordinates from the spacing being loaded (8-channel linear
+            # for MIRD). IMPORTANTE: la geometria debe coincidir con el spacing de las
+            # RIRs cargadas (mird_spacing), si no los steering vectors de los
+            # beamformers no corresponden al array real. Antes estaba fijo en 4-4-4.
+            base_array = generate_mird_linear_array_from_spacing(scene_base_config['mird_spacing'])
             mic_coords = base_array + array_center
             scene_base_config['mic_coords'] = mic_coords
 

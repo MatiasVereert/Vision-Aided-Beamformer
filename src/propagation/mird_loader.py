@@ -214,27 +214,34 @@ class MirdDatasetProvider:
         else:
             raise ValueError("Extraction targets restricted strictly to 'cartesian' or 'spherical'.")
 
+def generate_mird_linear_array_from_spacing(spacing: str = "4-4-4-8-4-4-4") -> np.ndarray:
+    """
+    Generates theoretical coordinates for a MIRD-style linear array from a
+    hyphen-separated inter-sensor SPACING string in centimeters (e.g.
+    "4-4-4-8-4-4-4"). N gaps -> N+1 microphones. The array lies on the Y-axis
+    and is centred on the origin, matching the convention of the MIRD dataset
+    (mic1 towards +Y / +90 deg). Use this to sweep the three measured MIRD
+    array configurations (3-3-3-8-3-3-3, 4-4-4-8-4-4-4, 8-8-8-8-8-8-8).
+    """
+    gaps = [float(g) for g in str(spacing).split('-')]
+    # Cumulative sensor positions in centimeters: [0, g0, g0+g1, ...]
+    pos_cm = np.concatenate([[0.0], np.cumsum(gaps)])
+    # Centre the array on its geometric mean (symmetric for the MIRD patterns).
+    pos_cm = pos_cm - pos_cm.mean()
+    pos_m = pos_cm / 100.0
+    M = pos_m.shape[0]
+    return np.column_stack([np.zeros(M), pos_m, np.zeros(M)])
+
+
 def generate_mird_linear_array() -> np.ndarray:
     """
     Generates theoretical coordinates for the MIRD 8-channel linear array
-    configured with standard 4-4-4-8-4-4-4 cm spacing.
-    Correctly maps mic1 to the positive Y-axis (+90 deg) and mic8 to the 
+    configured with standard 4-4-4-8-4-4-4 cm spacing. Kept for backward
+    compatibility; delegates to generate_mird_linear_array_from_spacing.
+    Correctly maps mic1 to the positive Y-axis (+90 deg) and mic8 to the
     negative Y-axis (270 deg) to match physical metadata ground truth.
     """
-    # Base cumulative sensor positions along the linear array axis in centimeters
-    y_coords_cm = np.array([0, 4, 8, 12, 20, 24, 28, 32], dtype=float)
-    
-    # Center the array symmetrically around the origin
-    y_coords_cm -= 16.0  
-    
-    # Strictly invert the coordinate array to map index 0 (mic1) to +0.16m
-    #y_coords_cm = y_coords_cm[::-1]
-    
-    # Convert centimeters to meters
-    y_coords_m = y_coords_cm / 100.0
-    
-    zeros = np.zeros(8)
-    return np.column_stack([zeros, y_coords_m, zeros])
+    return generate_mird_linear_array_from_spacing("4-4-4-8-4-4-4")
 
 if __name__ == "__main__":
     from utils.audio import save_wav
