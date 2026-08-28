@@ -12,7 +12,8 @@ from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
 
 from evaluation.polar_plots import precompute_quantized_spatial_response, subsample_weights
 from beamforming.array.geometry import (generate_log_array_coords, generate_source_and_interferences,
-                                         generate_array_coords, place_spherical, max_distance_in_room)
+                                         generate_array_coords, place_spherical, max_distance_in_room,
+                                         select_reference_mic)
 from beamforming.array.microphone import Microphone
 from propagation.simulate_acoustics_v1 import SimAcoustic
 from propagation.mird_loader import generate_mird_linear_array, generate_mird_linear_array_from_spacing
@@ -36,6 +37,31 @@ from evaluation.bf_wrappers import (
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../"))
+
+
+def relative_spherical(point, array_center):
+    """
+    (azimut, elevacion, distancia slant) de `point` respecto de `array_center`,
+    con la MISMA convencion que place_spherical (azimut 0 = +Y, positivo hacia
+    +X; elevacion 0 = plano del arreglo, positivo hacia arriba). Es la inversa
+    exacta de place_spherical y se usa para REGISTRAR en el dataset los angulos
+    reales de la escena (post-recorte de pared), no los pedidos por el config.
+
+    Devuelve (nan, nan, nan) si el punto no es utilizable (None / mal formado).
+    """
+    try:
+        p = np.asarray(point, dtype=float).flatten()
+        c = np.asarray(array_center, dtype=float).flatten()
+        if p.size < 3 or c.size < 3:
+            return (np.nan, np.nan, np.nan)
+    except (TypeError, ValueError):
+        return (np.nan, np.nan, np.nan)
+    dx, dy, dz = p[0] - c[0], p[1] - c[1], p[2] - c[2]
+    hd = float(np.hypot(dx, dy))
+    az = float(np.rad2deg(np.arctan2(dx, dy)) % 360.0)
+    el = float(np.rad2deg(np.arctan2(dz, hd)))
+    dist = float(np.sqrt(hd ** 2 + dz ** 2))
+    return (az, el, dist)
 
 
 def compute_scene_seed(exp, scene_base_config):
@@ -414,7 +440,16 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             # es reutilizado IDENTICO por todos los procesadores (Node 1 se cachea y
             # el loop de procesadores esta anidado adentro). topology_kwargs permite
             # pasar opciones por-topologia (p.ej. n_turns, inner_ratio).
-            topo_kwargs = dict(scene_base_config.get('topology_kwargs', {}))
+            # topology_kwargs admite DOS formas:
+            #   - kwargs planos  {'n_turns': 2.0}          -> valen para todas las topologias
+            #   - por topologia  {'grid': {'area_mode': 'cell'}, 'spiral': {...}}
+            #     -> se detecta cuando TODOS los valores son dicts; cada topologia
+            #        recibe solo los suyos (una topologia ausente recibe {}).
+            _topo_cfg = scene_base_config.get('topology_kwargs', {}) or {}
+            if _topo_cfg and all(isinstance(v, dict) for v in _topo_cfg.values()):
+                topo_kwargs = dict(_topo_cfg.get(exp['topology'], {}))
+            else:
+                topo_kwargs = dict(_topo_cfg)
             if exp['topology'] == 'random':
                 topo_kwargs.setdefault('seed', compute_scene_seed(exp, scene_base_config))
             mic_coords = generate_array_coords(
@@ -512,6 +547,45 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             current_rt60, current_M, current_N_int, current_mismatch_pos = exp['rt60'], exp['M'], exp['N_interferences'], exp['mismatch_pos']
 
         # ---------------------------------------------------------
+        # MICROFONO DE REFERENCIA (canal de escucha de TODO el pipeline)
+        # ---------------------------------------------------------
+        # Los beamformers de la familia Souden (NM-MVDR, oracle) proyectan su salida
+        # sobre UN microfono de referencia: la salida estima la voz TAL COMO LLEGA a
+        # ese canal. Para que las metricas midan lo que el filtro realmente intenta
+        # reconstruir, el baseline y las referencias (early/anechoic/reverberant)
+        # tienen que salir del MISMO canal.
+        #
+        # scene_base_config['ref_mic_mode'] (OPT-IN, default None):
+        #   None / ausente -> comportamiento historico EXACTO: metricas contra el
+        #                     canal 0 y procesadores con su default interno (M//2).
+        #                     Ninguna prueba existente cambia de resultado.
+        #   'first'        -> canal 0, explicito y propagado a los procesadores.
+        #   'centroid'     -> microfono mas cercano al CENTRO GEOMETRICO del arreglo
+        #                     (select_reference_mic): minimiza la diferencia de camino
+        #                     acustico hacia el resto de los micros. Relevante al
+        #                     comparar topologias, donde M//2 cae en un lugar distinto
+        #                     (y arbitrario) segun como cada generador enumera sus micros.
+        #   int            -> indice fijo.
+        ref_mic_mode = scene_base_config.get('ref_mic_mode')
+        if ref_mic_mode is None:
+            # Sin modo: canal 0 (historico), salvo que el caller haya fijado a mano
+            # 'ref_mic_idx' en el config, en cuyo caso las metricas lo respetan.
+            ref_ch = int(scene_base_config.get('ref_mic_idx', 0))
+        else:
+            if ref_mic_mode == 'centroid':
+                ref_ch = select_reference_mic(scene_base_config['mic_coords'])
+            elif ref_mic_mode == 'first':
+                ref_ch = 0
+            else:
+                ref_ch = int(ref_mic_mode)
+            # Se propaga a los procesadores (los wrappers leen 'ref_mic_idx'; sin
+            # esta clave conservan su default historico M//2).
+            if scene_base_config.get('ref_mic_idx') != ref_ch:
+                tqdm.write(f" -> [REF-MIC] ref_mic_mode='{ref_mic_mode}' -> canal {ref_ch} "
+                           f"(metricas + proyeccion de los beamformers).")
+            scene_base_config['ref_mic_idx'] = ref_ch
+
+        # ---------------------------------------------------------
         # NODE 2: ACOUSTIC MIXTURE & GROUND TRUTHS PREPARATION
         # ---------------------------------------------------------
         if recalc_mixture:
@@ -527,13 +601,15 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             # bloque "ORACLE REFERENCES" mas abajo (alineado con el modulo MIRD).
 
             # Prepare multiple ground truth references based on configuration
+            # Referencias en el canal ref_ch (ver bloque REF-MIC): con el default
+            # historico ref_ch = 0 esto es identico a lo de siempre.
             refs_dict.clear()
             if 'anechoic' in scene_base_config['eval_references']:
-                refs_dict['anechoic'] = scene_data["target_anechoic"][0]
+                refs_dict['anechoic'] = scene_data["target_anechoic"][ref_ch]
             if 'early' in scene_base_config['eval_references']:
-                refs_dict['early'] = scene_data["target_early"][0]
+                refs_dict['early'] = scene_data["target_early"][ref_ch]
             if 'reverberant' in scene_base_config['eval_references']:
-                refs_dict['reverberant'] = scene_data["target_early"][0] + scene_data["target_late"][0]
+                refs_dict['reverberant'] = scene_data["target_early"][ref_ch] + scene_data["target_late"][ref_ch]
 
         unprocessed_mic_signals = scene_data["mic_signals"]
 
@@ -569,10 +645,10 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
 
             tqdm.write(" -> Evaluating Baseline Metrics against all references...")
             baseline_metrics = evaluate_all_references(
-                refs_dict=refs_dict, deg_sig=mic_signals_degraded[0], fs=scene_base_config['fs'],
-                interf_early=scene_data["interference_early"][0],
-                interf_late=scene_data["interference_late"][0],
-                target_late=scene_data["target_late"][0],
+                refs_dict=refs_dict, deg_sig=mic_signals_degraded[ref_ch], fs=scene_base_config['fs'],
+                interf_early=scene_data["interference_early"][ref_ch],
+                interf_late=scene_data["interference_late"][ref_ch],
+                target_late=scene_data["target_late"][ref_ch],
                 eval_start_s=eval_start_s, prefix_name=f"Baseline_Exp_{i}"
             )
 
@@ -596,10 +672,10 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
 
                 tqdm.write(" -> Evaluating WPE Metrics against all references...")
                 wpe_metrics = evaluate_all_references(
-                    refs_dict=refs_dict, deg_sig=mic_signals_ready[0], fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][0],
-                    interf_late=scene_data["interference_late"][0],
-                    target_late=scene_data["target_late"][0],
+                    refs_dict=refs_dict, deg_sig=mic_signals_ready[ref_ch], fs=scene_base_config['fs'],
+                    interf_early=scene_data["interference_early"][ref_ch],
+                    interf_late=scene_data["interference_late"][ref_ch],
+                    target_late=scene_data["target_late"][ref_ch],
                     eval_start_s=eval_start_s, prefix_name=f"WPE_Exp_{i}"
                 )
             else:
@@ -626,13 +702,13 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                 tqdm.write(" -> [NODE 4.5] Applying DTLN to reference microphone...")
                 audio_dtln_alone = apply_dtln_post_tflite_realtime(
                     interpreter_1=interpreter_1, interpreter_2=interpreter_2,
-                    audio_mono=mic_signals_ready[0]
+                    audio_mono=mic_signals_ready[ref_ch]
                 )
                 dtln_alone_metrics = evaluate_all_references(
                     refs_dict=refs_dict, deg_sig=audio_dtln_alone, fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][0],
-                    interf_late=scene_data["interference_late"][0],
-                    target_late=scene_data["target_late"][0],
+                    interf_early=scene_data["interference_early"][ref_ch],
+                    interf_late=scene_data["interference_late"][ref_ch],
+                    target_late=scene_data["target_late"][ref_ch],
                     eval_start_s=eval_start_s, prefix_name=f"DTLN_Alone_Exp_{i}"
                 )
         else:
@@ -673,9 +749,9 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
 
             proc_metrics = evaluate_all_references(
                 refs_dict=refs_dict, deg_sig=y_processed, fs=scene_base_config['fs'],
-                interf_early=scene_data["interference_early"][0],
-                interf_late=scene_data["interference_late"][0],
-                target_late=scene_data["target_late"][0],
+                interf_early=scene_data["interference_early"][ref_ch],
+                interf_late=scene_data["interference_late"][ref_ch],
+                target_late=scene_data["target_late"][ref_ch],
                 eval_start_s=eval_start_s, prefix_name=f"Proc_{proc_name}_Exp_{i}"
             )
 
@@ -694,11 +770,22 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                 )
                 dtln_post_metrics = evaluate_all_references(
                     refs_dict=refs_dict, deg_sig=y_post_dtln, fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][0],
-                    interf_late=scene_data["interference_late"][0],
-                    target_late=scene_data["target_late"][0],
+                    interf_early=scene_data["interference_early"][ref_ch],
+                    interf_late=scene_data["interference_late"][ref_ch],
+                    target_late=scene_data["target_late"][ref_ch],
                     eval_start_s=eval_start_s, prefix_name=f"DTLN_Post_{proc_name}_Exp_{i}"
                 )
+
+            # --- Angulos reales de la escena (para el dataset) ---
+            # array_center = centroide del arreglo (ya calculado en Node 5).
+            _src_az, _src_el, _src_r = relative_spherical(scene_base_config.get('source_pos'), array_center)
+            _src_h = float(np.asarray(scene_base_config['source_pos']).flatten()[2] - array_center[2])
+            _itf_pos = np.asarray(scene_base_config.get('interferences_pos', np.zeros((0, 3))))
+            if _itf_pos.size:
+                # Primera interferencia (en este barrido hay 1 por escena).
+                _itf_az, _itf_el, _itf_r = relative_spherical(_itf_pos[0], array_center)
+            else:
+                _itf_az = _itf_el = _itf_r = np.nan
 
             # Compile Dataset Row
             if geom_mode == 'mird_linear':
@@ -729,6 +816,21 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                 "interf_scenario": exp.get('interf_scenario'),
                 "source_dist": exp.get('source_dist'),
                 "source": os.path.basename(scene_base_config['source_path']),
+                # --- GEOMETRIA REAL DE LA ESCENA (post-recorte de pared) ---
+                # Se reconstruyen desde las posiciones absolutas efectivamente
+                # simuladas (no desde el spec pedido), respecto del centroide del
+                # arreglo y con la convencion de place_spherical. Permiten graficar
+                # cualquier metrica en funcion de la ELEVACION de la fuente, el eje
+                # que peor discrimina un arreglo planar. Columnas nuevas: no afectan
+                # a ninguna prueba existente, que selecciona sus columnas por nombre.
+                "source_azimuth_deg": _src_az,
+                "source_elevation_deg": _src_el,
+                "source_slant_m": _src_r,
+                "source_height_m": _src_h,          # altura sobre el PLANO DEL ARREGLO
+                "interf_azimuth_deg": _itf_az,
+                "interf_elevation_deg": _itf_el,
+                "interf_slant_m": _itf_r,
+                "ref_mic_idx": ref_ch,
             }
 
             # Append absolute metrics for all references

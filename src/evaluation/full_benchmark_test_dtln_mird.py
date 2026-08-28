@@ -13,6 +13,7 @@ from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
 
 from evaluation.polar_plots import precompute_quantized_spatial_response, subsample_weights
 from beamforming.array.microphone import Microphone
+from beamforming.array.geometry import select_reference_mic
 from propagation.simulate_acoustics_v1 import SimAcoustic
 from propagation.mird_loader import MirdDatasetProvider, generate_mird_linear_array, generate_mird_linear_array_from_spacing
 from dereverberation.nara_wrappers import (
@@ -395,6 +396,48 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             current_source_path = exp['source_path']
 
         # ---------------------------------------------------------
+        # MICROFONO DE REFERENCIA (canal de escucha de TODO el pipeline)
+        # ---------------------------------------------------------
+        # Un beamformer NO devuelve "la voz limpia" en abstracto: devuelve la voz TAL
+        # COMO LLEGA a un microfono de referencia. La familia Souden lo hace explicito
+        # (proyecta con el vector one-hot u_ref) y los geometricos tambien, via la RTF
+        # normalizada a ese canal (w^H d = 1 reconstruye d_ref). Si las metricas se
+        # calculan contra OTRO canal, la diferencia de camino acustico entre los dos
+        # micros se contabiliza como distorsion del procesador: medido sobre MIRD, eso
+        # costaba ~3 dB de SI-SDR y ~2 dB de SAR a la familia mask-based (que proyectaba
+        # al M//2) frente a las metricas, que salian del canal 0.
+        #
+        # Aca se elige UN canal y se usa para TODO: las referencias early/anechoic/
+        # reverberant, el baseline, las componentes de ruido de BSS-Eval, la entrada del
+        # DTLN mono y el 'ref_mic_idx' que leen todos los wrappers de procesador.
+        #
+        # scene_base_config['ref_mic_mode']:
+        #   None / ausente -> M//2, la referencia historica de la familia Souden (para
+        #                     el arreglo lineal de 8 micros del MIRD, el canal 4).
+        #   'first'        -> canal 0.
+        #   'centroid'     -> mic mas cercano al centro geometrico (select_reference_mic);
+        #                     util al comparar topologias, donde M//2 cae en un lugar
+        #                     arbitrario segun como cada generador enumera sus micros.
+        #   int            -> indice fijo.
+        _M_arr = len(scene_base_config['mic_coords'])
+        ref_mic_mode = scene_base_config.get('ref_mic_mode')
+        if ref_mic_mode is None:
+            ref_ch = _M_arr // 2
+        elif ref_mic_mode == 'centroid':
+            ref_ch = select_reference_mic(scene_base_config['mic_coords'])
+        elif ref_mic_mode == 'first':
+            ref_ch = 0
+        else:
+            ref_ch = int(ref_mic_mode)
+        if not (0 <= ref_ch < _M_arr):
+            raise ValueError(f"ref_mic_mode={ref_mic_mode!r} -> canal {ref_ch} fuera de rango (M={_M_arr}).")
+        if scene_base_config.get('ref_mic_idx') != ref_ch:
+            tqdm.write(f" -> [REF-MIC] canal {ref_ch} de {_M_arr} "
+                       f"(metricas + proyeccion de TODOS los beamformers).")
+        # Se propaga a los procesadores: los wrappers leen esta clave.
+        scene_base_config['ref_mic_idx'] = ref_ch
+
+        # ---------------------------------------------------------
         # NODE 2: ACOUSTIC MIXTURE & GROUND TRUTHS PREPARATION
         # ---------------------------------------------------------
         if recalc_mixture:
@@ -411,11 +454,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
             refs_dict.clear()
             if 'anechoic' in scene_base_config['eval_references']:
-                refs_dict['anechoic'] = scene_data["target_anechoic"][0]
+                refs_dict['anechoic'] = scene_data["target_anechoic"][ref_ch]
             if 'early' in scene_base_config['eval_references']:
-                refs_dict['early'] = scene_data["target_early"][0]
+                refs_dict['early'] = scene_data["target_early"][ref_ch]
             if 'reverberant' in scene_base_config['eval_references']:
-                refs_dict['reverberant'] = scene_data["target_early"][0] + scene_data["target_late"][0]
+                refs_dict['reverberant'] = scene_data["target_early"][ref_ch] + scene_data["target_late"][ref_ch]
 
         unprocessed_mic_signals = scene_data["mic_signals"]
 
@@ -452,10 +495,10 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
             tqdm.write(" -> Evaluating Baseline Metrics against all references...")
             baseline_metrics = evaluate_all_references(
-                refs_dict=refs_dict, deg_sig=mic_signals_degraded[0], fs=scene_base_config['fs'],
-                interf_early=scene_data["interference_early"][0],
-                interf_late=scene_data["interference_late"][0],
-                target_late=scene_data["target_late"][0],
+                refs_dict=refs_dict, deg_sig=mic_signals_degraded[ref_ch], fs=scene_base_config['fs'],
+                interf_early=scene_data["interference_early"][ref_ch],
+                interf_late=scene_data["interference_late"][ref_ch],
+                target_late=scene_data["target_late"][ref_ch],
                 eval_start_s=eval_start_s, prefix_name=f"Baseline_Exp_{i}"
             )
 
@@ -628,10 +671,10 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
                 tqdm.write(" -> Evaluating WPE Metrics against all references...")
                 wpe_metrics = evaluate_all_references(
-                    refs_dict=refs_dict, deg_sig=mic_signals_ready[0], fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][0],
-                    interf_late=scene_data["interference_late"][0],
-                    target_late=scene_data["target_late"][0],
+                    refs_dict=refs_dict, deg_sig=mic_signals_ready[ref_ch], fs=scene_base_config['fs'],
+                    interf_early=scene_data["interference_early"][ref_ch],
+                    interf_late=scene_data["interference_late"][ref_ch],
+                    target_late=scene_data["target_late"][ref_ch],
                     eval_start_s=eval_start_s, prefix_name=f"WPE_Exp_{i}"
                 )
             else:
@@ -663,13 +706,13 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 tqdm.write(" -> [NODE 4.5] Applying DTLN to reference microphone...")
                 audio_dtln_alone = apply_dtln_post_tflite_realtime(
                     interpreter_1=interpreter_1, interpreter_2=interpreter_2,
-                    audio_mono=mic_signals_ready[0]
+                    audio_mono=mic_signals_ready[ref_ch]
                 )
                 dtln_alone_metrics = evaluate_all_references(
                     refs_dict=refs_dict, deg_sig=audio_dtln_alone, fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][0],
-                    interf_late=scene_data["interference_late"][0],
-                    target_late=scene_data["target_late"][0],
+                    interf_early=scene_data["interference_early"][ref_ch],
+                    interf_late=scene_data["interference_late"][ref_ch],
+                    target_late=scene_data["target_late"][ref_ch],
                     eval_start_s=eval_start_s, prefix_name=f"DTLN_Alone_Exp_{i}"
                 )
         else:
@@ -710,9 +753,9 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
             proc_metrics = evaluate_all_references(
                 refs_dict=refs_dict, deg_sig=y_processed, fs=scene_base_config['fs'],
-                interf_early=scene_data["interference_early"][0],
-                interf_late=scene_data["interference_late"][0],
-                target_late=scene_data["target_late"][0],
+                interf_early=scene_data["interference_early"][ref_ch],
+                interf_late=scene_data["interference_late"][ref_ch],
+                target_late=scene_data["target_late"][ref_ch],
                 eval_start_s=eval_start_s, prefix_name=f"Proc_{proc_name}_Exp_{i}"
             )
 
@@ -732,9 +775,9 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 )
                 dtln_post_metrics = evaluate_all_references(
                     refs_dict=refs_dict, deg_sig=y_post_dtln, fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][0],
-                    interf_late=scene_data["interference_late"][0],
-                    target_late=scene_data["target_late"][0],
+                    interf_early=scene_data["interference_early"][ref_ch],
+                    interf_late=scene_data["interference_late"][ref_ch],
+                    target_late=scene_data["target_late"][ref_ch],
                     eval_start_s=eval_start_s, prefix_name=f"DTLN_Post_{proc_name}_Exp_{i}"
                 )
 
@@ -743,6 +786,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 "processor": proc_name,
                 "rt60": exp['rt60'],
                 "M": 8, # Fixed MIRD Array size
+                "ref_mic_idx": ref_ch,   # canal de referencia (metricas + proyeccion)
                 "N_interferences": len(exp['interf_configs']),
                 "mismatch_pos": 0.0, # Physical arrays inherently contain positioning reality, no injected random mismatch
                 "isir_db": exp['isir_db'],

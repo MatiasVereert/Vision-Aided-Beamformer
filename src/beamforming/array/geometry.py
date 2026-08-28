@@ -43,9 +43,14 @@ def generate_log_array_coords(M: int, d_min: float, d_max: float, room_dims: np.
 #   - Devuelven coordenadas (M, 3) CENTRADAS EN EL ORIGEN, en el plano XY (z=0).
 #   - El caller les suma `array_center` para posicionarlas en la sala, p.ej.:
 #         mic_coords = generate_circular_array_coords(M, diameter) + array_center
-#   - Todas quedan INSCRIPTAS en un circulo del `diameter` dado: ningun microfono
-#     cae fuera del circulo, y al menos uno lo toca (se usa el diametro completo),
-#     de modo que la apertura fisica sea comparable entre topologias.
+#   - Todas menos la grilla quedan INSCRIPTAS en un circulo del `diameter` dado:
+#     ningun microfono cae fuera del circulo, y al menos uno lo toca (se usa el
+#     diametro completo), de modo que la apertura fisica sea comparable.
+#   - EXCEPCION: la grilla rectangular ('grid' -> generate_grid_array_coords_area)
+#     ya NO se inscribe en el circulo. Se la iguala por SUPERFICIE OCUPADA
+#     (A_ref = pi * (diameter/2)**2), lo que permite filas != columnas y amplia el
+#     rango de M utilizables (6 -> 2x3, 8 -> 2x4, 12 -> 3x4). La version historica
+#     inscripta sigue disponible como 'grid_inscribed'.
 # =============================================================================
 
 def generate_circular_array_coords(M: int, diameter: float, angle_offset_deg: float = 0.0) -> np.ndarray:
@@ -135,6 +140,250 @@ def generate_grid_array_coords(M: int, diameter: float) -> np.ndarray:
     coords = np.zeros((M, 3))
     coords[:, :2] = grid
     return coords
+
+
+def _near_square_factors(M: int, max_aspect: float = 2.0):
+    """
+    (rows, cols) para M microfonos, lo mas cuadrado posible.
+
+    1) Si M admite una factorizacion exacta rows*cols == M con aspecto
+       cols/rows <= max_aspect, devuelve la mas cuadrada (rows maximo).
+       Ej.: 6 -> (2, 3); 8 -> (2, 4); 12 -> (3, 4); 16 -> (4, 4).
+    2) Si no (M primo, o toda factorizacion demasiado alargada: 7, 11, 10 con
+       max_aspect=2, ...), devuelve el rectangulo mas chico y mas cuadrado con
+       rows*cols >= M; el generador rellena solo M nodos (shell externa
+       parcialmente llena). Ej.: 7 -> (2, 4); 11 -> (3, 4).
+    """
+    if M < 2:
+        raise ValueError("At least 2 microphones are required.")
+    best = None
+    for rows in range(1, int(np.sqrt(M)) + 1):
+        if M % rows == 0:
+            cols = M // rows
+            if rows >= 2 and (cols / rows) <= max_aspect:
+                best = (rows, cols)          # rows crece -> se guarda la mas cuadrada
+    if best is not None:
+        return best
+    # Sin factorizacion aceptable: rectangulo minimo (rows*cols >= M) mas cuadrado.
+    rows = int(np.floor(np.sqrt(M)))
+    while rows >= 1:
+        cols = int(np.ceil(M / rows))
+        if rows * cols >= M and (cols / rows) <= max_aspect:
+            return (rows, cols)
+        rows -= 1
+    return (1, M)
+
+
+def generate_grid_array_coords_area(M: int, diameter: float, area_mode: str = "span",
+                                    rows: int = None, cols: int = None,
+                                    max_aspect: float = 2.0) -> np.ndarray:
+    """
+    Grilla rectangular de M microfonos EQUIVALENTE POR AREA al arreglo circular
+    (UCA) del mismo `diameter`. Plano XY (z=0), centrada en el origen.
+
+    A diferencia de `generate_grid_array_coords` (legacy), la grilla NO esta
+    inscripta en el circulo: se libera esa restriccion y se impone en su lugar
+    que la SUPERFICIE OCUPADA sea la del circulo de referencia,
+
+        A_ref = pi * (diameter / 2)**2
+
+    lo que permite filas != columnas y por lo tanto amplia el rango de M
+    utilizables con una grilla razonablemente cuadrada (6 -> 2x3, 8 -> 2x4,
+    12 -> 3x4), en vez de exigir n x n impar.
+
+    Convenciones de area (`area_mode`):
+      - 'span' (default): el RECTANGULO QUE ABARCAN LOS MICROFONOS EXTREMOS
+        tiene area A_ref, es decir (cols-1)*d x (rows-1)*d == A_ref. Es la
+        lectura literal de "misma superficie que el circulo": el mismo plato
+        fisico. Con pocos micros la apertura crece (y con ella el espaciado d,
+        que baja la frecuencia de aliasing espacial c/(2d)).
+      - 'cell': cada microfono ocupa una celda de A_ref / M, es decir
+        M * d**2 == A_ref. Conserva la DENSIDAD de micros del circulo (para M=12
+        y D=15 cm da d ~ 3.8 cm, casi el paso del UCA de 12 micros) a costa de
+        un footprint total menor.
+
+    El paso `d` es el MISMO en las dos direcciones (celdas cuadradas): la
+    relacion de aspecto la fija la factorizacion rows x cols, no un estiramiento.
+
+    Si rows*cols > M (M primo o de factorizacion muy alargada, ver
+    `_near_square_factors`) se conservan los M nodos mas cercanos al centro y el
+    area se ajusta sobre el rectangulo REALMENTE ocupado por esos M nodos.
+
+    Args:
+        M: numero de microfonos (>= 2).
+        diameter: diametro del circulo de REFERENCIA (define A_ref), en metros.
+            Ojo: la grilla puede extenderse fuera de ese circulo; solo comparte
+            el area.
+        area_mode: 'span' | 'cell' (ver arriba).
+        rows, cols: fuerzan la factorizacion (rows*cols debe ser >= M). Si se
+            pasa solo uno, el otro se deriva con ceil(M / el dado).
+        max_aspect: aspecto maximo cols/rows tolerado al factorizar M.
+
+    Returns:
+        (M, 3) coordenadas centradas en el origen, ordenadas por filas
+        (y creciente, luego x creciente).
+    """
+    if M < 2:
+        raise ValueError("At least 2 microphones are required.")
+    if diameter <= 0:
+        raise ValueError("diameter must be strictly positive.")
+    if area_mode not in ("span", "cell"):
+        raise ValueError("area_mode must be 'span' or 'cell'.")
+
+    if rows is None and cols is None:
+        rows, cols = _near_square_factors(M, max_aspect=max_aspect)
+    elif rows is None:
+        cols = int(cols); rows = int(np.ceil(M / cols))
+    elif cols is None:
+        rows = int(rows); cols = int(np.ceil(M / rows))
+    else:
+        rows, cols = int(rows), int(cols)
+    if rows * cols < M:
+        raise ValueError(f"rows*cols={rows*cols} < M={M}: la grilla no entra.")
+
+    # Lattice unitaria rows x cols centrada en el centro del rectangulo.
+    ax = np.arange(cols) - (cols - 1) / 2.0
+    ay = np.arange(rows) - (rows - 1) / 2.0
+    xx, yy = np.meshgrid(ax, ay)
+    lattice = np.column_stack([xx.ravel(), yy.ravel()])       # (rows*cols, 2)
+
+    if lattice.shape[0] > M:
+        # Shell externa parcial: se quedan los M nodos mas cercanos al centro.
+        keep = np.argsort(np.linalg.norm(lattice, axis=1), kind="stable")[:M]
+        lattice = lattice[np.sort(keep)]
+
+    # Recentrar en el centro geometrico del rectangulo ocupado (el "centro del
+    # plato"): con la grilla completa coincide con el centroide.
+    bbox_lo, bbox_hi = lattice.min(axis=0), lattice.max(axis=0)
+    lattice = lattice - (bbox_lo + bbox_hi) / 2.0
+
+    area_ref = np.pi * (diameter / 2.0) ** 2
+    if area_mode == "cell":
+        d = np.sqrt(area_ref / M)
+    else:
+        span = lattice.max(axis=0) - lattice.min(axis=0)      # en unidades de paso
+        if span[0] <= 0 or span[1] <= 0:
+            raise ValueError(
+                f"area_mode='span' necesita al menos 2 filas y 2 columnas "
+                f"(rows={rows}, cols={cols}, M={M}). Usa area_mode='cell' o "
+                f"fija rows/cols."
+            )
+        d = np.sqrt(area_ref / (span[0] * span[1]))
+
+    grid = lattice * d
+    # Orden por filas (y, luego x): lectura natural de la grilla.
+    order = np.lexsort((grid[:, 0], grid[:, 1]))
+    grid = grid[order]
+
+    coords = np.zeros((M, 3))
+    coords[:, :2] = grid
+    return coords
+
+
+def select_reference_mic(mic_coords: np.ndarray) -> int:
+    """
+    Indice del microfono que mejor representa el CENTRO GEOMETRICO del arreglo:
+    el que minimiza la suma de distancias cuadraticas al resto de los micros
+    (equivalente a: el mas cercano al centroide de la nube).
+
+    Motivacion: los beamformers tipo Souden (NM-MVDR, Souden-oracle) proyectan la
+    salida sobre UN microfono de referencia; ese canal fija el "punto de escucha"
+    del filtro espacial y la RTF a la que se normalizan los pesos. Elegirlo en el
+    centro del arreglo minimiza la maxima diferencia de camino acustico hacia los
+    demas micros, lo que reduce la varianza espacial de las RTF estimadas. El
+    indice M//2 (default historico) solo cae en el centro por accidente y depende
+    del ORDEN en que cada topologia enumera sus micros.
+
+    Empates (p.ej. UCA, o grilla par x par, donde varios micros equidistan del
+    centroide) se resuelven por el indice mas bajo (argmin estable).
+
+    Args:
+        mic_coords: (M, 3) o (M, 2) coordenadas de los microfonos (absolutas o
+            centradas: el criterio es invariante a traslacion).
+
+    Returns:
+        int: indice del microfono de referencia en [0, M).
+    """
+    P = np.asarray(mic_coords, dtype=float)
+    if P.ndim != 2 or P.shape[0] < 1:
+        raise ValueError("mic_coords must be a (M, D) array with M >= 1.")
+    centroid = P.mean(axis=0)
+    dist = np.linalg.norm(P - centroid, axis=1)
+    # Tolerancia para que los empates EXACTOS por simetria (UCA: todos los micros
+    # equidistan del centro) no los desempate el ruido de punto flotante: se toma
+    # el indice mas bajo dentro de la tolerancia -> resultado reproducible.
+    tol = 1e-9 + 1e-6 * float(np.max(dist))
+    return int(np.flatnonzero(dist <= dist.min() + tol)[0])
+
+
+def sample_torus_specs(n: int, r_major: float, r_tube: float,
+                       array_height: float = 0.0, z_min: float = 0.05,
+                       rng=None, volume_uniform: bool = True) -> np.ndarray:
+    """
+    Muestrea `n` posiciones dentro de un TOROIDE APOYADO SOBRE EL PISO, concentrico
+    al arreglo, y las devuelve como specs (azimut, elevacion, distancia slant)
+    listas para `place_spherical` / el motor del benchmark.
+
+    Modelo de uso: el arreglo esta apoyado sobre una mesa/piso (plano z=0) y los
+    locutores estan a ~`r_tube` de altura sobre ese plano, alrededor del arreglo.
+    El toroide tiene su circulo generador de radio `r_major` a la altura
+    z = r_tube, de modo que el tubo es TANGENTE al piso (z va de 0 a 2*r_tube) y
+    el centro de la dispersion en altura cae en r_tube. Reemplaza al domo/medio
+    cascaron: la fuente ya no puede estar en el cenit ni pegada al plano lejos,
+    sino en el anillo realista alrededor del dispositivo.
+
+    Muestreo: azimut uniforme en [0, 360); dentro de la seccion circular del tubo
+    (radio r_tube) se muestrea uniforme por area (sqrt del radio). Con
+    `volume_uniform=True` se aplica ademas rechazo proporcional a
+    (r_major + drho) / (r_major + r_tube), que corrige la densidad para que el
+    muestreo sea uniforme en el VOLUMEN del toroide (la parte externa del tubo
+    abarca mas volumen que la interna). Se rechazan los puntos con
+    z < `z_min` (una fuente en z<=0 rompe el ISM y ademas no es fisica).
+
+    Args:
+        n: cantidad de posiciones.
+        r_major: radio mayor [m] (centro del arreglo -> centro del tubo, horizontal).
+        r_tube: radio menor [m] (del tubo). Fija la altura media de las fuentes.
+        array_height: altura del PLANO DEL ARREGLO [m] sobre el piso. La elevacion
+            se mide respecto de ese plano (es el 0 de elevacion del benchmark).
+        z_min: altura minima admitida [m] sobre el piso.
+        rng: np.random.Generator o semilla (default_rng).
+        volume_uniform: True -> uniforme en volumen; False -> uniforme en la
+            seccion del tubo (mas peso relativo al lado interno).
+
+    Returns:
+        (n, 3) array de (azimut_deg, elevacion_deg, distancia_slant_m) respecto
+        del centro del arreglo.
+    """
+    if r_tube <= 0 or r_major <= 0:
+        raise ValueError("r_major y r_tube deben ser estrictamente positivos.")
+    if r_tube >= r_major:
+        raise ValueError("r_tube debe ser menor que r_major (toroide no degenerado).")
+    rng = np.random.default_rng(rng)
+
+    specs = np.zeros((n, 3))
+    k = 0
+    while k < n:
+        phi = rng.uniform(0.0, 2.0 * np.pi)                  # azimut
+        # Punto uniforme por area en la seccion circular del tubo.
+        rad = r_tube * np.sqrt(rng.random())
+        ang = rng.uniform(0.0, 2.0 * np.pi)
+        drho, dz = rad * np.cos(ang), rad * np.sin(ang)
+
+        rho = r_major + drho                                  # distancia horizontal
+        z = r_tube + dz                                       # altura sobre el piso
+        if z < z_min:
+            continue
+        if volume_uniform and rng.random() > rho / (r_major + r_tube):
+            continue                                          # correccion de volumen
+
+        dz_arr = z - array_height                             # altura sobre el arreglo
+        dist = float(np.hypot(rho, dz_arr))
+        el = float(np.rad2deg(np.arctan2(dz_arr, rho)))
+        az = float(np.rad2deg(phi))
+        specs[k] = (az, el, dist)
+        k += 1
+    return specs
 
 
 def generate_spiral_array_coords(M: int, diameter: float, n_turns: float = 2.0) -> np.ndarray:
@@ -299,7 +548,11 @@ def generate_random_array_coords(M: int, diameter: float, seed=None,
 # topologias en el benchmark (p.ej. for topo in TOPOLOGY_GENERATORS: ...).
 TOPOLOGY_GENERATORS = {
     "circular": generate_circular_array_coords,
-    "grid": generate_grid_array_coords,
+    # 'grid' = grilla EQUIVALENTE POR AREA al circulo de referencia (filas != columnas
+    # permitidas). La version historica inscripta en el circulo (n x n impar) queda
+    # disponible como 'grid_inscribed' para reproducir corridas viejas.
+    "grid": generate_grid_array_coords_area,
+    "grid_inscribed": generate_grid_array_coords,
     "spiral": generate_spiral_array_coords,
     "concentric": generate_concentric_array_coords,
     "random": generate_random_array_coords,
@@ -325,6 +578,64 @@ def generate_array_coords(topology: str, M: int, diameter: float, **kwargs) -> n
         raise ValueError(f"Unknown topology '{topology}'. "
                          f"Valid options: {sorted(TOPOLOGY_GENERATORS)}")
     return TOPOLOGY_GENERATORS[key](M=M, diameter=diameter, **kwargs)
+
+
+def sample_box_uniform_specs(n: int, lo, hi, min_dist: float = 0.5,
+                             rng=None) -> np.ndarray:
+    """
+    Muestrea `n` puntos UNIFORMES EN EL VOLUMEN de una caja (la sala, recortada por
+    el margen de pared) y los devuelve como specs (azimut, elevacion, distancia
+    slant) listas para `place_spherical` / el motor del benchmark.
+
+    `lo` y `hi` son las esquinas de la caja EXPRESADAS RESPECTO DEL CENTRO DEL
+    ARREGLO (y con z medida desde el PLANO del arreglo, que es el 0 de elevacion).
+    Al trabajar en coordenadas relativas, la misma tanda de specs sirve para varias
+    salas: basta tomar la INTERSECCION de sus cajas utiles (ver el notebook del
+    barrido de topologias) y ninguna posicion necesita recortarse despues.
+
+    A diferencia de un muestreo (azimut, elevacion, distancia) uniforme por
+    separado -que concentra las fuentes en un cascaron alrededor del arreglo y deja
+    las esquinas vacias-, esto llena la sala: la densidad es constante por unidad de
+    volumen, asi que la mayoria de las posiciones cae lejos (el volumen crece con
+    r^2) y a baja elevacion (una sala es mucho mas ancha que alta).
+
+    Se rechazan los puntos a menos de `min_dist` del centro del arreglo (una fuente
+    encima de los microfonos no es fisica y ademas degenera el modelo de campo
+    cercano). `lo[2]` fija implicitamente la elevacion minima: con lo[2] >= 0 nunca
+    hay fuentes por debajo del plano del arreglo (necesario si el arreglo se apoya
+    sobre un bafle/piso).
+
+    Args:
+        n: cantidad de posiciones.
+        lo, hi: (3,) esquinas minima y maxima de la caja, relativas al centro del
+            arreglo [m].
+        min_dist: distancia minima admitida al centro del arreglo [m].
+        rng: np.random.Generator o semilla (default_rng).
+
+    Returns:
+        (n, 3) array de (azimut_deg, elevacion_deg, distancia_slant_m).
+    """
+    lo = np.asarray(lo, dtype=float)
+    hi = np.asarray(hi, dtype=float)
+    if lo.shape != (3,) or hi.shape != (3,):
+        raise ValueError("lo y hi deben ser vectores de 3 componentes.")
+    if np.any(hi <= lo):
+        raise ValueError(f"Caja vacia o invertida: lo={lo}, hi={hi}.")
+    rng = np.random.default_rng(rng)
+
+    specs = np.zeros((n, 3))
+    k = 0
+    while k < n:
+        p = rng.uniform(lo, hi)                      # uniforme en el volumen
+        hd = float(np.hypot(p[0], p[1]))
+        dist = float(np.sqrt(hd ** 2 + p[2] ** 2))
+        if dist < min_dist:
+            continue
+        specs[k] = (float(np.rad2deg(np.arctan2(p[0], p[1])) % 360.0),
+                    float(np.rad2deg(np.arctan2(p[2], hd))),
+                    dist)
+        k += 1
+    return specs
 
 
 def place_spherical(azimuth_deg: float, elevation_deg: float, distance: float,
@@ -420,7 +731,9 @@ def _plot_topology_gallery(M: int = 12, diameter: float = 0.30):
     the resulting microphone positions."""
     specs = [
         ("Circular (UCA)", generate_circular_array_coords(M, diameter)),
-        ("Rectangular grid", generate_grid_array_coords(M, diameter)),
+        ("Grid (=area, span)", generate_grid_array_coords_area(M, diameter)),
+        ("Grid (=area, cell)", generate_grid_array_coords_area(M, diameter, area_mode="cell")),
+        ("Grid (inscripta, legacy)", generate_grid_array_coords(M, diameter)),
         ("Spiral (Archimedean)", generate_spiral_array_coords(M, diameter)),
         ("Concentric rings", generate_concentric_array_coords(M, diameter)),
         ("Random (seed=0)", generate_random_array_coords(M, diameter, seed=0)),
@@ -435,7 +748,9 @@ def _plot_topology_gallery(M: int = 12, diameter: float = 0.30):
         ax.scatter(coords[:, 0], coords[:, 1], c='blue', marker='x', s=60)
         for k, (x, y, _) in enumerate(coords):
             ax.text(x + 0.005, y + 0.005, str(k), fontsize=8, color='navy')
-        lim = radius * 1.2
+        # La grilla equivalente por area puede salirse del circulo de referencia:
+        # el limite se toma de las coordenadas, no del radio.
+        lim = max(radius, float(np.abs(coords[:, :2]).max())) * 1.2
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
         ax.set_aspect('equal')

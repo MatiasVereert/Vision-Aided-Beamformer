@@ -54,11 +54,14 @@ class DS:
         X_stft_ds = np.transpose(X_stft, (1, 2, 0))
         K, T, M = X_stft_ds.shape
 
-        # Compute exact steering vector
-        # Expected output shape: (K, M)
+        # Compute exact steering vector.
+        # ref_mic_idx normaliza la RTF: el DS entrega la voz tal como llega a ESE
+        # canal. Se toma el mismo microfono de referencia que usan los mask-based
+        # (inyectado por el benchmark en 'ref_mic_idx'); default historico 0.
         sv = compute_rtf_steering_vector(
             freqs, source_pos, mic_coords,
-            ref_mic_idx=0, mode="near_field", squeeze=True
+            ref_mic_idx=int(scene_config.get('ref_mic_idx', 0)),
+            mode="near_field", squeeze=True
         )
 
         # Calculate static Delay-and-Sum weights
@@ -198,8 +201,12 @@ class DTLN_MB_MVDR_SOUDEN_BAN:
             print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
 
         # Define Reference Microphone Index as middle index
+        # Microfono de REFERENCIA: fija el canal que reconstruye el filtro (o sea el
+        # DOMINIO de la salida) y por lo tanto contra cual hay que medir. El benchmark
+        # lo inyecta en 'ref_mic_idx' para que TODOS los procesadores y las metricas
+        # usen el mismo canal; sin esa clave se conserva el default historico.
         M_tot = mic_signals.shape[0]
-        ref_mic_idx = M_tot // 2
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
 
         # 2. Extract masks using block_shift (hop_length)
         mask_s, mask_n = get_dtln_masks(
@@ -232,7 +239,8 @@ class DTLN_MB_MVDR_SOUDEN_BAN:
             mask_s,
             mask_n,
             min_loading= self.min_loading,
-            save_weights=True
+            save_weights=True,
+            ref_mic_idx=ref_mic_idx
         )
 
         # 6. Compute ISTFT to return to the time domain
@@ -281,8 +289,12 @@ class DTLN_MB_MVDR_SOUDEN_SLOW:
             print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
 
         # Define Reference Microphone Index as middle index
+        # Microfono de REFERENCIA: fija el canal que reconstruye el filtro (o sea el
+        # DOMINIO de la salida) y por lo tanto contra cual hay que medir. El benchmark
+        # lo inyecta en 'ref_mic_idx' para que TODOS los procesadores y las metricas
+        # usen el mismo canal; sin esa clave se conserva el default historico.
         M_tot = mic_signals.shape[0]
-        ref_mic_idx = M_tot // 2
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
 
         # 2. Extract masks using block_shift (hop_length)
         mask_s, mask_n = get_dtln_masks(
@@ -316,7 +328,8 @@ class DTLN_MB_MVDR_SOUDEN_SLOW:
             mask_n,
             min_loading= self.min_loading,
             save_weights=True,
-            alpha= self.alpha
+            alpha= self.alpha,
+            ref_mic_idx=ref_mic_idx
         )
 
         # 6. Compute ISTFT to return to the time domain
@@ -371,9 +384,14 @@ class NM_MVDR:
         if nperseg_dyn != 512 or hop_length_dyn != 128:
             print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
 
-        # Define Reference Microphone Index as middle index
+        # --- MICROFONO DE REFERENCIA ---
+        # El filtro de Souden proyecta la salida sobre UN canal de referencia: ese
+        # microfono define el "punto de escucha" (la voz se estima tal como llega a
+        # el). Si el benchmark inyecta 'ref_mic_idx' (p.ej. el mic mas cercano al
+        # centro geometrico del arreglo, geometry.select_reference_mic), se usa ese;
+        # si no, se cae al default historico M//2.
         M_tot = mic_signals.shape[0]
-        ref_mic_idx = M_tot // 2
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
 
         # Exponente de realce de la mascara (controlable por instancia o por escena)
         sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
@@ -412,7 +430,8 @@ class NM_MVDR:
             mask_n,
             min_loading= self.min_loading,
             save_weights=True,
-            alpha= self.alpha
+            alpha= self.alpha,
+            ref_mic_idx=ref_mic_idx
         )
 
         # 6. Compute ISTFT to return to the time domain
@@ -469,9 +488,14 @@ class ORACLE_MB_MVDR_SOUDEN:
         if nperseg_dyn != 512 or hop_length_dyn != 128:
             print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match the DTLN path (512/128) for a fair Oracle-vs-DTLN comparison.")
 
-        # Define Reference Microphone Index as middle index (same as DTLN wrappers)
+        # --- MICROFONO DE REFERENCIA ---
+        # El filtro de Souden proyecta la salida sobre UN canal de referencia: ese
+        # microfono define el "punto de escucha" (la voz se estima tal como llega a
+        # el). Si el benchmark inyecta 'ref_mic_idx' (p.ej. el mic mas cercano al
+        # centro geometrico del arreglo, geometry.select_reference_mic), se usa ese;
+        # si no, se cae al default historico M//2.
         M_tot = mic_signals.shape[0]
-        ref_mic_idx = M_tot // 2
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
 
         # 2. Retrieve the clean reference signals and build the ORACLE masks
         # These are the ground-truth (pre-hardware/pre-WPE) components; the mask
@@ -512,7 +536,8 @@ class ORACLE_MB_MVDR_SOUDEN:
             mask_n,
             min_loading=self.min_loading,
             save_weights=True,
-            alpha=self.alpha
+            alpha=self.alpha,
+            ref_mic_idx=ref_mic_idx
         )
 
         # 6. Compute ISTFT to return to the time domain
@@ -572,6 +597,11 @@ class SOUDEN_ORACLE_SCM:
         S_stft = _stft(speech_ref)
         N_stft = _stft(noise_ref)
 
+        # Microfono de referencia (punto de escucha del filtro de Souden). El
+        # benchmark puede inyectar 'ref_mic_idx' (mic mas cercano al centro
+        # geometrico del arreglo); default historico M//2.
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', mic_signals.shape[0] // 2))
+
         # 4. Alinear frames al minimo comun
         min_frames = min(X_stft.shape[1], S_stft.shape[1], N_stft.shape[1])
         X_stft = X_stft[:, :min_frames, :]
@@ -583,7 +613,8 @@ class SOUDEN_ORACLE_SCM:
             X_stft, S_stft, N_stft,
             min_loading=self.min_loading,
             save_weights=True,
-            alpha=self.alpha
+            alpha=self.alpha,
+            ref_mic_idx=ref_mic_idx
         )
 
         # 6. ISTFT
@@ -677,7 +708,8 @@ class MVDR_GEO_ORACLE_SCM:
             rel_loading=self.rel_loading,
             min_loading=self.min_loading,
             alpha=self.alpha,
-            ref_mic_idx=self.ref_mic_idx,
+            ref_mic_idx=(self.ref_mic_idx if self.ref_mic_idx is not None
+                         else scene_config.get('ref_mic_idx')),
             save_weights=True
         )
 
@@ -723,6 +755,12 @@ class MVDR_Recursive:
         mic_coords = scene_config['mic_coords']
         vad = scene_config['VAD']
 
+        # Microfono de REFERENCIA: fija el canal que reconstruye el filtro (o sea el
+        # DOMINIO de la salida) y por lo tanto contra cual hay que medir. El benchmark
+        # lo inyecta en 'ref_mic_idx' para que TODOS los procesadores y las metricas
+        # usen el mismo canal; sin esa clave se conserva el default historico.
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', 0))
+
         # Dynamic STFT configuration
         nperseg_dyn = scene_config.get('stft_window', self.nperseg)
         noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
@@ -755,7 +793,8 @@ class MVDR_Recursive:
             rel_loading=self.rel_loading,
             min_loading=self.min_loading,
             alpha=self.alpha,
-            save_weights=True
+            save_weights=True,
+            ref_mic_idx=ref_mic_idx
         )
 
         # 5. Inverse STFT to return to time domain
@@ -1137,6 +1176,12 @@ class MPDR_Recursive:
         source_pos = scene_config['source_pos'].reshape(1, 3)
         mic_coords = scene_config['mic_coords']
 
+        # Microfono de REFERENCIA: fija el canal que reconstruye el filtro (o sea el
+        # DOMINIO de la salida) y por lo tanto contra cual hay que medir. El benchmark
+        # lo inyecta en 'ref_mic_idx' para que TODOS los procesadores y las metricas
+        # usen el mismo canal; sin esa clave se conserva el default historico.
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', 0))
+
         # Dynamic STFT configuration
         nperseg_dyn = scene_config.get('stft_window', self.nperseg)
         noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
@@ -1161,7 +1206,8 @@ class MPDR_Recursive:
             source_pos=source_pos,
             beta=self.beta,
             min_loading=self.min_loading,
-            save_weights=True
+            save_weights=True,
+            ref_mic_idx=ref_mic_idx
         )
 
         # 4. Inverse STFT to return to the time domain
@@ -1222,8 +1268,12 @@ class NM_MVDR_PF:
         # sharpen_exp / smooth desde config si estan, si no los del __init__
         sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
 
+        # Microfono de REFERENCIA: fija el canal que reconstruye el filtro (o sea el
+        # DOMINIO de la salida) y por lo tanto contra cual hay que medir. El benchmark
+        # lo inyecta en 'ref_mic_idx' para que TODOS los procesadores y las metricas
+        # usen el mismo canal; sin esa clave se conserva el default historico.
         M_tot = mic_signals.shape[0]
-        ref_mic_idx = M_tot // 2
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
 
         # 2. Mascara DTLN sharpened (para el beamformer)
         mask_s, mask_n = get_dtln_masks_sharpen(
@@ -1251,7 +1301,7 @@ class NM_MVDR_PF:
         Y_stft, weights = MVDR_Souden_recursive_mask_specsub_base(
             X_stft, mask_s, mask_n, mask_s_soft,
             min_loading=self.min_loading, alpha=self.alpha,
-            smooth=self.smooth, save_weights=True
+            smooth=self.smooth, save_weights=True, ref_mic_idx=ref_mic_idx
         )
 
         # 7. ISTFT
@@ -1308,8 +1358,12 @@ class NM_MVDR_BAN_PF:
 
         sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
 
+        # Microfono de REFERENCIA: fija el canal que reconstruye el filtro (o sea el
+        # DOMINIO de la salida) y por lo tanto contra cual hay que medir. El benchmark
+        # lo inyecta en 'ref_mic_idx' para que TODOS los procesadores y las metricas
+        # usen el mismo canal; sin esa clave se conserva el default historico.
         M_tot = mic_signals.shape[0]
-        ref_mic_idx = M_tot // 2
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
 
         # 2. Mascara DTLN sharpened (para el beamformer)
         mask_s, mask_n = get_dtln_masks_sharpen(
@@ -1337,7 +1391,7 @@ class NM_MVDR_BAN_PF:
         Y_stft, weights = MVDR_Souden_recursive_mask_BAN_specsub_base(
             X_stft, mask_s, mask_n, mask_s_soft,
             min_loading=self.min_loading, alpha=self.alpha,
-            smooth=self.smooth, save_weights=True
+            smooth=self.smooth, save_weights=True, ref_mic_idx=ref_mic_idx
         )
 
         # 7. ISTFT

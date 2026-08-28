@@ -13,7 +13,8 @@ mismo contrato. Las mascaras se estiman aparte (ver dtln_masks.py).
 
 Las variantes se diferencian por el CRITERIO DE OPTIMIZACION / post-filtro:
 
-  - MVDR_Souden_recursive_mask        : MVDR base, factor de olvido alpha, ref=M//2.
+  - MVDR_Souden_recursive_mask        : MVDR base, factor de olvido alpha,
+                                        ref=ref_mic_idx (None -> M//2).
   - MVDR_Souden_recursive_mask_slow   : idem base pero aplica los pesos del frame
                                         anterior (variante experimental).
   - MVDR_Souden_recursive_mask_BAN    : acumulacion estricta (alpha=1) + Blind
@@ -36,7 +37,19 @@ import numpy as np
 # =====================================================================
 # MVDR base (Souden) con factor de olvido
 # =====================================================================
-def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False, alpha = 0.99):
+def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False, alpha = 0.99,
+                               ref_mic_idx=None):
+    """
+    MVDR de Souden mask-based, recursivo con factor de olvido alpha.
+
+    ref_mic_idx : int | None
+        Microfono de REFERENCIA sobre el que se proyecta la salida (el vector
+        one-hot `r` de la formula). Fija el "punto de escucha" del filtro: la
+        salida estima la voz TAL COMO LLEGA a ese canal. None -> M//2 (default
+        historico). El benchmark pasa aca el microfono mas cercano al centro
+        geometrico del arreglo (geometry.select_reference_mic), que es el que
+        minimiza la diferencia de camino acustico hacia el resto.
+    """
     K, T, M = X_stft.shape
 
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -48,14 +61,11 @@ def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_we
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
 
-    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula)
-
-
-        # Define Reference Microphone Index as middle index
-    ref_mic_idx = M // 2
-    ref_mic = ref_mic_idx
-
-
+    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's
+    # formula). Default historico: el indice del medio (M // 2).
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
 
     if save_weights:
         weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -123,7 +133,8 @@ def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_we
 # MVDR ORACLE (Souden) con covarianzas estimadas DIRECTAMENTE de las
 # señales limpias multicanal (sin mascara)
 # =====================================================================
-def MVDR_Souden_recursive_oracle(X_stft, S_stft, N_stft, min_loading=1e-6, save_weights=False, alpha=0.99):
+def MVDR_Souden_recursive_oracle(X_stft, S_stft, N_stft, min_loading=1e-6, save_weights=False, alpha=0.99,
+                                 ref_mic_idx=None):
     """
     Variante ORACLE del Souden MVDR. Identica a MVDR_Souden_recursive_mask salvo
     en la ESTIMACION de las covarianzas: en vez de ponderar la mezcla ruidosa por
@@ -136,6 +147,10 @@ def MVDR_Souden_recursive_oracle(X_stft, S_stft, N_stft, min_loading=1e-6, save_
     Los pesos resultantes se aplican a la MEZCLA OBSERVADA X_stft (K, T, M), igual
     que la version mask-based. Con alpha=1 tiende al oraculo global (SCM de toda la
     señal). Devuelve Y_stft (K, T) [+ pesos si save_weights=True].
+
+    ref_mic_idx : int | None
+        Microfono de referencia sobre el que se proyecta la salida (mismo rol que
+        en la version mask-based). None -> M//2 (default historico).
     """
     K, T, M = X_stft.shape
 
@@ -148,7 +163,9 @@ def MVDR_Souden_recursive_oracle(X_stft, S_stft, N_stft, min_loading=1e-6, save_
     Den = np.zeros((K, 1, 1), dtype=np.float64)
 
     # Reference microphone index (same convention as the mask-based version)
-    ref_mic = M // 2
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
 
     if save_weights:
         weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -201,7 +218,8 @@ def MVDR_Souden_recursive_oracle(X_stft, S_stft, N_stft, min_loading=1e-6, save_
         return Y_stft
 
 
-def MVDR_Souden_recursive_mask_slow(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False, alpha = 0.99):
+def MVDR_Souden_recursive_mask_slow(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False, alpha = 0.99,
+                                    ref_mic_idx=None):
     K, T, M = X_stft.shape
 
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -213,12 +231,13 @@ def MVDR_Souden_recursive_mask_slow(X_stft, mask_s, mask_n, min_loading=1e-6, sa
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
 
-    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula)
-
-
-        # Define Reference Microphone Index as middle index
-    ref_mic_idx = M // 2
-    ref_mic = ref_mic_idx
+    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula).
+    # ref_mic_idx=None -> M//2 (default historico de la familia Souden). El canal de
+    # referencia fija el DOMINIO de la salida: el filtro estima la voz TAL COMO LLEGA
+    # a ese microfono, asi que las metricas tienen que compararse contra ese canal.
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
 
 
     if save_weights:
@@ -289,7 +308,8 @@ def MVDR_Souden_recursive_mask_slow(X_stft, mask_s, mask_n, min_loading=1e-6, sa
 # =====================================================================
 # MVDR + Blind Analytical Normalization (BAN)
 # =====================================================================
-def MVDR_Souden_recursive_mask_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False):
+def MVDR_Souden_recursive_mask_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, save_weights=False,
+                                   ref_mic_idx=None):
     K, T, M = X_stft.shape
 
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -301,8 +321,13 @@ def MVDR_Souden_recursive_mask_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, sav
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
 
-    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula)
-    ref_mic = 0
+    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula).
+    # ref_mic_idx=None -> 0 (default historico de ESTA variante, distinto del M//2 del
+    # core base). Los wrappers del benchmark pasan siempre un indice explicito para que
+    # toda la familia proyecte sobre el MISMO canal que miden las metricas.
+    ref_mic = 0 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
 
     if save_weights:
         weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -384,7 +409,7 @@ def MVDR_Souden_recursive_mask_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, sav
 
 
 def MVDR_Souden_recursive_mask_BAN_alpha(X_stft, mask_s, mask_n, min_loading=1e-6,
-                                         save_weights=False, alpha=0.99):
+                                         save_weights=False, alpha=0.99, ref_mic_idx=None):
     K, T, M = X_stft.shape
 
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -396,8 +421,11 @@ def MVDR_Souden_recursive_mask_BAN_alpha(X_stft, mask_s, mask_n, min_loading=1e-
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
 
-    # Reference microphone index (igual que el original BAN)
-    ref_mic = 0
+    # Reference microphone index (ref_mic_idx=None -> 0, igual que el original BAN).
+    # Ver la nota del core BAN: el benchmark inyecta el canal explicito.
+    ref_mic = 0 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
 
     if save_weights:
         weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -753,7 +781,7 @@ def MVDR_Souden_recursive_mask_specsub(X_stft, mask_s, mask_n, mask_s_soft,
 
 def MVDR_Souden_recursive_mask_specsub_base(X_stft, mask_s, mask_n, mask_s_soft,
                                             min_loading=1e-6, alpha=0.99, smooth=0.33,
-                                            save_weights=False):
+                                            save_weights=False, ref_mic_idx=None):
     """
     Sustraccion espectral sobre el CORE BASE (MVDR_Souden_recursive_mask), el mismo
     beamformer que usa NM_MVDR (el de mejor rendimiento).
@@ -774,7 +802,7 @@ def MVDR_Souden_recursive_mask_specsub_base(X_stft, mask_s, mask_n, mask_s_soft,
     """
     res = MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n,
                                      min_loading=min_loading, alpha=alpha,
-                                     save_weights=save_weights)
+                                     save_weights=save_weights, ref_mic_idx=ref_mic_idx)
     Y, W = (res if save_weights else (res, None))
     Y = Y.copy()
 
@@ -789,7 +817,7 @@ def MVDR_Souden_recursive_mask_specsub_base(X_stft, mask_s, mask_n, mask_s_soft,
 
 def MVDR_Souden_recursive_mask_BAN_specsub_base(X_stft, mask_s, mask_n, mask_s_soft,
                                                 min_loading=1e-6, alpha=0.99, smooth=0.33,
-                                                save_weights=False):
+                                                save_weights=False, ref_mic_idx=None):
     """
     BAN sobre el CORE BASE + POST-FILTRO de sustraccion espectral.
 
@@ -813,7 +841,7 @@ def MVDR_Souden_recursive_mask_BAN_specsub_base(X_stft, mask_s, mask_n, mask_s_s
     """
     res = MVDR_Souden_recursive_mask_BAN_alpha(X_stft, mask_s, mask_n,
                                                min_loading=min_loading, alpha=alpha,
-                                               save_weights=save_weights)
+                                               save_weights=save_weights, ref_mic_idx=ref_mic_idx)
     Y, W = (res if save_weights else (res, None))
     Y = Y.copy()
 

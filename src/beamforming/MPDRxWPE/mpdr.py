@@ -9,7 +9,8 @@ from utils.audio import save_wav, normalize_signal
 from beamforming.MWF.SP_SDW_MWF_base import process_wpe_online
 
 
-def MPDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False):
+def MPDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loading=1e-6, save_weights=False,
+                   ref_mic_idx=0):
     """
     MPDR implementation: Updates the covariance matrix continuously using the 
     observed signal, without relying on a Voice Activity Detector (VAD).
@@ -18,10 +19,12 @@ def MPDR_recursive(X_stft, fs, array_geometry, source_pos, beta=1e-3, min_loadin
     K, T, M = X_stft.shape  
     frecs = np.linspace(0, fs/2, K)
 
-    # Get steering vectors, expected shape (K, M)
+    # Get steering vectors, expected shape (K, M).
+    # ref_mic_idx normaliza la RTF -> fija el canal que reconstruye la restriccion
+    # distortionless (el dominio de la salida). Default 0 = comportamiento historico.
     sv = compute_rtf_steering_vector(
-        frecs, source_pos, array_geometry, 
-        ref_mic_idx=0, mode="near_field", squeeze=True
+        frecs, source_pos, array_geometry,
+        ref_mic_idx=int(ref_mic_idx), mode="near_field", squeeze=True
     )
     
     # Initialize output complex STFT matrix
