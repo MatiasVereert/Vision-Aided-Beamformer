@@ -9,9 +9,38 @@ from utils.audio import save_wav
 # Assuming the import works correctly in your local environment
 from beamforming.signal_model import compute_rtf_steering_vector
 
-def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft, min_loading = 1e-6, save_weights=False):
-    lamda = 0.99
-    beta = 1e-2 # relative loading
+def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_length_fft,
+                   rel_loading=1e-2, min_loading=1e-6, alpha=0.99, save_weights=False):
+    """
+    MVDR geometrico adaptativo: steering vector near-field desde la posicion de la
+    fuente + covarianza de ruido R_nn recursiva, actualizada SOLO en los frames que
+    el VAD marca como sin voz.
+
+        w = R_nn^-1 d / (d^H R_nn^-1 d)
+
+    CARGA DIAGONAL (misma forma que la familia Souden en mask/souden_mvdr.py):
+
+        load = max( rel_loading * tr(R_nn)/M , min_loading )
+
+    es decir una carga RELATIVA a la energia de la matriz (`rel_loading`, adimensional)
+    con un piso ABSOLUTO (`min_loading`) que solo protege el arranque, cuando R_nn
+    todavia es la semilla 1e-6*I. Antes ambos numeros estaban mezclados: la escala
+    relativa era un `beta = 1e-2` hardcodeado y `min_loading` era el unico parametro
+    expuesto, con lo cual "min_loading=1e-6" NO significaba lo mismo que el
+    "min_loading=1e-6" de los mask-based (donde ESE es el factor relativo). La
+    equivalencia entre convenciones es:
+
+        souden_mvdr.MVDR_Souden_*(min_loading=x)  <->  rel_loading=x, min_loading~1e-9
+
+    Los defaults (rel_loading=1e-2, min_loading=1e-6, alpha=0.99) reproducen
+    EXACTAMENTE el comportamiento historico de esta funcion.
+
+    Nota de sintonia (medido sobre MIRD, RT 360/610 ms, 24 escenas): este beamformer
+    rinde mejor con carga PESADA (rel_loading ~1e-2). Bajarla a 1e-6 no mejora la
+    supresion (mismo SIR) y cuesta ~3.8 dB de SDR y ~3.2 dB de SAR: sin regularizar,
+    el desajuste del steering vector en sala reverberante hace que los nulos se coman
+    el propio target (autocancelacion). Los mask-based tienen el optimo al reves.
+    """
     K, T, M = X_stft.shape
     frecs = np.linspace(0, fs/2, K)
 
@@ -24,8 +53,6 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
     # Initialize noise covariance matrix R_nn for all frequencies (K, M, M)
     # We use a small diagonal loading to prevent singularities from the start
     R_nn = np.tile(np.eye(M, dtype=np.complex128) * 1e-6, (K, 1, 1))
-    count = 0
-
 
     #save weights
     weights_rec = np.zeros((K,T,M), dtype=np.complex128)
@@ -41,11 +68,11 @@ def MVDR_recursive(X_stft, vad, fs, array_geometry, source_pos, length_fft, hop_
         if not vad_status:
             # Outer product of the frame: (K, M) and (K, M) -> (K, M, M)
             R_nn_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
-            R_nn = lamda * R_nn + (1 - lamda) * R_nn_instant
+            R_nn = alpha * R_nn + (1 - alpha) * R_nn_instant
 
-        # Cálculo dinámico parametrizado
+        # Carga diagonal: escala RELATIVA + piso ABSOLUTO, ambos parametros.
         tr_R = np.real(np.trace(R_nn, axis1=1, axis2=2))
-        adaptive_load = beta * (tr_R[:, None, None] / M)
+        adaptive_load = rel_loading * (tr_R[:, None, None] / M)
         loading = np.maximum(adaptive_load, min_loading)
 
         R_nn_stable = R_nn + np.eye(M)[None, :, :] * loading
