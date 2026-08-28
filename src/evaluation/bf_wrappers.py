@@ -22,6 +22,50 @@ from beamforming.mask.souden_mvdr import (
     MVDR_Souden_recursive_oracle,
 )
 
+# ---------------------------------------------------------------------------
+# VENTANA DE LA STFT (analisis/sintesis) -- PARAMETRIZABLE
+# ---------------------------------------------------------------------------
+# Historicamente TODOS los wrappers usaban window='hamming' hardcodeado. Eso es
+# incompatible con acoplar el beamformer y el DTLN en UNA sola STFT: el DTLN
+# (tanto get_dtln_masks como apply_dtln_post_tflite_realtime) enmarca con ventana
+# RECTANGULAR (in_buffer -> np.fft.rfft, sin ventana) y hace overlap-add por suma
+# simple con block_len=512 / block_shift=128.
+#
+# `resolve_stft_window` deja elegir la ventana sin tocar el default: si no se
+# especifica nada devuelve 'hamming' -> resultados IDENTICOS a los previos.
+#
+# Prioridad: argumento de la instancia (win_type=...) > scene_config['stft_win_type']
+# > 'hamming'.
+#
+# Alias aceptados:
+#   'hamming'                       -> hamming (default historico)
+#   'hann' / 'hanning'              -> hann
+#   'rect' / 'rectangular' / 'boxcar' / 'none' -> boxcar (la del DTLN)
+#   'sqrt_hann'                     -> raiz de hann (WOLA simetrico analisis/sintesis)
+_WIN_ALIASES = {
+    'hamming': 'hamming',
+    'hann': 'hann', 'hanning': 'hann',
+    'rect': 'boxcar', 'rectangular': 'boxcar', 'boxcar': 'boxcar', 'none': 'boxcar',
+    'blackman': 'blackman',
+}
+
+
+def resolve_stft_window(scene_config, override=None, nperseg=512):
+    """Devuelve el argumento `window` para scipy.signal.stft/istft.
+
+    scene_config : dict de escena (se lee la clave opcional 'stft_win_type').
+    override     : valor de la instancia del wrapper (gana sobre la escena).
+    nperseg      : necesario solo para las ventanas construidas a mano.
+    """
+    w = override if override is not None else scene_config.get('stft_win_type', 'hamming')
+    if not isinstance(w, str):
+        return w  # ya es un array de ventana
+    key = w.strip().lower()
+    if key == 'sqrt_hann':
+        return np.sqrt(sig.get_window('hann', int(nperseg), fftbins=True))
+    return _WIN_ALIASES.get(key, key)
+
+
 class DS:
     """
     Standard Delay-and-Sum beamformer for baseline comparison.
@@ -174,13 +218,15 @@ class DTLN_MB_MVDR_SOUDEN_BAN:
     Wrapper for the DTLN mask-based MVDR beamformer.
     Integrates offline neural mask estimation with recursive spatial filtering.
     """
-    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6):
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, win_type=None):
         # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
         self.hop_length = nperseg - noverlap
         self.min_loading = min_loading
+        # Ventana de la STFT del beamformer. None -> 'hamming' (historico).
+        self.win_type = win_type
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
         # 1. Extract physical and operational configurations
@@ -217,10 +263,11 @@ class DTLN_MB_MVDR_SOUDEN_BAN:
             block_shift=hop_length_dyn
         )
 
-        # 3. Compute STFT
+        # 3. Compute STFT (ventana configurable: ver resolve_stft_window)
+        win_spec = resolve_stft_window(scene_config, self.win_type, nperseg_dyn)
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
-            mic_signals, fs=fs, window='hamming',
+            mic_signals, fs=fs, window=win_spec,
             nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
 
@@ -245,7 +292,7 @@ class DTLN_MB_MVDR_SOUDEN_BAN:
 
         # 6. Compute ISTFT to return to the time domain
         _, y_time = sig.istft(
-            Y_stft, fs=fs, window='hamming',
+            Y_stft, fs=fs, window=win_spec,
             nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
 
@@ -356,7 +403,8 @@ class NM_MVDR:
     comportamiento original (get_dtln_masks tenia el `** 4` fijo). Se puede
     overridear por escena con scene_config['dtln_sharpen_exp'].
     """
-    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, alpha=0.99, sharpen_exp=4.0):
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, alpha=0.99, sharpen_exp=4.0,
+                 win_type=None):
         # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
         self.nperseg = nperseg
         self.noverlap = noverlap
@@ -365,6 +413,9 @@ class NM_MVDR:
         self.min_loading = min_loading
         self.alpha = alpha
         self.sharpen_exp = sharpen_exp
+        # Ventana de la STFT del beamformer. None -> 'hamming' (comportamiento
+        # historico). 'rect'/'boxcar' = la misma que usa el DTLN internamente.
+        self.win_type = win_type
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
         # 1. Extract physical and operational configurations
@@ -407,10 +458,11 @@ class NM_MVDR:
             sharpen_exp=sharpen_exp
         )
 
-        # 3. Compute STFT
+        # 3. Compute STFT (ventana configurable: ver resolve_stft_window)
+        win_spec = resolve_stft_window(scene_config, self.win_type, nperseg_dyn)
         # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
         freqs, times, Zxx = sig.stft(
-            mic_signals, fs=fs, window='hamming',
+            mic_signals, fs=fs, window=win_spec,
             nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
 
@@ -436,7 +488,7 @@ class NM_MVDR:
 
         # 6. Compute ISTFT to return to the time domain
         _, y_time = sig.istft(
-            Y_stft, fs=fs, window='hamming',
+            Y_stft, fs=fs, window=win_spec,
             nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
         )
 

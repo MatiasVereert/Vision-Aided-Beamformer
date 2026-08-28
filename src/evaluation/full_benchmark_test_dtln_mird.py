@@ -847,6 +847,10 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 "M": 8, # Fixed MIRD Array size
                 "ref_mic_idx": ref_ch,   # canal de referencia (metricas + proyeccion)
                 "N_interferences": len(exp['interf_configs']),
+                # Geometria de las interferencias (angulo, distancia). Sin esta
+                # columna, dos escenas que solo difieren en DONDE esta el
+                # interferente quedan indistinguibles en el CSV/parquet.
+                "interf_configs": str(exp['interf_configs']),
                 "mismatch_pos": 0.0, # Physical arrays inherently contain positioning reality, no injected random mismatch
                 "isir_db": exp['isir_db'],
                 "mismatch_gain": exp['mismatch_gain'],

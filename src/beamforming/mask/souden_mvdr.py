@@ -325,7 +325,7 @@ def MVDR_Souden_recursive_mask_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, sav
     # ref_mic_idx=None -> 0 (default historico de ESTA variante, distinto del M//2 del
     # core base). Los wrappers del benchmark pasan siempre un indice explicito para que
     # toda la familia proyecte sobre el MISMO canal que miden las metricas.
-    ref_mic = 0 if ref_mic_idx is None else int(ref_mic_idx)
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
     if not (0 <= ref_mic < M):
         raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
 
