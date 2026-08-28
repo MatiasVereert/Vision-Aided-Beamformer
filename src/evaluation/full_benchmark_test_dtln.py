@@ -5,7 +5,6 @@ import hashlib
 import h5py
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
 
 import tensorflow as tf
 from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
@@ -20,6 +19,7 @@ from propagation.mird_loader import generate_mird_linear_array, generate_mird_li
 from utils.geometry import spherical_to_cartesian
 from dereverberation.nara_wrappers import process_wpe_online_with_components
 from evaluation.metrics import evaluate_full_pipeline
+from evaluation.bench_ui import BenchmarkUI, compact_config, varying_keys
 
 from evaluation.bf_wrappers import (
     DS,
@@ -208,7 +208,16 @@ def evaluate_all_references(refs_dict, deg_sig, fs, interf_early, interf_late, t
     return combined_metrics
 
 
-def run_grid_search(grid_params, room_profiles, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None, save_catalog=True, apply_dtln_post=True):
+def run_grid_search(grid_params, room_profiles, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None, save_catalog=True, apply_dtln_post=True,
+                    show_progress=True, quiet_console=True):
+    """
+    Barrido ISM. `show_progress`/`quiet_console` SOLO afectan la consola:
+      show_progress=False -> sin panel de barras (log plano, util en CI/logs).
+      quiet_console=False -> deja pasar los prints internos de procesadores y
+                             metricas (util para depurar una etapa puntual).
+    Ninguno de los dos cambia las llamadas, el orden de ejecucion ni el DataFrame
+    devuelto.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     # geometry_mode selecciona como se arma la escena en Node 1:
@@ -269,8 +278,9 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
     # early/late reference, otherwise the Delta metrics are biased by a moving
     # target and cells are not comparable (correction A1, alineado con el modulo MIRD).
     t_early_dynamic = scene_base_config['t_early']
-    tqdm.write(f"[*] t_early FIXED at {t_early_dynamic*1000:.1f} ms (decoupled from wpe_delay).")
-    tqdm.write(f"[*] Total experiments to run: {len(experiments)} per processor.")
+    print(f"[*] t_early FIXED at {t_early_dynamic*1000:.1f} ms (decoupled from wpe_delay).")
+    print(f"[*] Total experiments to run: {len(experiments)} per processor "
+          f"({len(processors)} processors -> {len(experiments) * len(processors)} rows).")
 
     # Base tracked metrics. Leaderboard will specifically track the '_early' variations.
     tracked_metrics = ["Delta_tot_PESQ", "Delta_tot_STOI", "Delta_tot_SDR", "Delta_tot_SIR", "Delta_tot_SAR", "Delta_tot_SINR", "Delta_tot_CD"]
@@ -312,9 +322,14 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
 
     use_dtln = interpreter_1 is not None and interpreter_2 is not None
 
+    # --- PANEL DE CONSOLA (3 lineas fijas: total / prueba / etapa) ---
+    ui = BenchmarkUI(len(experiments), desc="ISM Benchmark", unit="exp",
+                     quiet=quiet_console, enabled=show_progress)
+    # La etiqueta de cada prueba muestra solo los ejes que realmente se barren.
+    label_keys = varying_keys(experiments)
+
     # 4. Main Orchestrator Loop
-    for i, exp in enumerate(tqdm(experiments, desc="Running Benchmark", unit="exp")):
-        tqdm.write(f"\n--- Iteration {i+1}/{len(experiments)} | Config: {exp} ---")
+    for i, exp in enumerate(experiments):
 
         if geom_mode == 'mird_linear':
             recalc_physics = (exp['rt60'] != current_rt60 or
@@ -338,6 +353,19 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
                                              exp['mismatch_phase'] != current_phase_mismatch)
         recalc_wpe = recalc_hardware or (exp['use_wpe'] != current_use_wpe)
 
+        # Presupuesto de etapas de ESTA prueba = 100% de la barra inferior. Se
+        # deriva de los flags de cache (los nodos reusados no cuentan) + el trabajo
+        # por procesador. Es solo para la escala de la barra; si aparecen mas
+        # etapas de las previstas, BenchmarkUI estira el total.
+        n_steps = ((1 if recalc_physics else 0) + (1 if recalc_mixture else 0) +
+                   (2 if recalc_hardware else 0))
+        if recalc_wpe:
+            n_steps += 2 if exp['use_wpe'] else 1
+            if use_dtln:
+                n_steps += 2
+        n_steps += len(processors) * (2 + (2 if (use_dtln and apply_dtln_post) else 0))
+        ui.begin_experiment(i, compact_config(exp, keep=label_keys), steps=n_steps)
+
         # ---------------------------------------------------------
         # NODE 1: GEOMETRY AND PHYSICS
         # ---------------------------------------------------------
@@ -347,60 +375,62 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             # angulo/distancia que full_benchmark_test_dtln_mird, pero las RIRs
             # se COMPUTAN con el modelo ISM calibrado (compute_rirs) en una
             # shoebox de dimensiones scene_base_config['room_dims'] (MIRD: 6x6x2.4).
-            tqdm.write(" -> [NODE 1|MIRD-replica] Building linear array + simulating RIRs (ISM)...")
-            current_room_dims = np.array(scene_base_config['room_dims'], dtype=float)
-            array_center = np.array(scene_base_config['array_center'], dtype=float)
+            ui.stage(f"[NODE 1|MIRD-replica] array lineal + RIRs ISM "
+                     f"(rt60={exp['rt60']}, dist={exp['target_dist']} m, ang={exp['target_angle']} deg)")
+            with ui.quiet():
+                current_room_dims = np.array(scene_base_config['room_dims'], dtype=float)
+                array_center = np.array(scene_base_config['array_center'], dtype=float)
 
-            # Array lineal construido desde el spacing (barrer las 3 config MIRD:
-            # 3-3-3-8-3-3-3 / 4-4-4-8-4-4-4 / 8-8-8-8-8-8-8). Default 4-4-4.
-            mird_spacing = scene_base_config.get('mird_spacing', '4-4-4-8-4-4-4')
-            mic_coords = generate_mird_linear_array_from_spacing(mird_spacing) + array_center
-            scene_base_config['mic_coords'] = mic_coords
+                # Array lineal construido desde el spacing (barrer las 3 config MIRD:
+                # 3-3-3-8-3-3-3 / 4-4-4-8-4-4-4 / 8-8-8-8-8-8-8). Default 4-4-4.
+                mird_spacing = scene_base_config.get('mird_spacing', '4-4-4-8-4-4-4')
+                mic_coords = generate_mird_linear_array_from_spacing(mird_spacing) + array_center
+                scene_base_config['mic_coords'] = mic_coords
 
-            acoustic_scene = SimAcoustic(
-                array_geometry=mic_coords, array_mismatch=0.0,  # array real, sin mismatch posicional inyectado
-                duration=scene_base_config['duration'], fs=scene_base_config['fs']
-            )
+                acoustic_scene = SimAcoustic(
+                    array_geometry=mic_coords, array_mismatch=0.0,  # array real, sin mismatch posicional inyectado
+                    duration=scene_base_config['duration'], fs=scene_base_config['fs']
+                )
 
-            # Target por (angulo, distancia) con la MISMA convencion que MIRD:
-            # spherical_to_cartesian(r, az=deg2rad(angle), inc=pi/2) -> (r cos, r sin, 0)
-            # con el array a lo largo de Y => angle 0 = broadside (+X).
-            scene_base_config['source_path'] = exp['source_path']
-            rel_target = spherical_to_cartesian(
-                np.array([exp['target_dist']], dtype=float),
-                np.array([np.deg2rad(exp['target_angle'])], dtype=float),
-                np.array([np.pi / 2.0], dtype=float),
-            ).squeeze()
-            source_pos = (array_center + rel_target).reshape(1, 3)
-            scene_base_config['source_pos'] = source_pos
-            acoustic_scene.set_source(exp['source_path'], gain=1.0, position=source_pos)
-
-            interferences_pos = []
-            for idx, interf_cfg in enumerate(exp['interf_configs']):
-                i_ang = interf_cfg[0]
-                i_dist = interf_cfg[1]
-                if len(interf_cfg) >= 3:
-                    audio_idx = interf_cfg[2]
-                else:
-                    audio_idx = idx % len(scene_base_config['interf_paths'])
-
-                rel_i = spherical_to_cartesian(
-                    np.array([i_dist], dtype=float),
-                    np.array([np.deg2rad(i_ang)], dtype=float),
+                # Target por (angulo, distancia) con la MISMA convencion que MIRD:
+                # spherical_to_cartesian(r, az=deg2rad(angle), inc=pi/2) -> (r cos, r sin, 0)
+                # con el array a lo largo de Y => angle 0 = broadside (+X).
+                scene_base_config['source_path'] = exp['source_path']
+                rel_target = spherical_to_cartesian(
+                    np.array([exp['target_dist']], dtype=float),
+                    np.array([np.deg2rad(exp['target_angle'])], dtype=float),
                     np.array([np.pi / 2.0], dtype=float),
                 ).squeeze()
-                abs_i = array_center + rel_i
-                interferences_pos.append(abs_i)
-                acoustic_scene.set_interference(
-                    audio_path=scene_base_config['interf_paths'][audio_idx],
-                    gain=1.0, position=abs_i.reshape(1, 3)
-                )
-            scene_base_config['interferences_pos'] = (np.asarray(interferences_pos)
-                                                      if interferences_pos else np.zeros((0, 3)))
+                source_pos = (array_center + rel_target).reshape(1, 3)
+                scene_base_config['source_pos'] = source_pos
+                acoustic_scene.set_source(exp['source_path'], gain=1.0, position=source_pos)
 
-            acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'],
-                                        ray_tracing=scene_base_config.get('ray_tracing', False))
-            acoustic_scene.convolve_signals(t_early=t_early_dynamic)
+                interferences_pos = []
+                for idx, interf_cfg in enumerate(exp['interf_configs']):
+                    i_ang = interf_cfg[0]
+                    i_dist = interf_cfg[1]
+                    if len(interf_cfg) >= 3:
+                        audio_idx = interf_cfg[2]
+                    else:
+                        audio_idx = idx % len(scene_base_config['interf_paths'])
+
+                    rel_i = spherical_to_cartesian(
+                        np.array([i_dist], dtype=float),
+                        np.array([np.deg2rad(i_ang)], dtype=float),
+                        np.array([np.pi / 2.0], dtype=float),
+                    ).squeeze()
+                    abs_i = array_center + rel_i
+                    interferences_pos.append(abs_i)
+                    acoustic_scene.set_interference(
+                        audio_path=scene_base_config['interf_paths'][audio_idx],
+                        gain=1.0, position=abs_i.reshape(1, 3)
+                    )
+                scene_base_config['interferences_pos'] = (np.asarray(interferences_pos)
+                                                          if interferences_pos else np.zeros((0, 3)))
+
+                acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'],
+                                            ray_tracing=scene_base_config.get('ray_tracing', False))
+                acoustic_scene.convolve_signals(t_early=t_early_dynamic)
 
             current_rt60 = exp['rt60']
             current_target_angle = exp['target_angle']
@@ -425,125 +455,130 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             #     la interferencia del plano del arreglo (estresor principal).
             # Las distancias se recortan con max_distance_in_room para no salir de
             # la sala (margen de pared configurable).
-            tqdm.write(f" -> [NODE 1|topology] Building '{exp['topology']}' array "
-                       f"(M={exp['M']}, D={exp['diameter']} m) | room RT={exp['rt60']}s | "
-                       f"interf='{exp['interf_scenario']}' | src_dist={exp['source_dist']}m; simulating RIRs (ISM)...")
-            current_room_dims = np.asarray(room_profiles[exp['rt60']], dtype=float)
+            ui.stage(f"[NODE 1|topology] array '{exp['topology']}' (M={exp['M']}, D={exp['diameter']} m) "
+                     f"| RT={exp['rt60']}s | interf='{exp['interf_scenario']}' "
+                     f"| src_dist={exp['source_dist']} m; RIRs ISM")
+            with ui.quiet():
+                current_room_dims = np.asarray(room_profiles[exp['rt60']], dtype=float)
 
-            # Centro del array: mapa por rt60 (descentrado); fallback al centro de sala.
-            ac_map = scene_base_config.get('array_center_map', {})
-            array_center = np.asarray(ac_map.get(exp['rt60'], current_room_dims / 2.0), dtype=float)
-            wall_margin = scene_base_config.get('wall_margin', 0.3)
+                # Centro del array: mapa por rt60 (descentrado); fallback al centro de sala.
+                ac_map = scene_base_config.get('array_center_map', {})
+                array_center = np.asarray(ac_map.get(exp['rt60'], current_room_dims / 2.0), dtype=float)
+                wall_margin = scene_base_config.get('wall_margin', 0.3)
 
-            # La topologia 'random' recibe una semilla ESTABLE derivada de la fisica
-            # de la escena: el mismo arreglo aleatorio se reproduce entre corridas y
-            # es reutilizado IDENTICO por todos los procesadores (Node 1 se cachea y
-            # el loop de procesadores esta anidado adentro). topology_kwargs permite
-            # pasar opciones por-topologia (p.ej. n_turns, inner_ratio).
-            # topology_kwargs admite DOS formas:
-            #   - kwargs planos  {'n_turns': 2.0}          -> valen para todas las topologias
-            #   - por topologia  {'grid': {'area_mode': 'cell'}, 'spiral': {...}}
-            #     -> se detecta cuando TODOS los valores son dicts; cada topologia
-            #        recibe solo los suyos (una topologia ausente recibe {}).
-            _topo_cfg = scene_base_config.get('topology_kwargs', {}) or {}
-            if _topo_cfg and all(isinstance(v, dict) for v in _topo_cfg.values()):
-                topo_kwargs = dict(_topo_cfg.get(exp['topology'], {}))
-            else:
-                topo_kwargs = dict(_topo_cfg)
-            if exp['topology'] == 'random':
-                topo_kwargs.setdefault('seed', compute_scene_seed(exp, scene_base_config))
-            mic_coords = generate_array_coords(
-                topology=exp['topology'], M=exp['M'], diameter=exp['diameter'], **topo_kwargs
-            ) + array_center
-            scene_base_config['mic_coords'] = mic_coords
+                # La topologia 'random' recibe una semilla ESTABLE derivada de la fisica
+                # de la escena: el mismo arreglo aleatorio se reproduce entre corridas y
+                # es reutilizado IDENTICO por todos los procesadores (Node 1 se cachea y
+                # el loop de procesadores esta anidado adentro). topology_kwargs permite
+                # pasar opciones por-topologia (p.ej. n_turns, inner_ratio).
+                # topology_kwargs admite DOS formas:
+                #   - kwargs planos  {'n_turns': 2.0}          -> valen para todas las topologias
+                #   - por topologia  {'grid': {'area_mode': 'cell'}, 'spiral': {...}}
+                #     -> se detecta cuando TODOS los valores son dicts; cada topologia
+                #        recibe solo los suyos (una topologia ausente recibe {}).
+                _topo_cfg = scene_base_config.get('topology_kwargs', {}) or {}
+                if _topo_cfg and all(isinstance(v, dict) for v in _topo_cfg.values()):
+                    topo_kwargs = dict(_topo_cfg.get(exp['topology'], {}))
+                else:
+                    topo_kwargs = dict(_topo_cfg)
+                if exp['topology'] == 'random':
+                    topo_kwargs.setdefault('seed', compute_scene_seed(exp, scene_base_config))
+                mic_coords = generate_array_coords(
+                    topology=exp['topology'], M=exp['M'], diameter=exp['diameter'], **topo_kwargs
+                ) + array_center
+                scene_base_config['mic_coords'] = mic_coords
 
-            acoustic_scene = SimAcoustic(
-                array_geometry=mic_coords, array_mismatch=exp['mismatch_pos'],
-                duration=scene_base_config['duration'], fs=scene_base_config['fs']
-            )
-
-            # --- FUENTE (target) por (azimut, elevacion, distancia slant) ---
-            # Por defecto se toman los angulos globales de config y la distancia del
-            # eje del grid (exp['source_dist']). Si el config trae 'source_specs' (un
-            # dict {interf_scenario -> (az, el, dist)}, usado en el modo de escenas
-            # aleatorias), la spec por-escena OVERRIDE los tres valores. Backward-
-            # compatible: sin 'source_specs' el comportamiento es identico al previo.
-            s_az = scene_base_config.get('source_azimuth_deg', 0.0)
-            s_el = scene_base_config.get('source_elevation_deg', 0.0)
-            s_dist_req = float(exp['source_dist'])
-            _src_specs = scene_base_config.get('source_specs')
-            if _src_specs is not None and exp['interf_scenario'] in _src_specs:
-                s_az, s_el, s_dist_req = (float(v) for v in _src_specs[exp['interf_scenario']])
-            s_dist = min(s_dist_req, max_distance_in_room(s_az, s_el, array_center, current_room_dims, wall_margin))
-            if s_dist < s_dist_req - 1e-6:
-                tqdm.write(f"    [!] source dist recortada {s_dist_req:.2f}->{s_dist:.2f} m (pared).")
-            source_pos = place_spherical(s_az, s_el, s_dist, array_center).reshape(1, 3)
-            scene_base_config['source_pos'] = source_pos
-            acoustic_scene.set_source(scene_base_config['source_path'], gain=1.0, position=source_pos)
-
-            # --- INTERFERENCIAS 3D segun el escenario seleccionado ---
-            specs = scene_base_config['interf_scenarios'][exp['interf_scenario']]
-            interferences_pos = []
-            for idx, (i_az, i_el, i_dist_req) in enumerate(specs):
-                i_dist = min(float(i_dist_req),
-                             max_distance_in_room(i_az, i_el, array_center, current_room_dims, wall_margin))
-                if i_dist < float(i_dist_req) - 1e-6:
-                    tqdm.write(f"    [!] interf {idx} dist recortada {float(i_dist_req):.2f}->{i_dist:.2f} m (pared).")
-                pos = place_spherical(i_az, i_el, i_dist, array_center)
-                interferences_pos.append(pos)
-                path_idx = idx % len(scene_base_config['interf_paths'])
-                acoustic_scene.set_interference(
-                    audio_path=scene_base_config['interf_paths'][path_idx],
-                    gain=1.0, position=pos.reshape(1, 3)
+                acoustic_scene = SimAcoustic(
+                    array_geometry=mic_coords, array_mismatch=exp['mismatch_pos'],
+                    duration=scene_base_config['duration'], fs=scene_base_config['fs']
                 )
-            scene_base_config['interferences_pos'] = (np.asarray(interferences_pos)
-                                                      if interferences_pos else np.zeros((0, 3)))
 
-            acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'],
-                                        ray_tracing=scene_base_config.get('ray_tracing', True))
-            acoustic_scene.convolve_signals(t_early=t_early_dynamic)
+                # --- FUENTE (target) por (azimut, elevacion, distancia slant) ---
+                # Por defecto se toman los angulos globales de config y la distancia del
+                # eje del grid (exp['source_dist']). Si el config trae 'source_specs' (un
+                # dict {interf_scenario -> (az, el, dist)}, usado en el modo de escenas
+                # aleatorias), la spec por-escena OVERRIDE los tres valores. Backward-
+                # compatible: sin 'source_specs' el comportamiento es identico al previo.
+                s_az = scene_base_config.get('source_azimuth_deg', 0.0)
+                s_el = scene_base_config.get('source_elevation_deg', 0.0)
+                s_dist_req = float(exp['source_dist'])
+                _src_specs = scene_base_config.get('source_specs')
+                if _src_specs is not None and exp['interf_scenario'] in _src_specs:
+                    s_az, s_el, s_dist_req = (float(v) for v in _src_specs[exp['interf_scenario']])
+                s_dist = min(s_dist_req, max_distance_in_room(s_az, s_el, array_center, current_room_dims, wall_margin))
+                if s_dist < s_dist_req - 1e-6:
+                    ui.log(f" [!] exp {i+1}/{len(experiments)}: source dist recortada "
+                           f"{s_dist_req:.2f}->{s_dist:.2f} m (pared).")
+                source_pos = place_spherical(s_az, s_el, s_dist, array_center).reshape(1, 3)
+                scene_base_config['source_pos'] = source_pos
+                acoustic_scene.set_source(scene_base_config['source_path'], gain=1.0, position=source_pos)
+
+                # --- INTERFERENCIAS 3D segun el escenario seleccionado ---
+                specs = scene_base_config['interf_scenarios'][exp['interf_scenario']]
+                interferences_pos = []
+                for idx, (i_az, i_el, i_dist_req) in enumerate(specs):
+                    i_dist = min(float(i_dist_req),
+                                 max_distance_in_room(i_az, i_el, array_center, current_room_dims, wall_margin))
+                    if i_dist < float(i_dist_req) - 1e-6:
+                        ui.log(f" [!] exp {i+1}/{len(experiments)}: interf {idx} dist recortada "
+                               f"{float(i_dist_req):.2f}->{i_dist:.2f} m (pared).")
+                    pos = place_spherical(i_az, i_el, i_dist, array_center)
+                    interferences_pos.append(pos)
+                    path_idx = idx % len(scene_base_config['interf_paths'])
+                    acoustic_scene.set_interference(
+                        audio_path=scene_base_config['interf_paths'][path_idx],
+                        gain=1.0, position=pos.reshape(1, 3)
+                    )
+                scene_base_config['interferences_pos'] = (np.asarray(interferences_pos)
+                                                          if interferences_pos else np.zeros((0, 3)))
+
+                acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'],
+                                            ray_tracing=scene_base_config.get('ray_tracing', True))
+                acoustic_scene.convolve_signals(t_early=t_early_dynamic)
             current_rt60, current_M, current_mismatch_pos = exp['rt60'], exp['M'], exp['mismatch_pos']
             current_N_int = len(specs)
             current_topology, current_diameter = exp['topology'], exp['diameter']
             current_interf_scenario, current_source_dist = exp['interf_scenario'], exp['source_dist']
 
         elif recalc_physics:
-            tqdm.write(" -> [NODE 1] Physics changed. Re-computing RIRs...")
-            current_room_dims = room_profiles[exp['rt60']]
-            room_center = current_room_dims / 2.0
+            ui.stage(f"[NODE 1] fisica nueva: RIRs ISM (rt60={exp['rt60']}, M={exp['M']}, "
+                     f"N_int={exp['N_interferences']})")
+            with ui.quiet():
+                current_room_dims = room_profiles[exp['rt60']]
+                room_center = current_room_dims / 2.0
 
-            mic_coords = generate_log_array_coords(
-                M=exp['M'], d_min=scene_base_config['d_min'],
-                d_max=scene_base_config['d_max'], room_dims=current_room_dims
-            )
-            scene_base_config['mic_coords'] = mic_coords
+                mic_coords = generate_log_array_coords(
+                    M=exp['M'], d_min=scene_base_config['d_min'],
+                    d_max=scene_base_config['d_max'], room_dims=current_room_dims
+                )
+                scene_base_config['mic_coords'] = mic_coords
 
-            acoustic_scene = SimAcoustic(
-                array_geometry=mic_coords, array_mismatch=exp['mismatch_pos'],
-                duration=scene_base_config['duration'], fs=scene_base_config['fs']
-            )
-
-            source_pos, interferences_pos = generate_source_and_interferences(
-                N_interferences=exp['N_interferences'], radius_source=scene_base_config['radius_source'],
-                radius_interf=scene_base_config['radius_interf'], delta_ang_deg=scene_base_config['delta_ang_deg'],
-                array_center=room_center
-            )
-            scene_base_config['source_pos'] = source_pos
-            # Persist absolute interference positions so they can be saved to H5 and
-            # rendered by the dashboard (shape (N_interferences, 3)).
-            scene_base_config['interferences_pos'] = interferences_pos
-
-            acoustic_scene.set_source(scene_base_config['source_path'], gain=1.0, position=source_pos.reshape(1,3))
-            for idx in range(exp['N_interferences']):
-                path_idx = idx % len(scene_base_config['interf_paths'])
-                acoustic_scene.set_interference(
-                    audio_path=scene_base_config['interf_paths'][path_idx],
-                    gain=1.0, position=interferences_pos[idx].reshape(1,3)
+                acoustic_scene = SimAcoustic(
+                    array_geometry=mic_coords, array_mismatch=exp['mismatch_pos'],
+                    duration=scene_base_config['duration'], fs=scene_base_config['fs']
                 )
 
-            acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'],
-                                        ray_tracing=scene_base_config.get('ray_tracing', True))
-            acoustic_scene.convolve_signals(t_early=t_early_dynamic)
+                source_pos, interferences_pos = generate_source_and_interferences(
+                    N_interferences=exp['N_interferences'], radius_source=scene_base_config['radius_source'],
+                    radius_interf=scene_base_config['radius_interf'], delta_ang_deg=scene_base_config['delta_ang_deg'],
+                    array_center=room_center
+                )
+                scene_base_config['source_pos'] = source_pos
+                # Persist absolute interference positions so they can be saved to H5 and
+                # rendered by the dashboard (shape (N_interferences, 3)).
+                scene_base_config['interferences_pos'] = interferences_pos
+
+                acoustic_scene.set_source(scene_base_config['source_path'], gain=1.0, position=source_pos.reshape(1,3))
+                for idx in range(exp['N_interferences']):
+                    path_idx = idx % len(scene_base_config['interf_paths'])
+                    acoustic_scene.set_interference(
+                        audio_path=scene_base_config['interf_paths'][path_idx],
+                        gain=1.0, position=interferences_pos[idx].reshape(1,3)
+                    )
+
+                acoustic_scene.compute_rirs(room_dimensions=current_room_dims, desire_RT=exp['rt60'],
+                                            ray_tracing=scene_base_config.get('ray_tracing', True))
+                acoustic_scene.convolve_signals(t_early=t_early_dynamic)
             current_rt60, current_M, current_N_int, current_mismatch_pos = exp['rt60'], exp['M'], exp['N_interferences'], exp['mismatch_pos']
 
         # ---------------------------------------------------------
@@ -581,16 +616,17 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             # Se propaga a los procesadores (los wrappers leen 'ref_mic_idx'; sin
             # esta clave conservan su default historico M//2).
             if scene_base_config.get('ref_mic_idx') != ref_ch:
-                tqdm.write(f" -> [REF-MIC] ref_mic_mode='{ref_mic_mode}' -> canal {ref_ch} "
-                           f"(metricas + proyeccion de los beamformers).")
+                ui.log(f" [*] [REF-MIC] ref_mic_mode='{ref_mic_mode}' -> canal {ref_ch} "
+                       f"(metricas + proyeccion de los beamformers).")
             scene_base_config['ref_mic_idx'] = ref_ch
 
         # ---------------------------------------------------------
         # NODE 2: ACOUSTIC MIXTURE & GROUND TRUTHS PREPARATION
         # ---------------------------------------------------------
         if recalc_mixture:
-            tqdm.write(f" -> [NODE 2] Applying acoustic mixture (iSIR = {exp['isir_db']} dB)...")
-            scene_data = acoustic_scene.mix_and_normalize(iSIR_dB=exp['isir_db'])
+            ui.stage(f"[NODE 2] mezcla acustica (iSIR = {exp['isir_db']} dB)")
+            with ui.quiet():
+                scene_data = acoustic_scene.mix_and_normalize(iSIR_dB=exp['isir_db'])
             current_isir_db = exp['isir_db']
             scene_base_config['VAD'] = scene_data["VAD"]
 
@@ -617,16 +653,18 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
         # NODE 3: HARDWARE EMULATION & BASELINE
         # ---------------------------------------------------------
         if recalc_hardware:
-            tqdm.write(f" -> [NODE 3] Emulating hardware (Gain: {exp['mismatch_gain']}dB, Phase: {exp['mismatch_phase']}deg)...")
+            ui.stage(f"[NODE 3] emulacion de hardware (gain {exp['mismatch_gain']} dB, "
+                     f"fase {exp['mismatch_phase']} deg)")
             # Semilla derivada SOLO de la fisica de la escena (no del mismatch): fija
             # el patron base de mismatch/ruido para que el barrido de gain/phase varie
             # solo la escala del error. Al no depender del mismatch, set_seed es no-op
             # cuando solo cambian gain/phase -> se preservan los patrones cacheados.
             mic_simulator.set_seed(compute_scene_seed(exp, scene_base_config))
-            mic_simulator.set_custom_errors(
-                std_gain_dB=exp['mismatch_gain'], std_phase_deg=exp['mismatch_phase'], snr_dB=scene_base_config['snr_db']
-            )
-            mic_signals_degraded = mic_simulator.emulate(unprocessed_mic_signals)
+            with ui.quiet():
+                mic_simulator.set_custom_errors(
+                    std_gain_dB=exp['mismatch_gain'], std_phase_deg=exp['mismatch_phase'], snr_dB=scene_base_config['snr_db']
+                )
+                mic_signals_degraded = mic_simulator.emulate(unprocessed_mic_signals)
             current_gain_mismatch, current_phase_mismatch = exp['mismatch_gain'], exp['mismatch_phase']
 
             # --- COMPONENTES POST-HW PARA EL ORACLE (dominio de la observacion) ---
@@ -643,43 +681,47 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             hw_oracle_target = mic_simulator._apply_mismatch(target_clean)
             hw_oracle_noise = mic_signals_degraded - hw_oracle_target
 
-            tqdm.write(" -> Evaluating Baseline Metrics against all references...")
-            baseline_metrics = evaluate_all_references(
-                refs_dict=refs_dict, deg_sig=mic_signals_degraded[ref_ch], fs=scene_base_config['fs'],
-                interf_early=scene_data["interference_early"][ref_ch],
-                interf_late=scene_data["interference_late"][ref_ch],
-                target_late=scene_data["target_late"][ref_ch],
-                eval_start_s=eval_start_s, prefix_name=f"Baseline_Exp_{i}"
-            )
+            ui.stage("[NODE 3] metricas del baseline (todas las referencias)")
+            with ui.quiet():
+                baseline_metrics = evaluate_all_references(
+                    refs_dict=refs_dict, deg_sig=mic_signals_degraded[ref_ch], fs=scene_base_config['fs'],
+                    interf_early=scene_data["interference_early"][ref_ch],
+                    interf_late=scene_data["interference_late"][ref_ch],
+                    target_late=scene_data["target_late"][ref_ch],
+                    eval_start_s=eval_start_s, prefix_name=f"Baseline_Exp_{i}"
+                )
 
         # ---------------------------------------------------------
         # NODE 4: WPE PRE-PROCESSING
         # ---------------------------------------------------------
         if recalc_wpe:
             if exp['use_wpe']:
-                tqdm.write(" -> [NODE 4] Applying heavy WPE pre-processing (float)...")
+                ui.stage(f"[NODE 4] WPE online (float) taps={scene_base_config['wpe_taps']} "
+                         f"delay={scene_base_config['wpe_delay']}")
                 # Un solo pase de WPE que devuelve la mezcla dereverberada Y las
                 # componentes target/ruido filtradas con el MISMO G (estimado de la
                 # mezcla). Al ser lineal dado G: WPE(target)+WPE(ruido)==WPE(mezcla).
                 # z_u es IDENTICO (bit a bit) a process_wpe_online(mezcla).
-                mic_signals_ready, (oracle_target, oracle_noise) = process_wpe_online_with_components(
-                    u=mic_signals_degraded,
-                    components=[hw_oracle_target, hw_oracle_noise],
-                    taps=scene_base_config['wpe_taps'], delay=scene_base_config['wpe_delay'],
-                    alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'],
-                    stft_shift=scene_base_config['wpe_stft_shift'],
-                )
+                with ui.quiet():
+                    mic_signals_ready, (oracle_target, oracle_noise) = process_wpe_online_with_components(
+                        u=mic_signals_degraded,
+                        components=[hw_oracle_target, hw_oracle_noise],
+                        taps=scene_base_config['wpe_taps'], delay=scene_base_config['wpe_delay'],
+                        alpha=scene_base_config['wpe_alpha'], stft_size=scene_base_config['wpe_stft_size'],
+                        stft_shift=scene_base_config['wpe_stft_shift'],
+                    )
 
-                tqdm.write(" -> Evaluating WPE Metrics against all references...")
-                wpe_metrics = evaluate_all_references(
-                    refs_dict=refs_dict, deg_sig=mic_signals_ready[ref_ch], fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][ref_ch],
-                    interf_late=scene_data["interference_late"][ref_ch],
-                    target_late=scene_data["target_late"][ref_ch],
-                    eval_start_s=eval_start_s, prefix_name=f"WPE_Exp_{i}"
-                )
+                ui.stage("[NODE 4] metricas del WPE (todas las referencias)")
+                with ui.quiet():
+                    wpe_metrics = evaluate_all_references(
+                        refs_dict=refs_dict, deg_sig=mic_signals_ready[ref_ch], fs=scene_base_config['fs'],
+                        interf_early=scene_data["interference_early"][ref_ch],
+                        interf_late=scene_data["interference_late"][ref_ch],
+                        target_late=scene_data["target_late"][ref_ch],
+                        eval_start_s=eval_start_s, prefix_name=f"WPE_Exp_{i}"
+                    )
             else:
-                tqdm.write(" -> [NODE 4] Bypassing WPE pre-processing...")
+                ui.stage("[NODE 4] WPE desactivado (bypass)")
                 mic_signals_ready = mic_signals_degraded.copy()
                 wpe_metrics = baseline_metrics.copy()
                 # Sin WPE: las refs del oracle son las componentes POST-HW (mismo
@@ -699,20 +741,23 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             # NODE 4.5: SINGLE-MIC DTLN
             # ---------------------------------------------------------
             if use_dtln:
-                tqdm.write(" -> [NODE 4.5] Applying DTLN to reference microphone...")
-                audio_dtln_alone = apply_dtln_post_tflite_realtime(
-                    interpreter_1=interpreter_1, interpreter_2=interpreter_2,
-                    audio_mono=mic_signals_ready[ref_ch]
-                )
-                dtln_alone_metrics = evaluate_all_references(
-                    refs_dict=refs_dict, deg_sig=audio_dtln_alone, fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][ref_ch],
-                    interf_late=scene_data["interference_late"][ref_ch],
-                    target_late=scene_data["target_late"][ref_ch],
-                    eval_start_s=eval_start_s, prefix_name=f"DTLN_Alone_Exp_{i}"
-                )
+                ui.stage("[NODE 4.5] DTLN mono sobre el mic de referencia")
+                with ui.quiet():
+                    audio_dtln_alone = apply_dtln_post_tflite_realtime(
+                        interpreter_1=interpreter_1, interpreter_2=interpreter_2,
+                        audio_mono=mic_signals_ready[ref_ch]
+                    )
+                ui.stage("[NODE 4.5] metricas DTLN mono")
+                with ui.quiet():
+                    dtln_alone_metrics = evaluate_all_references(
+                        refs_dict=refs_dict, deg_sig=audio_dtln_alone, fs=scene_base_config['fs'],
+                        interf_early=scene_data["interference_early"][ref_ch],
+                        interf_late=scene_data["interference_late"][ref_ch],
+                        target_late=scene_data["target_late"][ref_ch],
+                        eval_start_s=eval_start_s, prefix_name=f"DTLN_Alone_Exp_{i}"
+                    )
         else:
-            tqdm.write(" -> [CACHE] Reusing previous WPE & Single-Mic DTLN state.")
+            ui.stage("[CACHE] reusando WPE + DTLN mono de la prueba anterior", advance=False)
 
         # ---------------------------------------------------------
         # NODE 5: SIGNAL PROCESSING AND EVALUATION
@@ -740,20 +785,24 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
         proc_config = scene_base_config.copy()
         proc_config['source_pos'] = assumed_source_pos
 
-        for proc_name, processor in processors.items():
-            tqdm.write(f"   -> Processing with: {proc_name} (ErrAng: {err_ang}deg, ErrDist: {err_dist}m)...")
+        for p_idx, (proc_name, processor) in enumerate(processors.items()):
+            ui.stage(f"[BF {p_idx+1}/{len(processors)}] {proc_name} "
+                     f"(ErrAng {err_ang}deg, ErrDist {err_dist}m)")
 
             t0 = time.time()
-            y_processed, weights = processor.process(mic_signals_ready, proc_config)
+            with ui.quiet():
+                y_processed, weights = processor.process(mic_signals_ready, proc_config)
             proc_time = time.time() - t0
 
-            proc_metrics = evaluate_all_references(
-                refs_dict=refs_dict, deg_sig=y_processed, fs=scene_base_config['fs'],
-                interf_early=scene_data["interference_early"][ref_ch],
-                interf_late=scene_data["interference_late"][ref_ch],
-                target_late=scene_data["target_late"][ref_ch],
-                eval_start_s=eval_start_s, prefix_name=f"Proc_{proc_name}_Exp_{i}"
-            )
+            ui.stage(f"[BF {p_idx+1}/{len(processors)}] {proc_name}: metricas ({proc_time:.1f}s de BF)")
+            with ui.quiet():
+                proc_metrics = evaluate_all_references(
+                    refs_dict=refs_dict, deg_sig=y_processed, fs=scene_base_config['fs'],
+                    interf_early=scene_data["interference_early"][ref_ch],
+                    interf_late=scene_data["interference_late"][ref_ch],
+                    target_late=scene_data["target_late"][ref_ch],
+                    eval_start_s=eval_start_s, prefix_name=f"Proc_{proc_name}_Exp_{i}"
+                )
 
             # ---------------------------------------------------------
             # NODE 6: POST-BEAMFORMING DTLN
@@ -763,18 +812,21 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
             # DTLN-completo como post-filtro (2do nucleo). apply_dtln_post=False lo
             # saltea SIN afectar el baseline DTLN-mono (Node 4.5), que sigue vivo.
             if use_dtln and apply_dtln_post:
-                tqdm.write(f"   -> [NODE 6] Applying DTLN post {proc_name}...")
-                y_post_dtln = apply_dtln_post_tflite_realtime(
-                    interpreter_1=interpreter_1, interpreter_2=interpreter_2,
-                    audio_mono=y_processed
-                )
-                dtln_post_metrics = evaluate_all_references(
-                    refs_dict=refs_dict, deg_sig=y_post_dtln, fs=scene_base_config['fs'],
-                    interf_early=scene_data["interference_early"][ref_ch],
-                    interf_late=scene_data["interference_late"][ref_ch],
-                    target_late=scene_data["target_late"][ref_ch],
-                    eval_start_s=eval_start_s, prefix_name=f"DTLN_Post_{proc_name}_Exp_{i}"
-                )
+                ui.stage(f"[NODE 6] DTLN post {proc_name}")
+                with ui.quiet():
+                    y_post_dtln = apply_dtln_post_tflite_realtime(
+                        interpreter_1=interpreter_1, interpreter_2=interpreter_2,
+                        audio_mono=y_processed
+                    )
+                ui.stage(f"[NODE 6] metricas DTLN post {proc_name}")
+                with ui.quiet():
+                    dtln_post_metrics = evaluate_all_references(
+                        refs_dict=refs_dict, deg_sig=y_post_dtln, fs=scene_base_config['fs'],
+                        interf_early=scene_data["interference_early"][ref_ch],
+                        interf_late=scene_data["interference_late"][ref_ch],
+                        target_late=scene_data["target_late"][ref_ch],
+                        eval_start_s=eval_start_s, prefix_name=f"DTLN_Post_{proc_name}_Exp_{i}"
+                    )
 
             # --- Angulos reales de la escena (para el dataset) ---
             # array_center = centroide del arreglo (ya calculado en Node 5).
@@ -887,21 +939,30 @@ def run_grid_search(grid_params, room_profiles, processors, scene_base_config, o
 
                     if is_best:
                         leaderboard[proc_name][m_name]["best_val"] = current_val
-                        save_extreme_case_to_master(master_h5, proc_name, m_name, "best_case",
-                                                    processor, mic_signals_ready, y_processed,
-                                                    target_ref_audio, weights, exp, row_data,
-                                                    scene_base_config, current_room_dims,
-                                                    audio_dtln_alone, y_post_dtln)
+                        ui.stage(f"{proc_name}: catalogo H5 · best {m_name} ({current_val:+.2f})",
+                                 advance=False)
+                        with ui.quiet():
+                            save_extreme_case_to_master(master_h5, proc_name, m_name, "best_case",
+                                                        processor, mic_signals_ready, y_processed,
+                                                        target_ref_audio, weights, exp, row_data,
+                                                        scene_base_config, current_room_dims,
+                                                        audio_dtln_alone, y_post_dtln)
 
                     if is_worst:
                         leaderboard[proc_name][m_name]["worst_val"] = current_val
-                        save_extreme_case_to_master(master_h5, proc_name, m_name, "worst_case",
-                                                    processor, mic_signals_ready, y_processed,
-                                                    target_ref_audio, weights, exp, row_data,
-                                                    scene_base_config, current_room_dims,
-                                                    audio_dtln_alone, y_post_dtln)
+                        ui.stage(f"{proc_name}: catalogo H5 · worst {m_name} ({current_val:+.2f})",
+                                 advance=False)
+                        with ui.quiet():
+                            save_extreme_case_to_master(master_h5, proc_name, m_name, "worst_case",
+                                                        processor, mic_signals_ready, y_processed,
+                                                        target_ref_audio, weights, exp, row_data,
+                                                        scene_base_config, current_room_dims,
+                                                        audio_dtln_alone, y_post_dtln)
 
-    tqdm.write(f"\n=== BATCH COMPLETED IN {(time.time() - start_total_time)/60:.2f} MINUTES ===")
+        ui.end_experiment()
+
+    ui.close()
+    print(f"\n=== BATCH COMPLETED IN {(time.time() - start_total_time)/60:.2f} MINUTES ===")
     df_results = pd.DataFrame(all_metrics_results)
 
     # Cast list columns to string for parquet compatibility

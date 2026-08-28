@@ -61,6 +61,7 @@ if SRC_DIR not in sys.path:
 import tensorflow as tf
 from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
 from evaluation.nonintrusive import compute_nonintrusive, NONINTRUSIVE_KEYS
+from evaluation.bench_ui import BenchmarkUI
 from beamforming.mask.souden_mvdr import MVDR_Souden_recursive_mask
 from beamforming.mask.dtln_masks import get_dtln_masks_sharpen
 # Variante BAN duplicada con factor de olvido alpha (el original BAN no lo tiene)
@@ -187,7 +188,12 @@ class DTLN_Souden_BAN_MVDR(DTLN_Souden_MVDR):
 
 @contextlib.contextmanager
 def _quiet():
-    """Silencia el stdout verboso de las librerias DTLN (impresion por frame)."""
+    """
+    Silencia el stdout verboso de las librerias DTLN (impresion por frame).
+
+    El orquestador usa `BenchmarkUI.quiet()` (mismo efecto, ademas vuelca lo
+    capturado si la etapa falla). Se mantiene para uso suelto desde notebooks.
+    """
     with open(os.devnull, "w") as devnull:
         with contextlib.redirect_stdout(devnull):
             yield
@@ -337,7 +343,15 @@ def save_wav_normalized(path, x, fs, peak=0.95):
 # =============================================================================
 def run_real_benchmark(input_wav, output_dir, base_config,
                        interpreter_1=None, interpreter_2=None,
-                       geometric_processors=None, extra_processors=None):
+                       geometric_processors=None, extra_processors=None,
+                       show_progress=True, quiet_console=True):
+    """
+    Corre el pipeline sobre una grabacion real.
+
+    `show_progress`/`quiet_console` SOLO afectan la consola (panel de barras y
+    silenciado de los prints internos de los procesadores): no cambian ninguna
+    llamada, ni el audio generado, ni la tabla/CSV de diagnosticos.
+    """
     os.makedirs(output_dir, exist_ok=True)
     fs_cfg = base_config["fs"]
 
@@ -362,59 +376,89 @@ def run_real_benchmark(input_wav, output_dir, base_config,
     outputs = {}  # nombre -> senal 1D procesada
 
     # -------------------------------------------------------------------------
+    # PANEL DE CONSOLA
+    # -------------------------------------------------------------------------
+    # Aca la "prueba" es cada FASE del pipeline (un procesador, el guardado, los
+    # diagnosticos): la barra de arriba mide el pipeline completo y la de abajo el
+    # avance dentro de la fase en curso.
+    use_dtln = interpreter_1 is not None and interpreter_2 is not None
+    sharpen_exp = base_config.get("souden_sharpen_exp", 4.0)
+    alpha = base_config.get("souden_alpha", 0.99)
+
+    n_phases = (2                                       # Souden + Souden-BAN
+                + (2 if use_dtln else 0)                # DTLN mono + cascada BAN->DTLN
+                + len(geometric_processors or {})
+                + len(extra_processors or {})
+                + 3)                                    # WAVs + diagnosticos + espectrogramas
+    ui = BenchmarkUI(n_phases, desc="Benchmark REAL", unit="fase",
+                     quiet=quiet_console, enabled=show_progress)
+    _phase = {"i": -1}
+
+    def start_phase(label, steps=1):
+        _phase["i"] += 1
+        ui.begin_experiment(_phase["i"], label, steps=steps)
+
+    # -------------------------------------------------------------------------
     # Referencia: mic crudo (para A/B) y DTLN mono (denoise de un solo canal)
     # -------------------------------------------------------------------------
     outputs["ref_mic_raw"] = ref_mic
-    use_dtln = interpreter_1 is not None and interpreter_2 is not None
     if use_dtln:
-        print("[*] DTLN mono sobre mic de referencia (comparacion single-channel)...")
+        start_phase("DTLN mono (single-channel)")
+        ui.stage("DTLN mono sobre el mic de referencia")
         t0 = time.time()
-        with _quiet():
+        with ui.quiet():
             outputs["dtln_mono"] = apply_dtln_post_tflite_realtime(
                 interpreter_1=interpreter_1, interpreter_2=interpreter_2, audio_mono=ref_mic
             )
-        print(f"    ({time.time() - t0:.1f} s)")
+        ui.stage(f"DTLN mono listo ({time.time() - t0:.1f} s)", advance=False)
+        ui.end_experiment()
 
     # Beamformer nuevo: mascara variante (sharpening parametrizable) + Souden
-    sharpen_exp = base_config.get("souden_sharpen_exp", 4.0)
-    alpha = base_config.get("souden_alpha", 0.99)
-    print(f"[*] DTLN-Souden-MVDR (sharpen_exp={sharpen_exp}, alpha={alpha})...")
+    start_phase(f"DTLN-Souden-MVDR (sharpen={sharpen_exp}, alpha={alpha})")
+    ui.stage("mascara DTLN + MVDR de Souden")
     t0 = time.time()
-    with _quiet():
+    with ui.quiet():
         y_souden, _w = DTLN_Souden_MVDR(sharpen_exp=sharpen_exp, alpha=alpha).process(mic_signals, proc_config)
-    print(f"    ({time.time() - t0:.1f} s)")
     outputs["dtln_souden_mvdr"] = y_souden
+    ui.stage(f"DTLN-Souden-MVDR listo ({time.time() - t0:.1f} s)", advance=False)
+    ui.end_experiment()
 
     # Souden + BAN (post-filtro Blind Analytic Normalization) con factor de olvido alpha
-    print(f"[*] DTLN-Souden-BAN-MVDR (sharpen_exp={sharpen_exp}, alpha={alpha})...")
+    start_phase(f"DTLN-Souden-BAN-MVDR (sharpen={sharpen_exp}, alpha={alpha})")
+    ui.stage("mascara DTLN + Souden + BAN")
     t0 = time.time()
-    with _quiet():
+    with ui.quiet():
         y_ban, _w = DTLN_Souden_BAN_MVDR(sharpen_exp=sharpen_exp, alpha=alpha).process(mic_signals, proc_config)
-    print(f"    ({time.time() - t0:.1f} s)")
     outputs["dtln_souden_ban_mvdr"] = y_ban
+    ui.stage(f"DTLN-Souden-BAN-MVDR listo ({time.time() - t0:.1f} s)", advance=False)
+    ui.end_experiment()
 
     # Cascada BAN -> DTLN: BAN es la etapa espacial mas transparente (SIG alto),
     # el DTLN mono hace la supresion del residual.
     if use_dtln:
-        print("[*] DTLN post BAN (cascada BAN -> DTLN)...")
-        with _quiet():
+        start_phase("Cascada BAN -> DTLN")
+        ui.stage("DTLN mono sobre la salida del BAN")
+        with ui.quiet():
             outputs["dtln_souden_ban_then_dtln"] = apply_dtln_post_tflite_realtime(
                 interpreter_1=interpreter_1, interpreter_2=interpreter_2, audio_mono=y_ban
             )
+        ui.end_experiment()
 
     # -------------------------------------------------------------------------
     # BEAMFORMERS GEOMETRICOS (opcionales; requieren geometria MEDIDA)
     # -------------------------------------------------------------------------
     if geometric_processors:
-        print("[!] AVISO: corriendo beamformers geometricos con GEOMETRIA PLACEHOLDER. "
-              "Medí mic_coords/source_pos antes de sacar conclusiones espaciales.")
+        ui.log("[!] AVISO: corriendo beamformers geometricos con GEOMETRIA PLACEHOLDER. "
+               "Medi mic_coords/source_pos antes de sacar conclusiones espaciales.")
         for name, proc in geometric_processors.items():
-            print(f"[*] {name} (geometrico)...")
+            start_phase(f"{name} (geometrico)")
+            ui.stage(f"beamforming {name}")
             t0 = time.time()
-            with _quiet():
+            with ui.quiet():
                 y, _w = proc.process(mic_signals, proc_config)
-            print(f"    ({time.time() - t0:.1f} s)")
             outputs[name] = y
+            ui.stage(f"{name} listo ({time.time() - t0:.1f} s)", advance=False)
+            ui.end_experiment()
 
     # -------------------------------------------------------------------------
     # PROCESADORES EXTRA (mask-based / oracle; NO geometricos). Se corren con el
@@ -423,28 +467,34 @@ def run_real_benchmark(input_wav, output_dir, base_config,
     # -------------------------------------------------------------------------
     if extra_processors:
         for name, proc in extra_processors.items():
-            print(f"[*] {name} (extra)...")
+            start_phase(f"{name} (extra)")
+            ui.stage(f"procesando {name}")
             t0 = time.time()
-            with _quiet():
+            with ui.quiet():
                 y, _w = proc.process(mic_signals, proc_config)
-            print(f"    ({time.time() - t0:.1f} s)")
             outputs[name] = y
+            ui.stage(f"{name} listo ({time.time() - t0:.1f} s)", advance=False)
+            ui.end_experiment()
 
     # -------------------------------------------------------------------------
     # SALIDAS: WAVs + diagnosticos sin referencia + espectrogramas
     # -------------------------------------------------------------------------
-    print("\n=== Guardando salidas ===")
+    start_phase("Guardando WAVs", steps=len(outputs))
+    wav_paths = []
     for name, x in outputs.items():
+        ui.stage(f"WAV {name}")
         wav_path = os.path.join(output_dir, f"{name}.wav")
-        save_wav_normalized(wav_path, np.asarray(x, dtype=np.float64), fs)
-        print(f"[*] {wav_path}")
+        with ui.quiet():
+            save_wav_normalized(wav_path, np.asarray(x, dtype=np.float64), fs)
+        wav_paths.append(wav_path)
+    ui.end_experiment()
 
     # Diagnosticos sin referencia (relativos; NO son ground-truth)
-    print("\n=== Diagnosticos SIN referencia ===")
-    print("[*] Calculando metricas no-intrusivas (DNSMOS / SQUIM)... "
-          "(la 1a vez puede tardar por carga de modelos)")
+    start_phase("Diagnosticos SIN referencia (DNSMOS / SQUIM)", steps=len(outputs))
     diag_rows = []
     for name, x in outputs.items():
+        # La 1a senal tarda mas: incluye la carga de los modelos no-intrusivos.
+        ui.stage(f"metricas no-intrusivas · {name}")
         x = np.asarray(x, dtype=np.float64)
         # VAD por senal para el segSNR (sobre la propia salida, para comparar)
         vad_x = energy_vad(x, fs)
@@ -453,11 +503,52 @@ def run_real_benchmark(input_wav, output_dir, base_config,
         pk = 20 * np.log10(np.max(np.abs(x)) + 1e-12)
         row = {"senal": name, "rms_dbfs": r, "peak_dbfs": pk, "segSNR_est_db": seg}
         # Metricas no-intrusivas (DNSMOS P.835 + SQUIM). NaN si no estan disponibles.
-        ni = compute_nonintrusive(x, fs)
+        with ui.quiet():
+            ni = compute_nonintrusive(x, fs)
         for k in NONINTRUSIVE_KEYS:
             row[k] = ni.get(k, np.nan)
         diag_rows.append(row)
+    ui.end_experiment()
 
+    # Espectrogramas comparativos (mic crudo vs salidas principales) + CSV.
+    start_phase("Espectrogramas + CSV", steps=2)
+    ui.stage("CSV de diagnosticos")
+    csv_path = None
+    csv_error = None
+    try:
+        import csv
+        csv_path = os.path.join(output_dir, "diagnostics_real.csv")
+        fields = ["senal", "rms_dbfs", "peak_dbfs", "segSNR_est_db"] + NONINTRUSIVE_KEYS
+        with open(csv_path, "w", newline="") as fcsv:
+            w = csv.DictWriter(fcsv, fieldnames=fields)
+            w.writeheader()
+            w.writerows(diag_rows)
+    except Exception as e:
+        csv_path, csv_error = None, e
+
+    ui.stage("espectrogramas comparativos")
+    spec_signals = {"ref_mic_raw (entrada)": np.asarray(outputs["ref_mic_raw"], dtype=np.float64)}
+    if "dtln_mono" in outputs:
+        spec_signals["dtln_mono"] = np.asarray(outputs["dtln_mono"], dtype=np.float64)
+    spec_png = os.path.join(output_dir, "spectrograms_real.png")
+    with ui.quiet():
+        save_spectrograms(spec_signals, fs, spec_png)
+    ui.end_experiment()
+    ui.close()
+
+    # -------------------------------------------------------------------------
+    # REPORTE FINAL (stdout limpio, ya sin panel)
+    # -------------------------------------------------------------------------
+    print("\n=== Salidas guardadas ===")
+    for p in wav_paths:
+        print(f"[*] {p}")
+    print(f"[*] {spec_png}")
+    if csv_path:
+        print(f"[*] {csv_path}")
+    else:
+        print(f"[!] No se pudo escribir el CSV: {csv_error}")
+
+    print("\n=== Diagnosticos SIN referencia ===")
     # Tabla: basicas + no-intrusivas mas relevantes
     print(f"\n{'senal':<24} {'RMS':>7} {'segSNR':>7} "
           f"{'SIG':>6} {'BAK':>6} {'OVRL':>6} {'sqSTOI':>7} {'sqPESQ':>7} {'sqSISDR':>8}")
@@ -468,25 +559,6 @@ def run_real_benchmark(input_wav, output_dir, base_config,
         print(f"{rr['senal']:<24} {rr['rms_dbfs']:>7.1f} {rr['segSNR_est_db']:>7.2f} "
               f"{g('DNSMOS_SIG'):>6} {g('DNSMOS_BAK'):>6} {g('DNSMOS_OVRL'):>6} "
               f"{g('SQUIM_STOI'):>7} {g('SQUIM_PESQ'):>7} {g('SQUIM_SISDR'):>8}")
-
-    # CSV resumen (todas las columnas)
-    try:
-        import csv
-        csv_path = os.path.join(output_dir, "diagnostics_real.csv")
-        fields = ["senal", "rms_dbfs", "peak_dbfs", "segSNR_est_db"] + NONINTRUSIVE_KEYS
-        with open(csv_path, "w", newline="") as fcsv:
-            w = csv.DictWriter(fcsv, fieldnames=fields)
-            w.writeheader()
-            w.writerows(diag_rows)
-        print(f"\n[*] Resumen CSV: {csv_path}")
-    except Exception as e:
-        print(f"[!] No se pudo escribir el CSV: {e}")
-
-    # Espectrogramas comparativos (mic crudo vs salidas principales)
-    spec_signals = {"ref_mic_raw (entrada)": np.asarray(outputs["ref_mic_raw"], dtype=np.float64)}
-    if "dtln_mono" in outputs:
-        spec_signals["dtln_mono"] = np.asarray(outputs["dtln_mono"], dtype=np.float64)
-    save_spectrograms(spec_signals, fs, os.path.join(output_dir, "spectrograms_real.png"))
 
     print("\n=== LISTO ===")
     print("Recorda: sin referencia limpia estas metricas son RELATIVAS/cualitativas. "
