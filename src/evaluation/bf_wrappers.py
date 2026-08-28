@@ -3,6 +3,7 @@ import scipy.signal as sig
 # Assuming compute_rtf_steering_vector is imported in your module
 from beamforming.signal_model import compute_rtf_steering_vector
 from beamforming.MVDR.base import MVDR_recursive
+from beamforming.MVDR.oracle_scm import MVDR_geo_oracle_scm
 from beamforming.kmvdr.kmvdr_base import KMVDR_recursive
 from beamforming.MWF.SP_SDW_MWF_base import sdw_mwf
 from beamforming.MPDRxWPE.mpdr import MPDR_recursive
@@ -598,16 +599,118 @@ class SOUDEN_ORACLE_SCM:
         return y_time, weights
 
 
+class MVDR_GEO_ORACLE_SCM:
+    """
+    MVDR clasico GEOMETRICO (steering vector desde la posicion asumida de la fuente)
+    pero con la covarianza de ruido ORACLE, estimada directamente de la señal de
+    ruido+interferencia limpia multicanal (sin VAD, sin mascara):
+
+        w = Phi_NN^-1 d / (d^H Phi_NN^-1 d)
+
+    Es el eslabon que faltaba entre las dos familias:
+      - MVDR_Recursive     : d geometrico + Phi_NN de la mezcla via VAD.
+      - ESTE               : d geometrico + Phi_NN oracle  -> aisla el error del
+                             MODELO GEOMETRICO (RTF de campo cercano en sala real)
+                             con informacion de ruido perfecta.
+      - SOUDEN_ORACLE_SCM  : sin d, Phi_SS/Phi_NN oracle -> techo sin geometria.
+
+    Requiere en scene_config:
+      - 'oracle_noise' : (M, N) ruido + interferencia limpio (mismo dominio que la
+                         señal filtrada; lo arma el benchmark en Node 3/4).
+      - 'source_pos', 'mic_coords' : geometria (el benchmark ya inyecta aca el
+                         error de DOA/distancia si la grilla lo barre).
+
+    Carga diagonal con la MISMA forma que el resto del repo:
+    load = max(rel_loading * tr(Phi_NN)/M, min_loading), con rel_loading como escala
+    relativa y min_loading como piso absoluto. El default rel_loading=1e-2 es donde
+    este beamformer rinde mejor (ver el docstring del core); pasar 1e-6 para igualar
+    el valor que usan los mask-based.
+    `ref_mic_idx=None` -> M//2, la referencia de la familia Souden.
+    """
+    def __init__(self, nperseg=512, noverlap=384, rel_loading=1e-2, min_loading=1e-9,
+                 alpha=0.99, ref_mic_idx=None):
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.rel_loading = rel_loading
+        self.min_loading = min_loading
+        self.alpha = alpha
+        self.ref_mic_idx = ref_mic_idx
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Configuraciones
+        fs = scene_config['fs']
+        source_pos = np.asarray(scene_config['source_pos']).reshape(1, 3)
+        mic_coords = scene_config['mic_coords']
+
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+
+        # 2. Referencia oracle de ruido (la misma que consumen los otros oracles).
+        #    El MVDR clasico solo necesita Phi_NN: la informacion de la voz entra
+        #    por el steering vector geometrico, no por una SCM.
+        noise_ref = np.asarray(scene_config['oracle_noise'])
+
+        # 3. STFT de la mezcla observada (se filtra) y del ruido limpio (da Phi_NN)
+        def _stft(sig_in):
+            _, _, Z = sig.stft(
+                sig_in, fs=fs, window='hamming',
+                nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+            )
+            return np.transpose(Z, (1, 2, 0))  # (K, T, M)
+
+        X_stft = _stft(mic_signals)
+        N_stft = _stft(noise_ref)
+
+        # 4. Alinear frames al minimo comun
+        min_frames = min(X_stft.shape[1], N_stft.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        N_stft = N_stft[:, :min_frames, :]
+
+        # 5. Core: MVDR clasico con d geometrico + Phi_NN oracle
+        Y_stft, weights = MVDR_geo_oracle_scm(
+            X_stft, N_stft, fs=fs,
+            array_geometry=mic_coords,
+            source_pos=source_pos,
+            rel_loading=self.rel_loading,
+            min_loading=self.min_loading,
+            alpha=self.alpha,
+            ref_mic_idx=self.ref_mic_idx,
+            save_weights=True
+        )
+
+        # 6. ISTFT
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window='hamming',
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 7. Ajustar largo exacto
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights
+
+
 class MVDR_Recursive:
     """
     Wrapper for the isolated MVDR_recursive algorithm.
     Handles STFT/ISTFT transformations, parameter extraction from the
     pipeline config, and ensures the expected output format.
     """
-    def __init__(self, nperseg=512, noverlap=256, min_loading=1e-6):
+    def __init__(self, nperseg=512, noverlap=256, min_loading=1e-6, rel_loading=1e-2,
+                 alpha=0.99):
         self.nperseg = nperseg
         self.noverlap = noverlap
+        # Carga diagonal: load = max(rel_loading * tr(R_nn)/M, min_loading). La
+        # escala RELATIVA es rel_loading (misma forma que la familia Souden, donde
+        # ese rol lo cumple su parametro min_loading); aca min_loading es solo el
+        # piso ABSOLUTO del arranque. Defaults = comportamiento historico.
         self.min_loading = min_loading
+        self.rel_loading = rel_loading
+        self.alpha = alpha
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
         """
@@ -649,7 +752,9 @@ class MVDR_Recursive:
             source_pos=source_pos,
             length_fft=nperseg_dyn,
             hop_length_fft=hop_length_dyn,
+            rel_loading=self.rel_loading,
             min_loading=self.min_loading,
+            alpha=self.alpha,
             save_weights=True
         )
 
