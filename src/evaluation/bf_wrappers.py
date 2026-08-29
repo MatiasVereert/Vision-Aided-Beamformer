@@ -20,6 +20,7 @@ from beamforming.mask.souden_mvdr import (
     MVDR_Souden_recursive_mask_specsub_base,
     MVDR_Souden_recursive_mask_BAN_specsub_base,
     MVDR_Souden_recursive_oracle,
+    MVDR_Souden_recursive_mask_BAN_alpha
 )
 
 # ---------------------------------------------------------------------------
@@ -213,12 +214,13 @@ class DTLN_MB_MVDR:
         return y_time, weights
 
 
-class DTLN_MB_MVDR_SOUDEN_BAN:
+
+class DTLN_MB_MVDR_SOUDEN_BAN_alphaless:
     """
     Wrapper for the DTLN mask-based MVDR beamformer.
     Integrates offline neural mask estimation with recursive spatial filtering.
     """
-    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, win_type=None):
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, win_type=None, alpha = 0.99):
         # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
         self.nperseg = nperseg
         self.noverlap = noverlap
@@ -227,6 +229,7 @@ class DTLN_MB_MVDR_SOUDEN_BAN:
         self.min_loading = min_loading
         # Ventana de la STFT del beamformer. None -> 'hamming' (historico).
         self.win_type = win_type
+        self.alpha = alpha
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
         # 1. Extract physical and operational configurations
@@ -287,7 +290,99 @@ class DTLN_MB_MVDR_SOUDEN_BAN:
             mask_n,
             min_loading= self.min_loading,
             save_weights=True,
-            ref_mic_idx=ref_mic_idx
+            ref_mic_idx=ref_mic_idx,
+
+        )
+
+        # 6. Compute ISTFT to return to the time domain
+        _, y_time = sig.istft(
+            Y_stft, fs=fs, window=win_spec,
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # 7. Ensure the output length exactly matches the original input signal
+        original_length = mic_signals.shape[1]
+        y_time = y_time[:original_length]
+
+        return y_time, weights
+
+class DTLN_MB_MVDR_SOUDEN_BAN:
+    """
+    Wrapper for the DTLN mask-based MVDR beamformer.
+    Integrates offline neural mask estimation with recursive spatial filtering.
+    """
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-6, win_type=None, alpha = 0.99):
+        # STFT configuration aligned with DTLN (block_len=512, block_shift=128)
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+        # Ventana de la STFT del beamformer. None -> 'hamming' (historico).
+        self.win_type = win_type
+        self.alpha = alpha
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        # 1. Extract physical and operational configurations
+        fs = scene_config['fs']
+
+        # Dynamically extract DTLN model path from the benchmark config
+        # Defaults to a standard path if not provided in the dictionary
+        model_path = scene_config.get('dtln_model_path', r'dnn_denoise\models\model_quant_1.tflite')
+
+        # Dynamic STFT configuration
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        nfft_dyn = nperseg_dyn
+        hop_length_dyn = nperseg_dyn - noverlap_dyn
+
+        # Warning to use the same windows as the DTLN model was trained on
+        if nperseg_dyn != 512 or hop_length_dyn != 128:
+            print(f"[Warning]: Window length ({nperseg_dyn}) and hop length ({hop_length_dyn}) should ideally match DTLN training (512/128).")
+
+        # Define Reference Microphone Index as middle index
+        # Microfono de REFERENCIA: fija el canal que reconstruye el filtro (o sea el
+        # DOMINIO de la salida) y por lo tanto contra cual hay que medir. El benchmark
+        # lo inyecta en 'ref_mic_idx' para que TODOS los procesadores y las metricas
+        # usen el mismo canal; sin esa clave se conserva el default historico.
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
+
+        # 2. Extract masks using block_shift (hop_length)
+        mask_s, mask_n = get_dtln_masks(
+            mic_signals,
+            ref_mic_idx,
+            model_path,
+            block_len=nperseg_dyn,
+            block_shift=hop_length_dyn
+        )
+
+        # 3. Compute STFT (ventana configurable: ver resolve_stft_window)
+        win_spec = resolve_stft_window(scene_config, self.win_type, nperseg_dyn)
+        # Input shape: (M, N_samples). Output shape Zxx: (M, K, T)
+        freqs, times, Zxx = sig.stft(
+            mic_signals, fs=fs, window=win_spec,
+            nperseg=nperseg_dyn, noverlap=noverlap_dyn, nfft=nfft_dyn
+        )
+
+        # Transpose to (K, T, M) for spatial frequency-domain processing
+        X_stft = np.transpose(Zxx, (1, 2, 0))
+
+        # 4. Ensure time dimensions match between STFT and neural masks
+        min_frames = min(X_stft.shape[1], mask_s.shape[1])
+        X_stft = X_stft[:, :min_frames, :]
+        mask_s = mask_s[:, :min_frames]
+        mask_n = mask_n[:, :min_frames]
+
+        # 5. Execute the core mathematical function passing the STFT matrix
+        Y_stft, weights = MVDR_Souden_recursive_mask_BAN_alpha(
+            X_stft,
+            mask_s,
+            mask_n,
+            min_loading= self.min_loading,
+            save_weights=True,
+            ref_mic_idx=ref_mic_idx,
+            alpha = self.alpha,
         )
 
         # 6. Compute ISTFT to return to the time domain

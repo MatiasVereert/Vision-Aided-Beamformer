@@ -13,15 +13,22 @@ mismo contrato. Las mascaras se estiman aparte (ver dtln_masks.py).
 
 Las variantes se diferencian por el CRITERIO DE OPTIMIZACION / post-filtro:
 
-  - MVDR_Souden_recursive_mask        : MVDR base, factor de olvido alpha,
-                                        ref=ref_mic_idx (None -> M//2).
+MICROFONO DE REFERENCIA (unificado): TODOS los cores exponen `ref_mic_idx` y usan
+el MISMO default (None -> M//2). Es el canal sobre el que se proyecta la salida (el
+one-hot `r` de la formula) y debe coincidir con (a) el canal con el que el wrapper
+estima la mascara del DTLN y (b) el canal de referencia de las metricas intrusivas
+(ref_mic_mode). Cuando los tres coinciden el filtro estima la voz TAL COMO LLEGA al
+canal que se mide -> mejores resultados y comparacion honesta. Los wrappers del
+benchmark igual pasan el indice explicito (geometry.select_reference_mic).
+
+  - MVDR_Souden_recursive_mask        : MVDR base, factor de olvido alpha.
   - MVDR_Souden_recursive_mask_slow   : idem base pero aplica los pesos del frame
                                         anterior (variante experimental).
   - MVDR_Souden_recursive_mask_BAN    : acumulacion estricta (alpha=1) + Blind
-                                        Analytical Normalization, ref=0.
-  - MVDR_Souden_recursive_mask_BAN_alpha : BAN + factor de olvido alpha, ref=0.
+                                        Analytical Normalization.
+  - MVDR_Souden_recursive_mask_BAN_alpha : BAN + factor de olvido alpha.
   - MVDR_Souden_recursive_mask_fixed  : carga diagonal RELATIVA (escala-invariante)
-                                        + Hermitiana + solve, ref=M//2.
+                                        + Hermitiana + solve.
   - MVDR_Souden_recursive_mask_MWF    : fixed + post-filtro de Wiener parametrico
                                         (PMWF-beta, denominador lambda+mu).
   - MVDR_Souden_recursive_mask_BAN_MWF: fixed + MWF + BAN (OJO: la BAN es invariante
@@ -321,10 +328,11 @@ def MVDR_Souden_recursive_mask_BAN(X_stft, mask_s, mask_n, min_loading=1e-6, sav
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
 
-    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's formula).
-    # ref_mic_idx=None -> 0 (default historico de ESTA variante, distinto del M//2 del
-    # core base). Los wrappers del benchmark pasan siempre un indice explicito para que
-    # toda la familia proyecte sobre el MISMO canal que miden las metricas.
+    # Reference microphone index (equivalent to the one-hot vector 'r' in Souden's
+    # formula). ref_mic_idx=None -> M//2, UNIFICADO con el resto de la familia (esta
+    # variante usaba 0 historicamente). Los wrappers del benchmark pasan siempre un
+    # indice explicito para que el BF proyecte sobre el MISMO canal con el que se
+    # estima la mascara y sobre el que miden las metricas intrusivas.
     ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
     if not (0 <= ref_mic < M):
         raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
@@ -421,9 +429,9 @@ def MVDR_Souden_recursive_mask_BAN_alpha(X_stft, mask_s, mask_n, min_loading=1e-
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
 
-    # Reference microphone index (ref_mic_idx=None -> 0, igual que el original BAN).
-    # Ver la nota del core BAN: el benchmark inyecta el canal explicito.
-    ref_mic = 0 if ref_mic_idx is None else int(ref_mic_idx)
+    # Reference microphone index (ref_mic_idx=None -> M//2, unificado con toda la
+    # familia). Ver la nota del core BAN: el benchmark inyecta el canal explicito.
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
     if not (0 <= ref_mic < M):
         raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
 
@@ -492,11 +500,12 @@ def MVDR_Souden_recursive_mask_BAN_alpha(X_stft, mask_s, mask_n, min_loading=1e-
 # MVDR FIXED (carga relativa + Hermitiana + solve) y post-filtros
 # =====================================================================
 def MVDR_Souden_recursive_mask_fixed(X_stft, mask_s, mask_n, min_loading=1e-2,
-                                     save_weights=False, alpha=0.99, rank1=False):
+                                     save_weights=False, alpha=0.99, rank1=False,
+                                     ref_mic_idx=None):
     """
     Variante FIXED de MVDR_Souden_recursive_mask. Misma formulacion de Souden
-    (w = Phi_NN^-1 Phi_XX u / tr(Phi_NN^-1 Phi_XX)), ref_mic = M//2, factor de
-    olvido alpha; corrige:
+    (w = Phi_NN^-1 Phi_XX u / tr(Phi_NN^-1 Phi_XX)), ref_mic = ref_mic_idx
+    (None -> M//2, unificado con toda la familia), factor de olvido alpha; corrige:
 
       1. CARGA DIAGONAL escala-invariante. El original hace
              adaptive_load = min_loading*tr(Phi_NN)/M           (min_loading=1e-6)
@@ -522,7 +531,9 @@ def MVDR_Souden_recursive_mask_fixed(X_stft, mask_s, mask_n, min_loading=1e-2,
     Num_NN = np.zeros((K, M, M), dtype=np.complex128)
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
-    ref_mic = M // 2                      # consistente con la Souden original
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
     eye = np.eye(M)[np.newaxis, :, :]
 
     if save_weights:
@@ -576,7 +587,7 @@ def MVDR_Souden_recursive_mask_fixed(X_stft, mask_s, mask_n, min_loading=1e-2,
 
 def MVDR_Souden_recursive_mask_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,
                                    save_weights=False, alpha=0.99, mu=1.0,
-                                   rank1=False):
+                                   rank1=False, ref_mic_idx=None):
     """
     POST-FILTRO DE WIENER sobre el MVDR de Souden = MWF paramétrico (PMWF-beta del
     paper: Souden et al. 2010, "On Optimal Frequency-Domain Multichannel Linear
@@ -596,7 +607,8 @@ def MVDR_Souden_recursive_mask_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,
         mu > 1  -> más supresión de ruido, más distorsión de voz
     lambda es el MISMO trace que el MVDR ya calcula (lambda_norm); el único cambio
     respecto de _fixed es sumarle mu al denominador. Loading, Hermitiana, solve,
-    ref_mic=M//2 y (opcional) rank-1 de Phi_XX quedan idénticos a _fixed.
+    ref_mic (ref_mic_idx, None -> M//2) y (opcional) rank-1 de Phi_XX quedan
+    idénticos a _fixed.
     """
     K, T, M = X_stft.shape
     Y_stft = np.zeros((K, T), dtype=np.complex128)
@@ -604,7 +616,9 @@ def MVDR_Souden_recursive_mask_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,
     Num_NN = np.zeros((K, M, M), dtype=np.complex128)
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
-    ref_mic = M // 2                      # consistente con la Souden original
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
     eye = np.eye(M)[np.newaxis, :, :]
 
     if save_weights:
@@ -660,13 +674,13 @@ def MVDR_Souden_recursive_mask_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,
 
 def MVDR_Souden_recursive_mask_BAN_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,
                                        save_weights=False, alpha=0.99, mu=4.0,
-                                       rank1=False):
+                                       rank1=False, ref_mic_idx=None):
     """
     Souden FIXED + BAN + post-filtro de Wiener (MWF paramétrico, mu). Base = _fixed
-    (loading relativo + Hermitiana + solve + ref_mic=M//2), denominador MWF
-    (lambda+mu), y ENCIMA la Blind Analytical Normalization (BAN), pero con
-    ref_mic=M//2 y Phi_NN_stable coherente (a diferencia del BAN viejo, que usaba
-    ref_mic=0 y loading absoluto).
+    (loading relativo + Hermitiana + solve + ref_mic_idx, None -> M//2), denominador
+    MWF (lambda+mu), y ENCIMA la Blind Analytical Normalization (BAN), con el MISMO
+    ref_mic que el resto de la familia y Phi_NN_stable coherente (a diferencia del
+    BAN viejo, que usaba ref_mic=0 y loading absoluto).
 
     OJO -- ADVERTENCIA MATEMATICA (verificada numéricamente): la BAN es INVARIANTE
     A ESCALA. La ganancia de Wiener del MWF es un escalar REAL por frecuencia
@@ -682,7 +696,9 @@ def MVDR_Souden_recursive_mask_BAN_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,
     Num_NN = np.zeros((K, M, M), dtype=np.complex128)
     Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
-    ref_mic = M // 2
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
     eye = np.eye(M)[np.newaxis, :, :]
 
     if save_weights:
@@ -741,7 +757,7 @@ def MVDR_Souden_recursive_mask_BAN_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,
 
 def MVDR_Souden_recursive_mask_specsub(X_stft, mask_s, mask_n, mask_s_soft,
                                        min_loading=1e-2, alpha=0.99, smooth=0.33,
-                                       save_weights=False):
+                                       save_weights=False, ref_mic_idx=None):
     """
     Souden FIXED + POST-FILTRO DE SUSTRACCION ESPECTRAL (mask-based) sobre la salida
     del beamformer.
@@ -766,7 +782,8 @@ def MVDR_Souden_recursive_mask_specsub(X_stft, mask_s, mask_n, mask_s_soft,
     """
     res = MVDR_Souden_recursive_mask_fixed(X_stft, mask_s, mask_n,
                                            min_loading=min_loading, alpha=alpha,
-                                           save_weights=save_weights)
+                                           save_weights=save_weights,
+                                           ref_mic_idx=ref_mic_idx)
     Y, W = (res if save_weights else (res, None))
     Y = Y.copy()
 
@@ -856,7 +873,7 @@ def MVDR_Souden_recursive_mask_BAN_specsub_base(X_stft, mask_s, mask_n, mask_s_s
 
 def MVDR_Souden_recursive_mask_BAN_specsub(X_stft, mask_s, mask_n, mask_s_soft,
                                            min_loading=1e-6, alpha=0.99, smooth=0.33,
-                                           save_weights=False):
+                                           save_weights=False, ref_mic_idx=None):
     """
     Souden FIXED + BAN + POST-FILTRO DE SUSTRACCION ESPECTRAL. Combina las dos ideas:
       1. Beamformer = fixed + BAN (Blind Analytical Normalization) -> Y_ban(k,t).
@@ -876,7 +893,8 @@ def MVDR_Souden_recursive_mask_BAN_specsub(X_stft, mask_s, mask_n, mask_s_soft,
     """
     res = MVDR_Souden_recursive_mask_BAN_MWF(X_stft, mask_s, mask_n,
                                              min_loading=min_loading, alpha=alpha,
-                                             mu=0.0, save_weights=save_weights)
+                                             mu=0.0, save_weights=save_weights,
+                                             ref_mic_idx=ref_mic_idx)
     Y, W = (res if save_weights else (res, None))
     Y = Y.copy()
 

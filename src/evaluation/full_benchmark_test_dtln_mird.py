@@ -37,7 +37,8 @@ from evaluation.bf_wrappers import (
     DTLN_MB_MVDR_SOUDEN_SLOW,
     NM_MVDR_PF,
     ORACLE_MB_MVDR_SOUDEN,
-    SOUDEN_ORACLE_SCM
+    SOUDEN_ORACLE_SCM,
+    DTLN_MB_MVDR_SOUDEN_BAN_alphaless
 
 )
 
@@ -1049,10 +1050,10 @@ if __name__ == "__main__":
             [(45, 1.0)],
         ],
 
-        'isir_db': [-5],
+        'isir_db': [5],
         'mismatch_gain': [0],
         'mismatch_phase': [0],
-        'use_wpe': [True, False],
+        'use_wpe': [ False],
 
         # Back-end del WPE como eje de grilla: corre 'online' (RLS) y 'block'
         # (Opcion B, Cholesky) en la MISMA corrida para compararlos. Si se omite,
@@ -1077,22 +1078,19 @@ if __name__ == "__main__":
     }
 
     processors_dict = {
-        "DS" :DS(),
-        "NM-MVDR_alpha_0.99_ref_1e-9" : NM_MVDR(min_loading =1e-6, alpha = 0.99),
-        "NM-MVDR_alpha_0.99_ref_1e-3" : NM_MVDR(min_loading =1e-3, alpha = 0.99),
-        "NM-MVDR_alpha_0.99_ref_1e-2" : NM_MVDR(min_loading =1e-2, alpha = 0.99),
-
-       "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0),
-
+       # "DS" :DS(),
+        "NM-MVDR_alpha_0.99_ref_1e-9" : NM_MVDR(min_loading =1e-9, alpha = 0.99),
+        "NM-MVDR-BAN": DTLN_MB_MVDR_SOUDEN_BAN(min_loading =1e-9, alpha = 0.99),
+        "NM-MVDR-BAN_alphaless": DTLN_MB_MVDR_SOUDEN_BAN_alphaless(min_loading =1e-9),
+        #"Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0)
     }
-
 
     df_final = run_mird_grid_search(
         grid_params=param_grid,
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/loading_low_snr",
+        output_dir="tests/dataset_out/BAN",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )
