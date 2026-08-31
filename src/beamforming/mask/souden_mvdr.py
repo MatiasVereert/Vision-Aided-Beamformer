@@ -36,6 +36,32 @@ benchmark igual pasan el indice explicito (geometry.select_reference_mic).
   - MVDR_Souden_recursive_mask_specsub: fixed + sustraccion espectral (ganancia por
                                         bin con la mascara suave del DTLN).
   - MVDR_Souden_recursive_mask_BAN_specsub : fixed + BAN + sustraccion espectral.
+  - MVDR_Souden_recursive_mask_subtract: SUSTRACCION DE COVARIANZA. Estima el
+                                        target como Phi_SS = Phi_XX - Phi_NN y
+                                        normaliza por lambda_S = lambda - M, en
+                                        vez de por lambda. Corrige el COLAPSO DE
+                                        ESCALA en graves de todos los cores de
+                                        arriba (ver mas abajo). Opcionalmente:
+                                        gate por confianza y alpha por bin.
+
+COLAPSO DE ESCALA EN GRAVES (motivo de la variante _subtract)
+------------------------------------------------------------
+Todos los cores de esta familia le pasan a la formula de Souden la covarianza de
+la MEZCLA enmascarada en lugar de la del TARGET, o sea Phi_XX ~= Phi_SS + Phi_NN.
+Eso hace que el denominador lambda = tr(Phi_NN^-1 Phi_XX) = lambda_S + M quede
+ACOTADO POR ABAJO POR M. En los bins donde la mascara no encuentra voz,
+Phi_XX ~= Phi_NN y el filtro degenera a w = u/M: la banda sale -20*log10(M) dB
+(M=8 -> -18 dB) con ganancia de arreglo NULA. Verificado algebraicamente
+(forzando Phi_XX == Phi_NN la salida es exactamente x_ref/M) y medido sobre MIRD
+en tests/lowfreq_diagnostic_run.py. PESQ (P.862) no lo ve: no evalua debajo de
+~300 Hz.
+
+FACTOR DE OLVIDO POR BIN
+------------------------
+MVDR_Souden_recursive_mask y MVDR_Souden_recursive_mask_subtract aceptan `alpha`
+ESCALAR o como array (K,) -> factor de olvido dependiente de la frecuencia. Solo
+rinde COMBINADO con la sustraccion: sobre el core base es neutro, porque arregla
+la varianza del estimador mientras que el problema en graves es la normalizacion.
 """
 
 import numpy as np
@@ -73,6 +99,18 @@ def MVDR_Souden_recursive_mask(X_stft, mask_s, mask_n, min_loading=1e-6, save_we
     ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
     if not (0 <= ref_mic < M):
         raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
+    # alpha puede ser ESCALAR o un array POR BIN (K,) -> factor de olvido
+    # DEPENDIENTE DE LA FRECUENCIA. Se lleva a (K,1,1), que difunde correctamente
+    # contra Num (K,M,M) y contra Den (K,1,1) sin tocar nada mas del bucle.
+    # Motivacion: el campo a baja frecuencia decorrelaciona mas lento (la
+    # coherencia se sostiene sobre ~lambda/2), asi que promediar mas tiempo ahi
+    # baja la varianza de las SCM casi sin costo de tracking.
+    alpha = np.asarray(alpha, dtype=np.float64)
+    if alpha.ndim == 0:
+        alpha = np.full((K,), float(alpha))
+    if alpha.shape != (K,):
+        raise ValueError(f"alpha debe ser escalar o de shape ({K},); es {alpha.shape}.")
+    alpha = alpha[:, np.newaxis, np.newaxis]
 
     if save_weights:
         weights_rec = np.zeros((K, T, M), dtype=np.complex128)
@@ -583,6 +621,220 @@ def MVDR_Souden_recursive_mask_fixed(X_stft, mask_s, mask_n, min_loading=1e-2,
     if save_weights:
         return Y_stft, weights_rec
     return Y_stft
+
+
+def MVDR_Souden_recursive_mask_subtract(X_stft, mask_s, mask_n, min_loading=1e-9,
+                                        save_weights=False, alpha=0.99, mu=0.0,
+                                        lambda_floor=1e-3, psd_project=True,
+                                        rank1=False, ref_mic_idx=None,
+                                        gate_thresh=None, gate_sharp=2.0,
+                                        gate_kmax=None, save_gate=False):
+    """
+    Souden MVDR con SUSTRACCION DE COVARIANZA: Phi_SS = Phi_XX - Phi_NN.
+
+    EL PROBLEMA QUE CORRIGE
+    -----------------------
+    La ec. 24 de Souden usa la covarianza del TARGET (Phi_x en el paper). Todos
+    los cores mask-based de este archivo le pasan en su lugar la covarianza de la
+    MEZCLA enmascarada, que es
+
+        Phi_XX  ~=  Phi_SS + Phi_NN
+
+    Con eso, el denominador de la normalizacion vale
+
+        lambda = tr(Phi_NN^-1 Phi_XX) = tr(Phi_NN^-1 Phi_SS) + M = lambda_S + M
+
+    o sea que lambda esta ACOTADO POR ABAJO POR M. En un bin donde la mascara no
+    encuentra voz (lambda_S -> 0) queda Phi_XX ~= Phi_NN, y entonces
+
+        Phi_NN^-1 Phi_XX -> I ,   lambda -> M ,   w -> u / M
+
+    el filtro DEGENERA al microfono de referencia dividido por M: la banda sale
+    atenuada 1/M^2 (M=8 -> -18 dB) con ganancia de arreglo NULA. Medido sobre
+    MIRD (ver tests/lowfreq_diagnostic_run.py) eso es exactamente lo que pasa
+    debajo de ~130 Hz: Phi_XX es 91-100% ruido, lambda/M = 0.96-1.16, la
+    respuesta al target cae a -16 dB y AG ~= +1 dB. PESQ no lo ve porque P.862
+    no evalua debajo de ~300 Hz.
+
+    Visto de otra forma: dividir por lambda_S + M es un PMWF-beta con beta = M.
+    Los cores actuales son, sin quererlo, un Wiener parametrico con una
+    supresion que CRECE con el numero de microfonos.
+
+    LA CORRECCION
+    -------------
+    Se estima el target restando, y se normaliza con la traza que le corresponde:
+
+        Phi_SS_hat = Phi_XX - Phi_NN          (+ proyeccion PSD)
+        lambda_S   = tr(Phi_NN^-1 Phi_SS_hat)  == lambda - M  (exacto)
+        w          = Phi_NN^-1 Phi_SS_hat u / (lambda_S + mu)
+
+    Se corrige el NUMERADOR ademas del denominador: Phi_NN^-1 Phi_XX u contiene
+    un termino de paso directo +u que la sustraccion elimina. Por eso mu = M NO
+    reproduce exactamente el core actual (mismo denominador, distinto numerador).
+
+    PARAMETROS
+    ----------
+    mu : trade-off PMWF sobre el denominador (lambda_S + mu).
+        mu = 0   -> MVDR distortionless puro. Es la correccion en su forma pura:
+                   quita el colapso de escala por completo. OJO: en los bins donde
+                   Phi_XX ~= Phi_NN la resta es una diferencia de dos matrices casi
+                   iguales -> su direccion es ruido, y un filtro distortionless
+                   apuntado a una direccion aleatoria AMPLIFICA. Esperar mejora en
+                   respuesta al target y posible perdida en reduccion de ruido.
+        mu = 1   -> MWF estandar.
+        mu = M   -> mismo denominador que el core actual (numerador distinto).
+        El optimo real esta casi seguro entre 0 y 1: barrerlo.
+    lambda_floor : piso numerico sobre lambda_S (relativo, adimensional). Solo
+        evita la division por cero cuando mu = 0; con mu > 0 es inocuo.
+    psd_project : proyecta Phi_SS_hat a PSD (autovalores negativos -> 0) antes de
+        usarla. La resta de dos SCM estimadas sobre CONJUNTOS DE FRAMES DISTINTOS
+        (mascara de voz vs de ruido) no tiene por que dar PSD. Ademas garantiza
+        lambda_S >= 0 (traza de producto de dos PSD). Cuesta un eigh por bin y
+        frame; se puede apagar por velocidad.
+    rank1 : ademas de proyectar, se queda solo con el autovector principal de
+        Phi_SS_hat (target de rango 1). Implica psd_project.
+
+    GATE POR CONFIANZA (lambda_S/M)
+    -------------------------------
+    gate_thresh activa un blend SUAVE hacia el PASSTHROUGH del microfono de
+    referencia en los bins donde el filtro no tiene informacion espacial util:
+
+        r = lambda_S / M                       (confianza, gratis: ya se calcula)
+        g = r^p / (r^p + gate_thresh^p)        (Hill, p = gate_sharp)
+        w = g * w_mvdr + (1 - g) * u
+
+    POR QUE lambda Y NO LA FRECUENCIA. Medido en MIRD (tests/lowfreq_diagnostic_run.py),
+    lambda_S/M separa limpio: mediana 0.13 debajo de 130 Hz (donde AG = 2.4 dB y
+    TR = -15 dB: se paga 15 dB de voz por 2 dB de SNR) contra 0.63 en 130-200 Hz
+    (donde AG = 12.9 dB: NO hay que tocar nada) y 4-9 mas arriba. Un gate por
+    frecuencia fija en f_c = c/2L (660 Hz para L=26 cm) tiraria los ~13 dB de
+    ganancia REAL que hay entre 130 y 300 Hz. lambda_S/M es por bin, por frame,
+    ciego y se adapta a la escena; la frecuencia no.
+
+    El blend hacia `u` (NO hacia u/M) solo es coherente porque este core es
+    distortionless: con mu=0, w_mvdr cumple w^H a ~= 1, igual que u, asi que los
+    dos terminos estan en la MISMA normalizacion y la mezcla no introduce un
+    salto de escala. Con el core estandar (que degenera a u/M) este blend no
+    tendria sentido.
+
+    gate_kmax : ultimo indice de bin donde el gate esta activo (None = todos).
+        El gate por lambda es agnostico a la frecuencia por diseno; este tope es
+        una red de seguridad opcional para acotarlo a graves si en agudos se
+        observara perdida de supresion durante pausas.
+    save_gate : devuelve tambien g (K, T) para inspeccionar cuando se activo.
+
+    Base numerica identica a _fixed: Hermitiana forzada, carga diagonal RELATIVA
+    escala-invariante y np.linalg.solve. min_loading default 1e-9 para quedar en
+    el mismo regimen de carga que NM_MVDR (el core base ganador), no en el 1e-2
+    de _fixed.
+    """
+    K, T, M = X_stft.shape
+    Y_stft = np.zeros((K, T), dtype=np.complex128)
+    Num_XX = np.zeros((K, M, M), dtype=np.complex128)
+    Num_NN = np.zeros((K, M, M), dtype=np.complex128)
+    Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
+    Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
+    eye = np.eye(M)[np.newaxis, :, :]
+
+    # alpha puede ser ESCALAR o un array POR BIN (K,) -> factor de olvido
+    # dependiente de la frecuencia. Se lleva a (K,1,1), que difunde correctamente
+    # contra Num (K,M,M) y contra Den (K,1,1) sin tocar el resto del bucle.
+    alpha = np.asarray(alpha, dtype=np.float64)
+    if alpha.ndim == 0:
+        alpha = np.full((K,), float(alpha))
+    if alpha.shape != (K,):
+        raise ValueError(f"alpha debe ser escalar o de shape ({K},); es {alpha.shape}.")
+    alpha = alpha[:, np.newaxis, np.newaxis]
+
+    if save_weights:
+        weights_rec = np.zeros((K, T, M), dtype=np.complex128)
+    if save_gate:
+        gate_rec = np.zeros((K, T), dtype=np.float64)
+
+    # One-hot del microfono de referencia = destino del gate (PASSTHROUGH puro,
+    # NO u/M: ese factor 1/M es justamente el bug que este core corrige).
+    u_ref = np.zeros(M, dtype=np.complex128)
+    u_ref[ref_mic] = 1.0
+    k_hi = K if gate_kmax is None else int(gate_kmax) + 1
+
+    for m in range(T):
+        print(f"\rProcessing frame {m} of {T}", end="")
+        X_frame = X_stft[:, m, :]
+        m_s_frame = mask_s[:, m, np.newaxis, np.newaxis]
+        m_n_frame = mask_n[:, m, np.newaxis, np.newaxis]
+
+        R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
+
+        Num_XX = alpha * Num_XX + m_s_frame * R_instant
+        Den_XX = alpha * Den_XX + m_s_frame
+        Num_NN = alpha * Num_NN + m_n_frame * R_instant
+        Den_NN = alpha * Den_NN + m_n_frame
+
+        Phi_XX = Num_XX / (Den_XX + 1e-15)
+        Phi_NN = Num_NN / (Den_NN + 1e-15)
+
+        Phi_XX = 0.5 * (Phi_XX + np.conj(np.transpose(Phi_XX, (0, 2, 1))))
+        Phi_NN = 0.5 * (Phi_NN + np.conj(np.transpose(Phi_NN, (0, 2, 1))))
+
+        # --- LA CORRECCION: estimar el target restando el ruido (marca) -------
+        Phi_SS = Phi_XX - Phi_NN
+        Phi_SS = 0.5 * (Phi_SS + np.conj(np.transpose(Phi_SS, (0, 2, 1))))
+
+        if psd_project or rank1:
+            # eigh sobre matrices Hermitianas -> autovalores ascendentes, reales.
+            evals, evecs = np.linalg.eigh(Phi_SS)
+            if rank1:
+                # solo el autovector principal (target de rango 1)
+                lam_max = np.maximum(evals[:, -1], 0.0)
+                v = evecs[:, :, -1]
+                Phi_SS = lam_max[:, None, None] * np.einsum("fm,fn->fmn", v, v.conj())
+            else:
+                # proyeccion PSD: autovalores negativos (fruto de la resta) -> 0
+                evals = np.maximum(evals, 0.0)
+                Phi_SS = np.einsum("fmp,fnp->fmn", evecs * evals[:, np.newaxis, :],
+                                   evecs.conj())
+
+        # carga diagonal RELATIVA, escala-invariante (igual que _fixed)
+        tr_Phi = np.real(np.trace(Phi_NN, axis1=1, axis2=2))
+        adaptive_load = min_loading * (tr_Phi / M)
+        Phi_NN_stable = Phi_NN + eye * (adaptive_load[:, np.newaxis, np.newaxis] + 1e-12)
+
+        # w = Phi_NN^-1 Phi_SS u / (lambda_S + mu),  lambda_S = tr(.) == lambda - M
+        Phi_inv_Phi_S = np.linalg.solve(Phi_NN_stable, Phi_SS)      # (K,M,M)
+        lambda_S = np.real(np.trace(Phi_inv_Phi_S, axis1=1, axis2=2))
+        lambda_S = np.maximum(lambda_S, lambda_floor)
+        weights_unnorm = Phi_inv_Phi_S[:, :, ref_mic]
+        weights = weights_unnorm / (lambda_S[:, np.newaxis] + mu + 1e-15)
+
+        # --- GATE POR CONFIANZA: blend suave hacia el passthrough ------------
+        # g -> 1 donde el filtro tiene informacion espacial util; g -> 0 donde
+        # lambda_S/M dice que no la tiene (y ahi w = u: pasa el mic de
+        # referencia intacto, y la supresion queda para el post-filtro).
+        if gate_thresh is not None:
+            r = lambda_S / M
+            g = np.ones(K, dtype=np.float64)
+            rp = np.power(r[:k_hi], gate_sharp)
+            g[:k_hi] = rp / (rp + gate_thresh ** gate_sharp + 1e-30)
+            weights = (g[:, np.newaxis] * weights
+                       + (1.0 - g[:, np.newaxis]) * u_ref[np.newaxis, :])
+            if save_gate:
+                gate_rec[:, m] = g
+        elif save_gate:
+            gate_rec[:, m] = 1.0
+
+        if save_weights:
+            weights_rec[:, m, :] = weights
+        Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
+
+    out = (Y_stft,)
+    if save_weights:
+        out += (weights_rec,)
+    if save_gate:
+        out += (gate_rec,)
+    return out if len(out) > 1 else Y_stft
 
 
 def MVDR_Souden_recursive_mask_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,
