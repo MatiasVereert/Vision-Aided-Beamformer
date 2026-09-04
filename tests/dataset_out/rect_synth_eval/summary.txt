@@ -1,0 +1,21 @@
+=== BARRIDO sharpen x ventana (referencia 'early') ===
+                   proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                             
+hamming_pow8                 1.667            0.912              5.782           7.931          21.208           8.214
+hamming_warp                 1.641            0.911              6.105           8.298          20.220           8.679
+rect_pow4_synhann            1.660            0.907              4.951           7.460          20.907           7.760
+rect_pow8                    1.632            0.911              5.824           7.990          20.083           8.354
+rect_pow8_synhann            1.668            0.914              6.092           8.168          21.242           8.451
+rect_warp                    1.631            0.908              6.118           8.375          19.955           8.758
+rect_warp_synhann            1.676            0.911              6.401           8.573          20.714           8.926
+
+=== ordenado por PESQ ===
+                   proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                             
+rect_warp_synhann            1.676            0.911              6.401           8.573          20.714           8.926
+rect_pow8_synhann            1.668            0.914              6.092           8.168          21.242           8.451
+hamming_pow8                 1.667            0.912              5.782           7.931          21.208           8.214
+rect_pow4_synhann            1.660            0.907              4.951           7.460          20.907           7.760
+hamming_warp                 1.641            0.911              6.105           8.298          20.220           8.679
+rect_pow8                    1.632            0.911              5.824           7.990          20.083           8.354
+rect_warp                    1.631            0.908              6.118           8.375          19.955           8.758

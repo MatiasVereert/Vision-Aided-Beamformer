@@ -43,6 +43,14 @@ benchmark igual pasan el indice explicito (geometry.select_reference_mic).
                                         ESCALA en graves de todos los cores de
                                         arriba (ver mas abajo). Opcionalmente:
                                         gate por confianza y alpha por bin.
+  - MVDR_Souden_recursive_mask_calibrated: la _subtract GENERALIZADA con dos
+                                        parametros POR BIN ajustados contra las
+                                        SCM oracle (ver scm_calibration.py):
+                                        nu_k (escala de la sustraccion) y gamma_k
+                                        (shrinkage de Phi_NN hacia la coherencia
+                                        difusa, que sale de la GEOMETRIA).
+                                        Contiene a _fixed (nu=0) y a _subtract
+                                        (nu=1) como casos particulares.
 
 COLAPSO DE ESCALA EN GRAVES (motivo de la variante _subtract)
 ------------------------------------------------------------
@@ -628,7 +636,8 @@ def MVDR_Souden_recursive_mask_subtract(X_stft, mask_s, mask_n, min_loading=1e-9
                                         lambda_floor=1e-3, psd_project=True,
                                         rank1=False, ref_mic_idx=None,
                                         gate_thresh=None, gate_sharp=2.0,
-                                        gate_kmax=None, save_gate=False):
+                                        gate_kmax=None, save_gate=False,
+                                        ban=False):
     """
     Souden MVDR con SUSTRACCION DE COVARIANZA: Phi_SS = Phi_XX - Phi_NN.
 
@@ -723,6 +732,27 @@ def MVDR_Souden_recursive_mask_subtract(X_stft, mask_s, mask_n, min_loading=1e-9
         observara perdida de supresion durante pausas.
     save_gate : devuelve tambien g (K, T) para inspeccionar cuando se activo.
 
+    BAN (ban=True)
+    --------------
+    Blind Analytical Normalization sobre los pesos ya normalizados:
+
+        g_BAN = sqrt( (w^H Phi_NN^2 w) / M ) / (w^H Phi_NN w) ,   w <- g_BAN w
+
+    Misma formula que MVDR_Souden_recursive_mask_BAN. Lleva la salida al nivel de
+    ruido de UN microfono en vez del que deja la normalizacion de Souden: es un
+    reescalado REAL por (k,t), no cambia la direccion del filtro ni, por lo tanto,
+    la SINR instantanea -- lo que cambia es la respuesta en frecuencia efectiva de
+    la salida, y con ella PESQ/STOI.
+
+    OJO CON mu=0: el sentido original de BAN es corregir la escala del core
+    ESTANDAR, que degenera a u/M (ver arriba). Este core ya arregla ese colapso
+    por otra via, asi que BAN aca es una normalizacion ADICIONAL y no esta dicho
+    que sume: hay que medirlo.
+
+    Se aplica ANTES del gate por confianza, para que el blend siga siendo entre
+    dos filtros con sentido propio (w_ban y el passthrough u_ref) y no entre un
+    passthrough y una escala calculada sobre una mezcla.
+
     Base numerica identica a _fixed: Hermitiana forzada, carga diagonal RELATIVA
     escala-invariante y np.linalg.solve. min_loading default 1e-9 para quedar en
     el mismo regimen de carga que NM_MVDR (el core base ganador), no en el 1e-2
@@ -809,6 +839,13 @@ def MVDR_Souden_recursive_mask_subtract(X_stft, mask_s, mask_n, min_loading=1e-9
         weights_unnorm = Phi_inv_Phi_S[:, :, ref_mic]
         weights = weights_unnorm / (lambda_S[:, np.newaxis] + mu + 1e-15)
 
+        # --- BAN: reescalado real al nivel de ruido de un microfono ----------
+        if ban:
+            Phi_NN_w = np.einsum("fmn,fn->fm", Phi_NN_stable, weights)
+            ban_denom = np.real(np.einsum("fm,fm->f", weights.conj(), Phi_NN_w))
+            ban_num = np.sqrt(np.real(np.einsum("fm,fm->f", Phi_NN_w.conj(), Phi_NN_w)) / M)
+            weights = weights * (ban_num / (ban_denom + 1e-15))[:, np.newaxis]
+
         # --- GATE POR CONFIANZA: blend suave hacia el passthrough ------------
         # g -> 1 donde el filtro tiene informacion espacial util; g -> 0 donde
         # lambda_S/M dice que no la tiene (y ahi w = u: pasa el mic de
@@ -835,6 +872,146 @@ def MVDR_Souden_recursive_mask_subtract(X_stft, mask_s, mask_n, min_loading=1e-9
     if save_gate:
         out += (gate_rec,)
     return out if len(out) > 1 else Y_stft
+
+
+def MVDR_Souden_recursive_mask_calibrated(X_stft, mask_s, mask_n, nu=1.0, gamma=0.0,
+                                          Gamma_diff=None, min_loading=1e-9,
+                                          save_weights=False, alpha=0.99, mu=0.0,
+                                          lambda_floor=1e-3, psd_project=True,
+                                          ref_mic_idx=None):
+    """
+    Souden MVDR con la transformacion mascara -> covarianza CALIBRADA por banda.
+
+    Es la version "en produccion" de la familia parametrica que ajusta el banco
+    de `beamforming/mask/scm_calibration.py` (runner: tests/scm_calibration_run.py).
+    Dos parametros POR BIN, que se leen del .npz que produce el banco:
+
+      gamma_k -- SHRINKAGE ESTRUCTURADO de Phi_NN hacia la coherencia de campo
+          difuso Gamma(k), que sale SOLO de la geometria del arreglo:
+
+              Phi_NN <- (1 - gamma_k) Phi_NN + gamma_k (tr Phi_NN / M) Gamma(k)
+
+          Es Ledoit-Wolf con un target fisicamente correcto en lugar de la
+          identidad (que es lo que hace implicitamente la carga diagonal, y que
+          asume ruido espacialmente blanco: falso en una sala). Conserva la traza.
+
+      nu_k -- ESCALA DE LA SUSTRACCION del target:
+
+              Phi_SS = Phi_XX - nu_k Phi_NN            (+ proyeccion PSD)
+
+          El core `_subtract` usa nu = 1 implicito, pero Phi_XX (covarianza de la
+          mezcla condicionada a frames de VOZ, normalizada por Den_XX) y Phi_NN
+          (condicionada a frames de RUIDO, normalizada por Den_NN) NO estan en la
+          misma escala: nu = 1 asume que el nivel de ruido durante la voz es el
+          mismo que en las pausas. nu_k corrige ese sesgo, por banda.
+
+    CASOS PARTICULARES (verificados en tests/test_scm_calibration.py):
+        nu = 0, gamma = 0  ->  MVDR_Souden_recursive_mask_fixed   (core base)
+        nu = 1, gamma = 0  ->  MVDR_Souden_recursive_mask_subtract (mu = 0)
+    o sea que este core no es una variante mas: es el mapa que contiene a los dos
+    que ya estaban, y nu_k / gamma_k eligen el punto por banda.
+
+    PARAMETROS
+    ----------
+    nu, gamma : escalar o array (K,). gamma se clampea a [0, 1).
+    Gamma_diff : (K, M, M) coherencia difusa, de `scm_calibration.diffuse_coherence`
+        (necesita las posiciones de los microfonos). Obligatoria si algun
+        gamma_k > 0; con gamma == 0 se puede pasar None.
+    mu : trade-off PMWF sobre el denominador (lambda_S + mu), igual que en
+        `_subtract`. El banco ajusta con mu = 0 por default.
+    El resto (min_loading, lambda_floor, psd_project, alpha por bin, ref_mic_idx)
+    tiene el mismo significado y los mismos defaults que en `_subtract`.
+    """
+    K, T, M = X_stft.shape
+    Y_stft = np.zeros((K, T), dtype=np.complex128)
+    Num_XX = np.zeros((K, M, M), dtype=np.complex128)
+    Num_NN = np.zeros((K, M, M), dtype=np.complex128)
+    Den_XX = np.zeros((K, 1, 1), dtype=np.float64)
+    Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
+    ref_mic = M // 2 if ref_mic_idx is None else int(ref_mic_idx)
+    if not (0 <= ref_mic < M):
+        raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
+    eye = np.eye(M)[np.newaxis, :, :]
+
+    def _per_bin(p, name):
+        p = np.asarray(p, dtype=np.float64)
+        if p.ndim == 0:
+            p = np.full((K,), float(p))
+        if p.shape != (K,):
+            raise ValueError(f"{name} debe ser escalar o de shape ({K},); es {p.shape}.")
+        return p
+
+    nu = _per_bin(nu, "nu")[:, np.newaxis, np.newaxis]
+    gamma = np.clip(_per_bin(gamma, "gamma"), 0.0, 1.0)[:, np.newaxis, np.newaxis]
+    alpha = _per_bin(alpha, "alpha")[:, np.newaxis, np.newaxis]
+
+    use_shrink = bool(np.any(gamma > 0.0))
+    if use_shrink:
+        if Gamma_diff is None:
+            raise ValueError("gamma > 0 exige Gamma_diff (K, M, M): sin la geometria "
+                             "no hay target de shrinkage.")
+        Gamma_diff = np.asarray(Gamma_diff)
+        if Gamma_diff.shape != (K, M, M):
+            raise ValueError(f"Gamma_diff debe ser ({K}, {M}, {M}); es {Gamma_diff.shape}.")
+        Gamma_diff = Gamma_diff.astype(np.complex128)
+    # La proyeccion PSD solo tiene sentido donde efectivamente se resta algo: con
+    # nu = 0 en TODOS los bins, Phi_SS = Phi_XX ya es PSD y el eigh sobra.
+    do_psd = bool(psd_project and np.any(nu > 0.0))
+
+    if save_weights:
+        weights_rec = np.zeros((K, T, M), dtype=np.complex128)
+
+    for m in range(T):
+        print(f"\rProcessing frame {m} of {T}", end="")
+        X_frame = X_stft[:, m, :]
+        m_s_frame = mask_s[:, m, np.newaxis, np.newaxis]
+        m_n_frame = mask_n[:, m, np.newaxis, np.newaxis]
+
+        R_instant = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
+
+        Num_XX = alpha * Num_XX + m_s_frame * R_instant
+        Den_XX = alpha * Den_XX + m_s_frame
+        Num_NN = alpha * Num_NN + m_n_frame * R_instant
+        Den_NN = alpha * Den_NN + m_n_frame
+
+        Phi_XX = Num_XX / (Den_XX + 1e-15)
+        Phi_NN = Num_NN / (Den_NN + 1e-15)
+
+        Phi_XX = 0.5 * (Phi_XX + np.conj(np.transpose(Phi_XX, (0, 2, 1))))
+        Phi_NN = 0.5 * (Phi_NN + np.conj(np.transpose(Phi_NN, (0, 2, 1))))
+
+        # --- (1) shrinkage geometrico sobre Phi_NN ---------------------------
+        if use_shrink:
+            tr_n = np.real(np.trace(Phi_NN, axis1=1, axis2=2))[:, np.newaxis, np.newaxis] / M
+            Phi_NN = (1.0 - gamma) * Phi_NN + gamma * (tr_n * Gamma_diff)
+
+        # --- (2) sustraccion con escala calibrada ----------------------------
+        Phi_SS = Phi_XX - nu * Phi_NN
+        Phi_SS = 0.5 * (Phi_SS + np.conj(np.transpose(Phi_SS, (0, 2, 1))))
+
+        if do_psd:
+            evals, evecs = np.linalg.eigh(Phi_SS)
+            evals = np.maximum(evals, 0.0)
+            Phi_SS = np.einsum("fmp,fnp->fmn", evecs * evals[:, np.newaxis, :],
+                               evecs.conj())
+
+        # --- (3) Souden, base numerica identica a _subtract -------------------
+        tr_Phi = np.real(np.trace(Phi_NN, axis1=1, axis2=2))
+        adaptive_load = min_loading * (tr_Phi / M)
+        Phi_NN_stable = Phi_NN + eye * (adaptive_load[:, np.newaxis, np.newaxis] + 1e-12)
+
+        Phi_inv_Phi_S = np.linalg.solve(Phi_NN_stable, Phi_SS)
+        lambda_S = np.real(np.trace(Phi_inv_Phi_S, axis1=1, axis2=2))
+        lambda_S = np.maximum(lambda_S, lambda_floor)
+        weights = Phi_inv_Phi_S[:, :, ref_mic] / (lambda_S[:, np.newaxis] + mu + 1e-15)
+
+        if save_weights:
+            weights_rec[:, m, :] = weights
+        Y_stft[:, m] = np.einsum("fm,fm->f", weights.conj(), X_frame)
+
+    if save_weights:
+        return Y_stft, weights_rec
+    return Y_stft
 
 
 def MVDR_Souden_recursive_mask_MWF(X_stft, mask_s, mask_n, min_loading=1e-2,

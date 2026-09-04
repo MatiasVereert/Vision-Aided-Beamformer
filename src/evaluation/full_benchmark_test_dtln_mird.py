@@ -38,7 +38,10 @@ from evaluation.bf_wrappers import (
     NM_MVDR_PF,
     ORACLE_MB_MVDR_SOUDEN,
     SOUDEN_ORACLE_SCM,
-    DTLN_MB_MVDR_SOUDEN_BAN_alphaless
+    DTLN_MB_MVDR_SOUDEN_BAN_alphaless,
+    NM_MVDR_DSM_BLIND,
+
+    
 
 )
 
@@ -176,7 +179,9 @@ def evaluate_all_references(refs_dict, deg_sig, fs, interf_early, interf_late, t
 
 
 def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None, save_catalog=True, apply_dtln_post=True,
-                         show_progress=True, quiet_console=True):
+                         show_progress=True, quiet_console=True,
+                         save_weights_dir=None, save_weights_cells=None,
+                         save_weights_fps=16):
     """
     Barrido MIRD. `show_progress`/`quiet_console` SOLO afectan la consola:
       show_progress=False -> sin panel de barras (log plano, util en CI/logs).
@@ -184,8 +189,27 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                              metricas (util para depurar una etapa puntual).
     Ninguno de los dos cambia las llamadas, el orden de ejecucion ni el DataFrame
     devuelto.
+
+    GUARDADO DE PESOS (opcional)
+    ----------------------------
+    save_weights_dir : carpeta donde volcar los pesos w(k,t,m) de cada
+        (celda, procesador) como .npz. None (default) = no se guarda nada, o sea
+        el comportamiento historico.
+    save_weights_cells : lista de INDICES de experimento cuyos pesos guardar.
+        None = TODOS. Conviene acotarlo: los pesos son (K, T, M) complejos, y una
+        celda de 15 s con K=257, M=8 pesa ~60 MB en complex128. Aca se guardan
+        submuestreados en tiempo y en complex64 (ver abajo), pero aun asi son
+        varios MB por celda y procesador.
+    save_weights_fps : cuadros por segundo del submuestreo temporal (default 16).
+        Los pesos de un filtro recursivo con alpha=0.99 cambian con una constante
+        de tiempo de ~100 frames (~0.8 s a hop=128/16 kHz), asi que 16 fps ya
+        sobre-muestrea la dinamica real. Se conservan TODOS los bins de frecuencia
+        (a diferencia de `subsample_weights`, que ademas colapsa a tercios de
+        octava y serviria solo para los polares).
     """
     os.makedirs(output_dir, exist_ok=True)
+    if save_weights_dir is not None:
+        os.makedirs(save_weights_dir, exist_ok=True)
 
     # --- BACKWARD-COMPAT: promote wpe_taps/wpe_delay to grid axes ---
     # Callers that do not sweep these (e.g. notebooks A/B/C) still pass them as
@@ -806,6 +830,32 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 y_processed, weights = processor.process(mic_signals_ready, proc_config)
             proc_time = time.time() - t0
 
+            # --- volcado opcional de los pesos del beamformer -----------------
+            # Se guardan ANTES de cualquier post-filtro de salida: los pesos
+            # describen SOLO la etapa espacial (una ganancia espectral posterior
+            # no esta en w). Submuestreo temporal + complex64 para que el tamano
+            # sea manejable; todos los bins de frecuencia se conservan.
+            if (save_weights_dir is not None and weights is not None
+                    and (save_weights_cells is None or i in save_weights_cells)):
+                _hop = (scene_base_config['stft_window']
+                        - scene_base_config['stft_overlap'])
+                _T = weights.shape[1]
+                _dur = _T * _hop / scene_base_config['fs']
+                _nt = max(1, int(_dur * save_weights_fps))
+                _ti = np.round(np.linspace(0, _T - 1, _nt)).astype(int)
+                _freqs = np.fft.rfftfreq(scene_base_config['stft_window'],
+                                         1.0 / scene_base_config['fs'])
+                _tag = (f"exp{i:03d}_{proc_name}_rt{exp['rt60']:g}"
+                        f"_isir{exp['isir_db']:g}")
+                np.savez_compressed(
+                    os.path.join(save_weights_dir, f"{_tag}.npz"),
+                    weights=weights[:, _ti, :].astype(np.complex64),
+                    frame_idx=_ti, freqs=_freqs, hop=_hop,
+                    fs=scene_base_config['fs'], ref_mic_idx=ref_ch,
+                    processor=proc_name, rt60=exp['rt60'], isir_db=exp['isir_db'],
+                    interf_configs=str(exp['interf_configs']),
+                    mic_coords=scene_base_config['mic_coords'])
+
             ui.stage(f"[BF {p_idx+1}/{len(processors)}] {proc_name}: metricas ({proc_time:.1f}s de BF)")
             with ui.quiet():
                 proc_metrics = evaluate_all_references(
@@ -1050,10 +1100,10 @@ if __name__ == "__main__":
             [(45, 1.0)],
         ],
 
-        'isir_db': [5],
+        'isir_db': [0,5],
         'mismatch_gain': [0],
         'mismatch_phase': [0],
-        'use_wpe': [ False],
+        'use_wpe': [  False],
 
         # Back-end del WPE como eje de grilla: corre 'online' (RLS) y 'block'
         # (Opcion B, Cholesky) en la MISMA corrida para compararlos. Si se omite,
@@ -1079,18 +1129,19 @@ if __name__ == "__main__":
 
     processors_dict = {
        # "DS" :DS(),
-        "NM-MVDR_alpha_0.99_ref_1e-9" : NM_MVDR(min_loading =1e-9, alpha = 0.99),
-        "NM-MVDR-BAN": DTLN_MB_MVDR_SOUDEN_BAN(min_loading =1e-9, alpha = 0.99),
-        "NM-MVDR-BAN_alphaless": DTLN_MB_MVDR_SOUDEN_BAN_alphaless(min_loading =1e-9),
-        #"Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0)
-    }
+        "NM_MVDR" : NM_MVDR(min_loading =1e-9, alpha =0.99),
+        "NM_MVDR_PF" : NM_MVDR_PF(min_loading =1e-9, alpha =0.99),
+        "NM_MVDR_DSM_BLIND" : NM_MVDR_DSM_BLIND(min_loading =1e-9, alpha =0.99),
+        "NM_MVDR_DSM_BLIND_PF" : NM_MVDR_DSM_BLIND(min_loading =1e-9, alpha =0.99, smooth = 0.5), 
+        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0)
+    } 
 
     df_final = run_mird_grid_search(
         grid_params=param_grid,
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/BAN",
+        output_dir="tests/dataset_out/mega_king?",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )

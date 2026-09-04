@@ -1,0 +1,45 @@
+12 escenas  |  rt60 [0.36, 0.61]  interf [45, 90] deg  iSIR [-5, 0, 5] dB  |  snr_mic 30.0 dB
+alpha=0.99  alpha_lf=0.999 debajo de 300 Hz  smooth=0.33
+
+=== PROMEDIO SOBRE TODAS LAS ESCENAS ===
+                     PESQ   STOI  SI-SDR     SDR     SIR     SAR
+variant                                                         
+01_input_refmic     1.121  0.754   0.085   0.277   0.308  25.389
+NM_MVDR             1.579  0.898   5.308   6.925  13.801   8.349
+NM_MVDR_SUB         1.592  0.901   5.843   7.322  18.017   7.811
+NM_MVDR_SUB_aLF     1.686  0.907   6.382   8.097  18.992   8.573
+NM_MVDR_PF          1.699  0.877   3.942   6.713  16.252   7.240
+NM_MVDR_SUB_aLF_PF  1.796  0.884   4.827   7.371  21.028   7.569
+ORACLE_SCM          1.940  0.942   8.273  10.640  21.919  11.258
+
+=== ENERGIA POR BANDA vs TARGET LIMPIO [dB] (promedio) ===
+                    0-130Hz  130-300Hz  300-800Hz  800-2000Hz  2000-8000Hz
+variant                                                                   
+01_input_refmic       14.65       4.45       0.83        2.43         5.62
+NM_MVDR               -0.45      -5.96      -3.37       -3.91        -3.91
+NM_MVDR_SUB           -1.08      -5.18      -3.14       -3.87        -3.43
+NM_MVDR_SUB_aLF       -7.27      -4.88      -3.15       -3.87        -3.43
+NM_MVDR_PF            -5.89      -9.56      -3.96       -4.85        -5.11
+NM_MVDR_SUB_aLF_PF   -11.38      -8.56      -3.75       -4.80        -4.67
+ORACLE_SCM            -1.75      -3.09      -1.29       -0.78        -0.89
+
+=== VICTORIAS contra NM_MVDR (por escena) ===
+  NM_MVDR_SUB          PESQ 7/12  STOI 10/12  SI-SDR 12/12  SDR 12/12  SIR 12/12  SAR 4/12
+  NM_MVDR_SUB_aLF      PESQ 12/12  STOI 12/12  SI-SDR 12/12  SDR 12/12  SIR 11/12  SAR 8/12
+  NM_MVDR_PF           PESQ 12/12  STOI 0/12  SI-SDR 0/12  SDR 4/12  SIR 10/12  SAR 0/12
+  NM_MVDR_SUB_aLF_PF   PESQ 12/12  STOI 0/12  SI-SDR 1/12  SDR 8/12  SIR 10/12  SAR 0/12
+  ORACLE_SCM           PESQ 12/12  STOI 12/12  SI-SDR 12/12  SDR 12/12  SIR 11/12  SAR 12/12
+
+=== PROMEDIO POR iSIR (PESQ / SIR) ===
+-- PESQ --
+variant  01_input_refmic  NM_MVDR  NM_MVDR_SUB  NM_MVDR_SUB_aLF  NM_MVDR_PF  NM_MVDR_SUB_aLF_PF  ORACLE_SCM
+isir_db                                                                                                    
+-5                 1.065    1.254        1.301            1.416       1.358               1.513       1.694
+ 0                 1.102    1.554        1.585            1.705       1.702               1.840       1.965
+ 5                 1.195    1.928        1.889            1.938       2.038               2.035       2.162
+-- SIR --
+variant  01_input_refmic  NM_MVDR  NM_MVDR_SUB  NM_MVDR_SUB_aLF  NM_MVDR_PF  NM_MVDR_SUB_aLF_PF  ORACLE_SCM
+isir_db                                                                                                    
+-5                -4.302    8.822       15.403           16.472      12.570              22.638      18.865
+ 0                 0.327   14.064       18.395           19.857      18.622              19.575      26.424
+ 5                 4.898   18.518       20.252           20.647      18.879              20.335      20.468

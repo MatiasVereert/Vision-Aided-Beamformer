@@ -84,6 +84,46 @@ def generate_circular_array_coords(M: int, diameter: float, angle_offset_deg: fl
     return coords
 
 
+def generate_circular_center_array_coords(M: int, diameter: float,
+                                          angle_offset_deg: float = 0.0) -> np.ndarray:
+    """
+    UCA CON MICROFONO CENTRAL: un microfono en el centro del arreglo y los otros
+    M-1 repartidos uniformemente sobre la circunferencia de `diameter`. Plano XY
+    (z=0), centrado en el origen. **El microfono central se cuenta dentro de M**,
+    asi que a igual M y a igual diametro esta geometria y `generate_circular_array_coords`
+    tienen la misma apertura y la misma superficie: la unica diferencia es que una
+    "gasta" un sensor en el centro y la otra lo pone en el anillo.
+
+    Motivacion: los beamformers de la familia Souden (NM-MVDR) proyectan la salida
+    sobre UN microfono de referencia. En una UCA pura ese canal es forzosamente un
+    mic del anillo, a `diameter` de distancia del mic opuesto; con un mic central,
+    la referencia queda a `diameter/2` de TODOS los demas — la maxima diferencia de
+    camino acustico hacia la referencia se reduce a la mitad, que es justamente lo
+    que dispersa las RTF estimadas. El costo es un sensor menos en el anillo (peor
+    muestreo angular). Este generador existe para medir ese canje.
+
+    Orden: el microfono CENTRAL es el indice 0, despues el anillo. Asi
+    `select_reference_mic` lo elige naturalmente (es el mas cercano al centroide).
+
+    Args:
+        M: numero TOTAL de microfonos (>= 3: 1 central + al menos 2 en el anillo).
+        diameter: diametro del anillo en metros (= apertura del arreglo).
+        angle_offset_deg: rotacion rigida del anillo; no cambia la geometria.
+
+    Returns:
+        (M, 3) coordenadas centradas en el origen, el central primero.
+    """
+    if M < 3:
+        raise ValueError("At least 3 microphones are required (1 centre + 2 on the ring).")
+    if diameter <= 0:
+        raise ValueError("diameter must be strictly positive.")
+
+    ring = generate_circular_array_coords(M - 1, diameter, angle_offset_deg=angle_offset_deg)
+    coords = np.zeros((M, 3))
+    coords[1:, :] = ring          # el indice 0 queda en el origen (mic central)
+    return coords
+
+
 def generate_grid_array_coords(M: int, diameter: float) -> np.ndarray:
     """
     Square grid of M microphones inscribed in a circle of the given `diameter`,
@@ -386,6 +426,70 @@ def sample_torus_specs(n: int, r_major: float, r_tube: float,
     return specs
 
 
+def generate_powerlaw_grid_array_coords(M: int, diameter: float, exponent: float = 2.0,
+                                        area_mode: str = "span", rows: int = None,
+                                        cols: int = None, max_aspect: float = 2.0) -> np.ndarray:
+    """
+    Grilla rectangular de M microfonos con distribucion por LEY DE POTENCIAS en
+    cada eje, inscripta en el MISMO rectangulo que `generate_grid_array_coords_area`
+    (misma superficie, mismas filas x columnas, misma apertura). Plano XY (z=0),
+    centrada en el origen.
+
+    Sirve para aislar UNA sola variable: si la UNIFORMIDAD del reparto ayuda o no.
+    Se parte de la grilla uniforme equivalente por area y se deforma cada eje por
+    separado, en coordenadas normalizadas u en [-1, 1]:
+
+        u  ->  sign(u) * |u| ** exponent
+
+    Los extremos (|u| = 1) quedan fijos, asi que el RECTANGULO ENVOLVENTE -y por lo
+    tanto la superficie ocupada y la apertura maxima- es identico al de la grilla
+    uniforme; lo unico que cambia es como se reparten los micros adentro. Como la
+    deformacion es separable (misma para toda una fila / columna), la estructura de
+    producto tensorial de la grilla se conserva.
+
+      - exponent = 1   -> identidad: EXACTAMENTE la grilla uniforme (control).
+      - exponent > 1   -> micros apretados hacia el CENTRO y ralos en los bordes.
+        El co-arreglo gana espaciados chicos (mejor comportamiento en alta
+        frecuencia / menos aliasing espacial) sin perder apertura, a costa de
+        canales mas correlacionados en el centro.
+      - exponent < 1   -> micros empujados hacia los BORDES (tipo dos sub-arreglos
+        separados): mas resolucion angular, peor muestreo del campo cercano.
+
+    Nota: un eje con solo 2 nodos (p.ej. las 2 filas de la grilla 2x3 de M=6) no
+    cambia -sus micros ya estan en los extremos-, asi que con M chico la ley de
+    potencias actua sobre el eje largo unicamente.
+
+    Args:
+        M: numero de microfonos (>= 2).
+        diameter: diametro del circulo de REFERENCIA que fija la superficie
+            (A_ref = pi (diameter/2)^2), igual que en la grilla uniforme.
+        exponent: exponente de la ley de potencias (> 0).
+        area_mode, rows, cols, max_aspect: identicos a
+            `generate_grid_array_coords_area` (definen el rectangulo de base).
+
+    Returns:
+        (M, 3) coordenadas centradas en el origen, mismo orden por filas que la
+        grilla uniforme (comparables mic a mic).
+    """
+    if exponent <= 0:
+        raise ValueError("exponent must be strictly positive.")
+
+    base = generate_grid_array_coords_area(M, diameter, area_mode=area_mode,
+                                           rows=rows, cols=cols, max_aspect=max_aspect)
+    xy = base[:, :2]
+    warped = xy.copy()
+    for ax in (0, 1):
+        half = float(np.abs(xy[:, ax]).max())        # semi-span del eje
+        if half <= 0:
+            continue                                  # eje degenerado (1 sola linea)
+        u = xy[:, ax] / half                          # normalizado a [-1, 1]
+        warped[:, ax] = half * np.sign(u) * np.abs(u) ** exponent
+
+    coords = np.zeros((M, 3))
+    coords[:, :2] = warped
+    return coords
+
+
 def generate_spiral_array_coords(M: int, diameter: float, n_turns: float = 2.0) -> np.ndarray:
     """
     Archimedean spiral of M microphones inscribed in a circle of the given
@@ -548,11 +652,17 @@ def generate_random_array_coords(M: int, diameter: float, seed=None,
 # topologias en el benchmark (p.ej. for topo in TOPOLOGY_GENERATORS: ...).
 TOPOLOGY_GENERATORS = {
     "circular": generate_circular_array_coords,
+    # UCA con un mic en el centro (contado dentro de M): misma apertura y area que
+    # 'circular', pero la referencia del beamformer queda equidistante de todos.
+    "circular_center": generate_circular_center_array_coords,
     # 'grid' = grilla EQUIVALENTE POR AREA al circulo de referencia (filas != columnas
     # permitidas). La version historica inscripta en el circulo (n x n impar) queda
     # disponible como 'grid_inscribed' para reproducir corridas viejas.
     "grid": generate_grid_array_coords_area,
     "grid_inscribed": generate_grid_array_coords,
+    # Mismo rectangulo que 'grid' pero reparto por ley de potencias en cada eje
+    # (exponent=1 -> identico a 'grid'): aisla el efecto de la UNIFORMIDAD.
+    "powerlaw": generate_powerlaw_grid_array_coords,
     "spiral": generate_spiral_array_coords,
     "concentric": generate_concentric_array_coords,
     "random": generate_random_array_coords,

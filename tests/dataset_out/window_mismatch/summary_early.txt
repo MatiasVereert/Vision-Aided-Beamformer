@@ -1,0 +1,51 @@
+=== MEDIA POR PROCESADOR (referencia 'early', 4 escenas) ===
+                proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                          
+NM_PF_maskBF              1.770            0.886              3.180           6.498          24.900           6.544
+NM_PF_maskRect            1.760            0.889              3.401           6.629          26.421           6.699
+NM_maskBF                 1.751            0.905              4.525           7.139          20.834           7.391
+NM_maskRect               1.744            0.907              4.777           7.221          19.262           7.560
+NM_todoRect               1.712            0.906              4.878           7.369          20.370           7.721
+ORA_maskBF                1.958            0.926              6.051           8.852          28.828           8.887
+ORA_maskRect              1.925            0.923              5.672           8.214          22.309           8.419
+ORA_todoRect              1.885            0.922              5.751           8.536          21.162           8.818
+
+--- costo de la inconsistencia -- ORACLE (sin red):  ORA_maskBF - ORA_maskRect ---
+   proc_PESQ_early          media  +0.033   mediana  +0.038   por escena [0.039 0.012 0.041 0.038]
+   proc_STOI_early          media  +0.003   mediana  +0.003   por escena [0.003 0.003 0.004 0.004]
+   proc_SI-SDR_early        media  +0.379   mediana  +0.372   por escena [0.342 0.429 0.352 0.392]
+   proc_SDR_early           media  +0.638   mediana  +0.612   por escena [0.831 0.621 0.602 0.497]
+   proc_SIR_early           media  +6.297   mediana  +6.798   por escena [   nan  1.96  10.135  6.798]
+   proc_SAR_early           media  +0.468   mediana  +0.457   por escena [0.5   0.562 0.414 0.395]
+
+--- costo de la inconsistencia -- DTLN:  NM_maskBF - NM_maskRect ---
+   proc_PESQ_early          media  +0.007   mediana  +0.013   por escena [ 0.01   0.015  0.015 -0.012]
+   proc_STOI_early          media  -0.002   mediana  -0.002   por escena [-0.003 -0.001 -0.003 -0.   ]
+   proc_SI-SDR_early        media  -0.252   mediana  -0.232   por escena [-0.222 -0.447 -0.099 -0.242]
+   proc_SDR_early           media  -0.082   mediana  -0.152   por escena [ 0.211 -0.211 -0.237 -0.094]
+   proc_SIR_early           media  +1.572   mediana  +1.906   por escena [ 1.773  3.529 -1.052  2.039]
+   proc_SAR_early           media  -0.169   mediana  -0.187   por escena [ 0.069 -0.373 -0.163 -0.21 ]
+
+--- costo de la inconsistencia -- DTLN + postfiltro:  NM_PF_maskBF - NM_PF_maskRect ---
+   proc_PESQ_early          media  +0.010   mediana  +0.015   por escena [ 0.013  0.05  -0.041  0.018]
+   proc_STOI_early          media  -0.002   mediana  -0.003   por escena [-0.005 -0.002 -0.004  0.   ]
+   proc_SI-SDR_early        media  -0.221   mediana  -0.216   por escena [-0.177 -0.438 -0.014 -0.255]
+   proc_SDR_early           media  -0.130   mediana  -0.223   por escena [ 0.167 -0.242 -0.227 -0.219]
+   proc_SIR_early           media  -1.483   mediana  -0.153   por escena [ 5.002    nan -9.298 -0.153]
+   proc_SAR_early           media  -0.154   mediana  -0.170   por escena [ 0.096 -0.373 -0.121 -0.219]
+
+--- todo rectangular vs actual -- ORACLE:  ORA_todoRect - ORA_maskRect ---
+   proc_PESQ_early          media  -0.041   mediana  -0.043   por escena [-0.068 -0.066 -0.008 -0.02 ]
+   proc_STOI_early          media  -0.000   mediana  -0.001   por escena [ 0.     0.    -0.001 -0.001]
+   proc_SI-SDR_early        media  +0.079   mediana  +0.084   por escena [0.106 0.12  0.061 0.03 ]
+   proc_SDR_early           media  +0.323   mediana  +0.332   por escena [0.46  0.403 0.262 0.165]
+   proc_SIR_early           media  -1.147   mediana  -1.212   por escena [-0.359 -1.079 -1.345 -1.808]
+   proc_SAR_early           media  +0.400   mediana  +0.422   por escena [0.514 0.488 0.356 0.241]
+
+--- todo rectangular vs actual -- DTLN:  NM_todoRect - NM_maskRect ---
+   proc_PESQ_early          media  -0.032   mediana  -0.031   por escena [-0.034 -0.045 -0.021 -0.029]
+   proc_STOI_early          media  -0.000   mediana  -0.001   por escena [ 0.004  0.    -0.002 -0.004]
+   proc_SI-SDR_early        media  +0.101   mediana  +0.104   por escena [ 0.264  0.138  0.07  -0.068]
+   proc_SDR_early           media  +0.148   mediana  +0.161   por escena [ 0.266  0.362  0.057 -0.094]
+   proc_SIR_early           media  +1.108   mediana  -0.663   por escena [-0.538  7.125 -1.366 -0.787]
+   proc_SAR_early           media  +0.161   mediana  +0.162   por escena [ 0.358  0.139  0.186 -0.04 ]

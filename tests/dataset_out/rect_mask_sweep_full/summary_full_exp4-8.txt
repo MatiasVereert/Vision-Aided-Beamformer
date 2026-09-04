@@ -1,0 +1,21 @@
+=== BARRIDO sharpen x ventana (referencia 'early') ===
+              proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                        
+hamming_pow4            1.655            0.905              4.686           7.191          19.524           7.544
+hamming_pow8            1.667            0.912              5.782           7.931          21.208           8.214
+rect_pow4               1.630            0.904              4.773           7.346          19.369           7.741
+rect_pow8               1.632            0.911              5.824           7.990          20.083           8.354
+
+=== por ventana, ordenado por PESQ ===
+
+-- hamming --
+              proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                        
+hamming_pow8            1.667            0.912              5.782           7.931          21.208           8.214
+hamming_pow4            1.655            0.905              4.686           7.191          19.524           7.544
+
+-- rect --
+           proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                     
+rect_pow8            1.632            0.911              5.824           7.990          20.083           8.354
+rect_pow4            1.630            0.904              4.773           7.346          19.369           7.741

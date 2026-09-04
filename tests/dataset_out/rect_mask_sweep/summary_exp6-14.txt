@@ -1,0 +1,29 @@
+=== BARRIDO sharpen x ventana (referencia 'early') ===
+               proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                         
+hamming_pow10            1.771            0.915              5.908           8.144          22.208           8.362
+hamming_pow14            1.763            0.915              5.996           8.335          23.057           8.509
+hamming_pow6             1.767            0.911              5.425           7.704          21.624           7.921
+hamming_pow8             1.771            0.913              5.756           8.014          22.730           8.191
+rect_pow10               1.715            0.913              5.966           8.127          19.922           8.471
+rect_pow14               1.704            0.913              6.050           8.303          20.917           8.587
+rect_pow6                1.720            0.910              5.494           7.725          19.931           8.048
+rect_pow8                1.721            0.912              5.817           8.013          20.791           8.308
+
+=== por ventana, ordenado por PESQ ===
+
+-- hamming --
+               proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                         
+hamming_pow10            1.771            0.915              5.908           8.144          22.208           8.362
+hamming_pow8             1.771            0.913              5.756           8.014          22.730           8.191
+hamming_pow6             1.767            0.911              5.425           7.704          21.624           7.921
+hamming_pow14            1.763            0.915              5.996           8.335          23.057           8.509
+
+-- rect --
+            proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                      
+rect_pow8             1.721            0.912              5.817           8.013          20.791           8.308
+rect_pow6             1.720            0.910              5.494           7.725          19.931           8.048
+rect_pow10            1.715            0.913              5.966           8.127          19.922           8.471
+rect_pow14            1.704            0.913              6.050           8.303          20.917           8.587

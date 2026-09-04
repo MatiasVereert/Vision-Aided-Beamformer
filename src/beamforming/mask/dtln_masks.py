@@ -228,3 +228,58 @@ def get_dtln_masks_soft(time_domain_input, ref_mic, model1_path, block_len=512, 
     # This prevents harsh zeros in the STFT domain and reduces potential artifacts
 
     return sp_mask_condensed, n_mask_condensed
+
+
+# =====================================================================
+# ALINEACION DE FRAMES: mascara del DTLN vs STFT del beamformer
+# =====================================================================
+# El DTLN enmarca con un buffer deslizante: el bloque `i` contiene las ultimas
+# `block_len` muestras que terminan en (i+1)*block_shift, o sea la ventana
+#
+#     bloque i  ->  [ i*hop - (block_len - hop) ,  i*hop + hop )
+#
+# scipy.signal.stft(..., nperseg=block_len, noverlap=block_len-hop) con el
+# padding por defecto (boundary='zeros') centra el frame `t` en t*hop:
+#
+#     frame t   ->  [ t*hop - block_len/2 ,  t*hop + block_len/2 )
+#
+# Para block_len=512 y hop=128 las dos ventanas coinciden EXACTAMENTE cuando
+# t = i - 1: ambas cubren [i*128 - 384, i*128 + 128). Verificado numericamente
+# (correlacion 1.000 exacta en lag +1, ver tests/ds_mask_scm_run.py).
+#
+# Pero todos los wrappers mask-based aparean mask[:, m] con X_stft[:, m], o sea
+# que a cada frame de la STFT le aplican la mascara del frame ANTERIOR: la
+# mascara llega 1 frame (8 ms) tarde. `align_mask_frames` lo corrige adelantando
+# la mascara un frame.
+#
+# NO CUESTA LATENCIA. El bloque i+1 del DTLN y el frame i de la STFT cubren las
+# MISMAS 512 muestras y terminan en la MISMA muestra ((i+2)*hop), asi que la
+# correccion no mira ni una muestra hacia el futuro: es un error de indexado, no
+# un adelanto temporal. Por eso es implementable tal cual en el sistema online
+# que se lleva a HLS.
+#
+# OJO AL RE-AJUSTAR: cualquier calibracion ajustada ANTES de esta correccion
+# (los .npz de scm_calibration_run / scm_mask_calibration_run) se ajusto CON el
+# desfasaje puesto y hay que rehacerla.
+DTLN_MASK_SHIFT = 1
+
+
+def align_mask_frames(mask, shift=None):
+    """
+    Adelanta la mascara `shift` frames para alinearla con la STFT del beamformer
+    (ver la nota de arriba). Los ultimos `shift` frames se repiten.
+
+    Args:
+        mask: (K, T), o una tupla/lista de arrays (K, T).
+        shift: None -> DTLN_MASK_SHIFT (1 = corregido). 0 = comportamiento
+            historico, para reproducir resultados previos.
+
+    Returns:
+        lo mismo que se le paso (array o tupla), corrido.
+    """
+    s = DTLN_MASK_SHIFT if shift is None else int(shift)
+    if isinstance(mask, (tuple, list)):
+        return type(mask)(align_mask_frames(m, s) for m in mask)
+    if s <= 0:
+        return mask
+    return np.concatenate([mask[:, s:], np.repeat(mask[:, -1:], s, axis=1)], axis=1)
