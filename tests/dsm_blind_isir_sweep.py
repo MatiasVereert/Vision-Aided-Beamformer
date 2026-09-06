@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 from evaluation.intrusive_benchmark_real import (
     run_intrusive_benchmark, default_base_config, DTLN_MODEL_1, DTLN_MODEL_2,
 )
-from evaluation.bf_wrappers import NM_MVDR_DSM_BLIND
+from evaluation.bf_wrappers import NM_MVDR_DSM_BLIND, NM_MVDR_DSM_FB
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 CAPTURE = "/home/matias/pdm_mic_interface/kria_app/capture/wavs_paso5"
@@ -44,11 +44,13 @@ DEFAULT_OUT = os.path.join(PROJECT_ROOT, "tests", "real_benchmark_out", "dsm_bli
 
 # Orden fijo para que barras/curvas salgan siempre en el mismo orden.
 PROC_ORDER = ["ref_mic_raw", "dtln_mono", "dtln_souden_mvdr", "dtln_souden_ban_mvdr",
-             "dtln_souden_ban_then_dtln", "NM_MVDR_DSM_BLIND", "NM_MVDR_DSM_BLIND_PF"]
+             "dtln_souden_ban_then_dtln", "NM_MVDR_DSM_BLIND", "NM_MVDR_DSM_BLIND_PF",
+             "NM_MVDR_DSM_FB_8"]
 PROC_LABELS = {"ref_mic_raw": "mic crudo", "dtln_mono": "DTLN mono",
               "dtln_souden_mvdr": "Souden (actual)", "dtln_souden_ban_mvdr": "Souden+BAN",
               "dtln_souden_ban_then_dtln": "BAN->DTLN",
-              "NM_MVDR_DSM_BLIND": "DSM_BLIND", "NM_MVDR_DSM_BLIND_PF": "DSM_BLIND+PF"}
+              "NM_MVDR_DSM_BLIND": "DSM_BLIND", "NM_MVDR_DSM_BLIND_PF": "DSM_BLIND+PF",
+              "NM_MVDR_DSM_FB_8": "DSM_FB (sharpen=8, PF=0.5)"}
 METRIC_COLS = ["PESQ", "STOI", "SI-SDR", "SDR"]
 
 
@@ -67,6 +69,8 @@ def run_sweep(args):
         "NM_MVDR_DSM_BLIND": NM_MVDR_DSM_BLIND(min_loading=args.min_loading, alpha=args.alpha),
         "NM_MVDR_DSM_BLIND_PF": NM_MVDR_DSM_BLIND(min_loading=args.min_loading, alpha=args.alpha,
                                                    smooth=args.smooth),
+        "NM_MVDR_DSM_FB_8": NM_MVDR_DSM_FB(mode="fb", win_type="rect", synth="hann",
+                                           sharpen_exp=8.0, smooth=0.5, alpha=0.99),
     }
 
     rows_all = []

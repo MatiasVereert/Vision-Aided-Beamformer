@@ -375,7 +375,9 @@ def _rtf_from_loaded(R_est, load, ref_mic):
 
 def estimate_rtf_recursive(X_stft, mask_s, mask_n, ref_mic_idx=None,
                            rtf_alpha=0.999, rtf_loading=1e-2, rtf_mode="cs",
-                           w_mode="ds", bf_loading=1e-6):
+                           w_mode="ds", bf_loading=1e-6, return_diag=False,
+                           conf_gate=None, conf_bins=None, conf_smooth=0.9,
+                           conf_alpha=None, Gamma=None, sd_eps=1e-2):
     """
     RTF CIEGA por bin y por frame a partir de la SCM de senal estimada, y los
     pesos del front-end que se arma con ella.
@@ -393,15 +395,109 @@ def estimate_rtf_recursive(X_stft, mask_s, mask_n, ref_mic_idx=None,
         rtf_alpha: factor de olvido de la recursion de ESTIMACION.
         rtf_loading: carga diagonal relativa al nivel de ruido, eps.
         rtf_mode: "cs" | "evd" | "cw".
-        w_mode: "ds" -> w = d / (d^H d) (fijo salvo por d; sin estadistica de
-            ruido, el analogo directo del DS geometrico).
-            "mvdr" -> w = Phi_NN^-1 d / (d^H Phi_NN^-1 d): mejor SNR de entrada
-            para el DTLN, pero ya realimenta tambien la SCM de ruido.
+        w_mode: que hipotesis de ruido usa el front-end para armar w a partir de
+            la RTF estimada. Los tres son distortionless (w^H d = 1), o sea que
+            dejan la voz en el dominio del canal de referencia; lo que cambia es
+            contra que campo de ruido optimizan.
+            "ds"   -> w = d / (d^H d). Es el MVDR bajo la hipotesis de ruido
+                espacialmente BLANCO. Sin estadistica de ruido de ningun tipo.
+            "sd"   -> w = G^-1 d / (d^H G^-1 d), con G = (1-sd_eps) Gamma +
+                sd_eps I y Gamma la coherencia DIFUSA TEORICA, que sale SOLO de
+                la geometria del arreglo. SEMI-CIEGO: el sistema sigue sin saber
+                donde esta la fuente (d se estima), pero usa que conoce su propio
+                arreglo. sd_eps es la carga diagonal que controla el compromiso
+                directividad/WNG: sd_eps -> 1 recupera "ds" exactamente, sd_eps
+                -> 0 es el superdirectivo sin restriccion.
+            "mvdr" -> w = Phi_NN^-1 d / (d^H Phi_NN^-1 d), con la SCM de ruido
+                ESTIMADA (no teorica): mejor SNR de entrada para el DTLN, pero
+                realimenta tambien la SCM de ruido, o sea un segundo lazo.
+        Gamma: (K, M, M) coherencia difusa, obligatoria para w_mode="sd". Se
+            calcula una sola vez fuera (`scm_calibration.diffuse_coherence`)
+            porque no depende del tiempo.
+        sd_eps: carga diagonal de w_mode="sd", en [0, 1].
         bf_loading: carga relativa de Phi_NN para w_mode="mvdr" y para el
             blanqueo del modo "cw" (no toca la carga de la ESTIMACION).
 
+        return_diag: ademas de (W, D), devuelve un dict con los observables
+            INTERNOS de la recursion, por (K, T). Son los que hacen falta para
+            diagnosticar el lazo (y los candidatos naturales a alimentar un gate
+            de confianza, porque la recursion YA los calcula):
+              "sig_ratio": tr(Phi_SS) / tr(Phi_NN). SNR a-posteriori del propio
+                  estimador. ~0 -> no hay evidencia de senal en el subespacio,
+                  la carga manda y d -> e_ref.
+              "den_s", "den_n": masa acumulada de mascara (los denominadores de
+                  la media exponencial). Cuentan cuanta evidencia EFECTIVA entro:
+                  el horizonte real del estimador, no el nominal 1/(1-alpha).
+              "load_ratio": load_rtf / (tr(R_est)/M). Cuanto pesa la carga contra
+                  la senal estimada, o sea que tan encogido hacia e_ref esta d.
+              "conf": la confianza suavizada que gatea el lazo (ver abajo).
+              "gate": 1 si el frame entro a la rama de senal, 0 si no.
+              "wng": ganancia contra ruido BLANCO, 1/(w^H w), en veces. Con
+                  w^H d = 1 mide cuanto AMPLIFICA el filtro el ruido propio de
+                  los microfonos y el desajuste entre ellos: WNG < 1 (negativo
+                  en dB) significa que los empeora. Es la magnitud que hay que
+                  vigilar al bajar sd_eps.
+
+    ARRANQUE EN FRIO: EL GATE DE CONFIANZA (opcional, default apagado)
+    ------------------------------------------------------------------
+    Con conf_gate=None la recursion es BIT A BIT la historica. Ataca un modo de
+    falla medido (ver tests/window_mismatch/dsm_blind_feedback_diag.py): con
+    ruido NO estacionario y sin voz al principio, la sustraccion no se cancela,
+    d se va de e_ref, y la masa contaminada que se acumula (`den_s` ~ 10) tarda
+    1/(1-alpha) = 8 s de voz en olvidarse. El problema NO es que el estimador
+    arranque lento -- la recursion es una MEDIA normalizada, insesgada desde el
+    frame 1 -- es que olvida lento.
+
+      conf_gate : umbral en [0,1] sobre la CONFIANZA. Si la confianza no lo
+          alcanza, el frame NO entra a la rama de senal (gate DURO). Con el gate
+          cerrado desde el arranque, Den_XX = 0 -> Phi_XX = 0 -> Phi_SS = -Phi_NN
+          -> la proyeccion PSD lo anula entero -> R_est = 0 -> d = e_ref. O sea:
+          el estado seguro sale solo, sin forzar nada, y es exactamente el
+          sistema de hoy (el DTLN mirando el canal crudo). Cuando el gate abre,
+          Den_XX arranca de CERO: el estimador llega sin ancla.
+      conf_alpha : factor de olvido de la recursion SOMBRA que mide la
+          confianza. None = rtf_alpha. Conviene mas corto: ver la nota abajo.
+
+    Medido sobre 12 celdas MIRD con 8 s de ruido antes de la voz: la ganancia de
+    PESQ correlaciona r=+0.81 con cuanto dana el prefijo, o sea que actua donde
+    hay algo que arreglar. En las 5 celdas con dano >0.20 PESQ da +0.121 de media
+    (gana 4/5); en las otras 7, donde no hay dano, da -0.009. En la escena SANA
+    (voz desde t=0) es gratis: 12/12 celdas con |delta| <= 0.004.
+
+    SE PROBARON Y SE DESCARTARON otras dos piezas, por si vuelve la idea:
+      * un SCHEDULE del factor de olvido, alpha_eff = min(alpha, n/(n+1)). No
+        aporta: la recursion YA esta normalizada por Den, asi que la ventana
+        creciente ya la tenia; encima frena la convergencia (0.78 -> 3.09 s) y
+        da -0.017 de PESQ. Ojo si se reintenta: n TIENE que ser un contador
+        monotono. Con n = masa de mascara descontada por el propio alpha el
+        punto fijo es alpha_eff -> media de la mascara (~0.1), o sea memoria de
+        UN frame, y hunde el apuntamiento de 0.98 a 0.32.
+      * una CARGA guiada por la confianza (interpolar rtf_loading en log hasta un
+        valor alto cuando la confianza es 0). Borra el dano del prefijo, pero no
+        saca el ancla, cuesta en la escena sana (peor celda -0.026 de PESQ contra
+        -0.004 del gate) y tiene peor cola con prefijo (-0.122 vs -0.082): queda
+        dominada por el gate en riesgo.
+
+    LA CONFIANZA
+    ------------
+    Fraccion de bins donde tr(Phi_SS) > 0, suavizada en el tiempo con
+    `conf_smooth`. Medida: 0.02-0.24 en un prefijo sin voz y 0.97-1.00 en regimen
+    convergido; separa con 96-100% de acierto. Se calcula sobre `conf_bins`
+    (mascara booleana de K, None = todos).
+
+    Se estima con una recursion SOMBRA sin gatear -- una copia de Num_XX/Den_XX
+    con el alpha nominal -- y no con los acumuladores que alimentan la RTF. No es
+    un lujo: si la confianza saliera de los acumuladores gateados, con el gate
+    cerrado Phi_SS = -Phi_NN daria traza negativa en TODOS los bins, la confianza
+    quedaria clavada en 0 y el gate no abriria nunca. Cuesta un acumulador
+    (K,M,M) extra; la rama de ruido no se gatea, asi que Phi_NN se comparte.
+
+    La confianza que gatea el frame m es la del frame m-1: estrictamente causal,
+    sin lazo instantaneo.
+
     Returns:
         (W, D): ambos (K, T, M) complejos. W cumple W^H D = 1 frame a frame.
+        Con return_diag=True: (W, D, diag).
     """
     X_stft = np.asarray(X_stft)
     K, T, M = X_stft.shape
@@ -410,8 +506,25 @@ def estimate_rtf_recursive(X_stft, mask_s, mask_n, ref_mic_idx=None,
         raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
     if rtf_mode not in ("cs", "evd", "cw"):
         raise ValueError(f"rtf_mode desconocido: {rtf_mode!r} ('cs'|'evd'|'cw')")
-    if w_mode not in ("ds", "mvdr"):
-        raise ValueError(f"w_mode desconocido: {w_mode!r} ('ds'|'mvdr')")
+    if w_mode not in ("ds", "sd", "mvdr"):
+        raise ValueError(f"w_mode desconocido: {w_mode!r} ('ds'|'sd'|'mvdr')")
+    G_inv = None
+    if w_mode == "sd":
+        if Gamma is None:
+            raise ValueError("w_mode='sd' necesita Gamma (K, M, M). Ver "
+                             "`scm_calibration.diffuse_coherence`.")
+        Gamma = np.asarray(Gamma)
+        if Gamma.shape != (K, M, M):
+            raise ValueError(f"Gamma debe ser ({K}, {M}, {M}); es {Gamma.shape}.")
+        eps = float(np.clip(sd_eps, 0.0, 1.0))
+        # G NO depende del tiempo -> se invierte UNA vez y en el bucle queda un
+        # matvec. El piso absoluto evita la singularidad en f->0, donde Gamma
+        # tiende a la matriz de unos (rango 1) y con eps chico G queda mal
+        # condicionada: es el regimen donde el superdirectivo sin restriccion
+        # pide ganancias enormes y se le va el WNG.
+        G = ((1.0 - eps) * Gamma.astype(np.complex128)
+             + (eps + 1e-12) * np.eye(M)[None, :, :])
+        G_inv = np.linalg.inv(G)
 
     a = np.asarray(rtf_alpha, dtype=np.float64)
     if a.ndim == 0:
@@ -426,8 +539,37 @@ def estimate_rtf_recursive(X_stft, mask_s, mask_n, ref_mic_idx=None,
     Den_NN = np.zeros((K, 1, 1), dtype=np.float64)
     eye = np.eye(M)[None, :, :]
 
+    # --- infraestructura del gate de confianza -----------------------------
+    use_conf = conf_gate is not None
+    if conf_bins is None:
+        cb = np.ones(K, dtype=bool)
+    else:
+        cb = np.asarray(conf_bins, dtype=bool)
+        if cb.shape != (K,):
+            raise ValueError(f"conf_bins debe ser de shape ({K},); es {cb.shape}.")
+        if not cb.any():
+            raise ValueError("conf_bins no selecciona ningun bin.")
+    # Sombra SIN gatear: solo para medir la confianza (ver el docstring).
+    Num_XXs = np.zeros((K, M, M), dtype=np.complex128) if use_conf else None
+    Den_XXs = np.zeros((K, 1, 1), dtype=np.float64) if use_conf else None
+    # La sombra es un DETECTOR, no un estimador: le conviene una ventana CORTA
+    # ("¿hay evidencia de senal ahora?"), no la de 8 s del estimador. Con el
+    # alpha nominal la sombra hereda el mismo anclaje que hay que detectar y la
+    # confianza se queda clavada cerca del umbral. None = usa rtf_alpha.
+    a_c = a if conf_alpha is None else np.full((K, 1, 1), float(conf_alpha))
+    # Arranca en 0: SEGURO POR DEFAULT. Con la confianza baja el gate esta
+    # cerrado y la carga alta, o sea d = e_ref = el sistema de hoy, hasta que la
+    # sombra junte evidencia de que hay un subespacio de senal. Arrancar en 1
+    # dejaria entrar los primeros ~1/(1-conf_smooth) frames de basura, que con
+    # alpha=0.999 despues no se van mas.
+    conf = 0.0
+
     D = np.zeros((K, T, M), dtype=np.complex128)
     W = np.zeros((K, T, M), dtype=np.complex128)
+    diag = ({k: np.zeros((K, T)) for k in
+             ("sig_ratio", "den_s", "den_n", "load_ratio", "conf", "gate",
+              "wng")}
+            if return_diag else None)
 
     for m in range(T):
         X_frame = X_stft[:, m, :]
@@ -435,8 +577,14 @@ def estimate_rtf_recursive(X_stft, mask_s, mask_n, ref_mic_idx=None,
         m_s = mask_s[:, m, None, None]
         m_n = mask_n[:, m, None, None]
 
-        Num_XX = a * Num_XX + m_s * R_inst
-        Den_XX = a * Den_XX + m_s
+        # GATE duro sobre la rama de SENAL, con la confianza del frame ANTERIOR
+        # (nada de lazo instantaneo: es estrictamente causal). La rama de ruido
+        # no se gatea nunca: el ruido siempre esta, y Phi_NN fija la escala de
+        # la carga.
+        g = 1.0 if conf_gate is None else float(conf >= conf_gate)
+
+        Num_XX = a * Num_XX + g * m_s * R_inst
+        Den_XX = a * Den_XX + g * m_s
         Num_NN = a * Num_NN + m_n * R_inst
         Den_NN = a * Den_NN + m_n
 
@@ -453,6 +601,16 @@ def estimate_rtf_recursive(X_stft, mask_s, mask_n, ref_mic_idx=None,
         # con ella el umbral de confianza a partir del cual la RTF deja de ser
         # e_ref. Piso absoluto para los primeros frames (Phi_NN ~ 0).
         nlev = np.real(np.trace(Phi_NN, axis1=1, axis2=2)) / M
+
+        # --- confianza: recursion SOMBRA, sin gate y con el alpha nominal ----
+        if use_conf:
+            Num_XXs = a_c * Num_XXs + m_s * R_inst
+            Den_XXs = a_c * Den_XXs + m_s
+            Phi_XXs = Num_XXs / (Den_XXs + 1e-15)
+            tr_ss = (np.real(np.trace(Phi_XXs, axis1=1, axis2=2)) / M) - nlev
+            conf_inst = float(np.mean(tr_ss[cb] > 0.0))
+            conf = conf_smooth * conf + (1.0 - conf_smooth) * conf_inst
+
         load_rtf = rtf_loading * nlev + 1e-20
 
         if rtf_mode == "cs":
@@ -487,9 +645,23 @@ def estimate_rtf_recursive(X_stft, mask_s, mask_n, ref_mic_idx=None,
         d = _rtf_from_loaded(R_est, load_rtf, ref_mic)
         D[:, m, :] = d
 
+        if diag is not None:
+            tr_ss = np.real(np.trace(Phi_SS, axis1=1, axis2=2)) / M
+            tr_est = np.real(np.trace(R_est, axis1=1, axis2=2)) / M
+            diag["sig_ratio"][:, m] = tr_ss / (nlev + 1e-30)
+            diag["den_s"][:, m] = Den_XX[:, 0, 0]
+            diag["den_n"][:, m] = Den_NN[:, 0, 0]
+            diag["load_ratio"][:, m] = load_rtf / (tr_est + 1e-30)
+            diag["conf"][:, m] = conf if use_conf else np.nan
+            diag["gate"][:, m] = g
+
         if w_mode == "ds":
             den = np.real(np.einsum("fm,fm->f", d.conj(), d))
             W[:, m, :] = d / (den[:, None] + 1e-30)
+        elif w_mode == "sd":
+            Gi_d = np.einsum("fmn,fn->fm", G_inv, d)
+            den = np.real(np.einsum("fm,fm->f", d.conj(), Gi_d))
+            W[:, m, :] = Gi_d / (den[:, None] + 1e-30)
         else:
             load_nn = bf_loading * nlev + 1e-20
             Phi_NN_l = Phi_NN + eye * load_nn[:, None, None]
@@ -497,21 +669,42 @@ def estimate_rtf_recursive(X_stft, mask_s, mask_n, ref_mic_idx=None,
             den = np.real(np.einsum("fm,fm->f", d.conj(), Pi_d))
             W[:, m, :] = Pi_d / (den[:, None] + 1e-30)
 
-    return W, D
+        if diag is not None:
+            # DESPUES de escribir W: 1/(w^H w) necesita el filtro ya armado.
+            diag["wng"][:, m] = 1.0 / (
+                np.real(np.einsum("fm,fm->f", W[:, m, :].conj(), W[:, m, :]))
+                + 1e-30)
+
+    return (W, D, diag) if return_diag else (W, D)
 
 
 def blind_bf_signal(mic_signals, mask_s, mask_n, fs, ref_mic_idx=None,
                     nperseg=512, noverlap=384, window="hamming",
                     rtf_alpha=0.999, rtf_loading=1e-2, rtf_mode="cs",
-                    w_mode="ds", bf_loading=1e-6, return_stats=False):
+                    w_mode="ds", bf_loading=1e-6, return_stats=False,
+                    return_diag=False, conf_gate=None,
+                    conf_band=(300.0, 3400.0), conf_smooth=0.9, conf_alpha=None,
+                    mic_coords=None, sd_eps=1e-2, sd_field="spherical"):
     """
     Analogo CIEGO de `fixed_bf_signal`: en vez de apuntar con la geometria y el
     DOA, apunta con la RTF estimada de la propia SCM de senal (ver arriba).
     Devuelve la senal MONO en el tiempo, alineada con `mic_signals` y en el
     dominio del canal de referencia, lista para entrar al DTLN.
 
+    Para w_mode="sd" hay que pasar `mic_coords` (M, 3): la coherencia difusa
+    Gamma se calcula aca, una sola vez, a partir de la geometria y de las
+    frecuencias de la STFT. NO se usa la posicion de la fuente en ningun lado:
+    el sistema sigue siendo ciego al DOA, solo conoce su propio arreglo.
+
+    conf_gate es el gate de arranque en frio de `estimate_rtf_recursive`
+    (apagado por default). `conf_band` es el rango en Hz sobre el que se cuenta
+    la fraccion de bins con senal, y se traduce aca a la mascara de bins que
+    espera el estimador; None = todos.
+
     Returns:
-        y_time (N,)  -- o (y_time, W, D, freqs) con return_stats=True.
+        y_time (N,)  -- o (y_time, W, D, freqs) con return_stats=True, o
+        (y_time, W, D, freqs, diag) si ademas return_diag=True (ver
+        `estimate_rtf_recursive`).
     """
     freqs, _, Z = sig.stft(mic_signals, fs=fs, window=window, nperseg=nperseg,
                            noverlap=noverlap, nfft=nperseg)
@@ -531,15 +724,28 @@ def blind_bf_signal(mic_signals, mask_s, mask_n, fs, ref_mic_idx=None,
             [m, np.repeat(m[:, -1:], T - m.shape[1], axis=1)], axis=1)
     mask_s, mask_n = _fit_T(mask_s), _fit_T(mask_n)
 
-    W, D = estimate_rtf_recursive(
+    Gamma = None
+    if w_mode == "sd":
+        if mic_coords is None:
+            raise ValueError("w_mode='sd' necesita mic_coords (M, 3).")
+        Gamma = diffuse_coherence(np.asarray(mic_coords, dtype=np.float64),
+                                  freqs, field=sd_field)
+    if conf_band is None:
+        conf_bins = None
+    else:
+        conf_bins = (freqs >= conf_band[0]) & (freqs <= conf_band[1])
+    out = estimate_rtf_recursive(
         X, mask_s, mask_n, ref_mic_idx=ref_mic_idx,
         rtf_alpha=rtf_alpha, rtf_loading=rtf_loading, rtf_mode=rtf_mode,
-        w_mode=w_mode, bf_loading=bf_loading)
+        w_mode=w_mode, bf_loading=bf_loading, return_diag=return_diag,
+        conf_gate=conf_gate, conf_bins=conf_bins, conf_smooth=conf_smooth,
+        conf_alpha=conf_alpha, Gamma=Gamma, sd_eps=sd_eps)
+    (W, D, diag) = out if return_diag else (out[0], out[1], None)
 
     Y = np.einsum("ktm,ktm->kt", W.conj(), X)
     _, y = sig.istft(Y, fs=fs, window=window, nperseg=nperseg, noverlap=noverlap,
                      nfft=nperseg)
     y = y[:mic_signals.shape[1]]
     if return_stats:
-        return y, W, D, freqs
+        return (y, W, D, freqs, diag) if return_diag else (y, W, D, freqs)
     return y

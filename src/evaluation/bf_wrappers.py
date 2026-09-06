@@ -30,6 +30,9 @@ from beamforming.mask.ds_mask import (
     fixed_bf_signal, array_gain, backproject_mask, stretch_sharpen,
     blind_bf_signal, estimate_rtf_recursive,
 )
+from beamforming.mask.blind_feedback import (
+    blind_feedback_stft, DTLNStream,
+)
 from beamforming.MWF.wiener_postfilter import (
     MVDR_Souden_mask_specsub_MWF, estimate_isir_db, schedule_aggressiveness,
 )
@@ -2534,10 +2537,22 @@ class NM_MVDR_DSM_BLIND:
                  lambda_floor=1e-3, psd_project=True, mask_shift=None,
                  rtf_alpha=0.999, rtf_loading=1e-2, rtf_mode="cs", w_mode="ds",
                  bf_loading=1e-6, n_iter=1, smooth=None, pf_mask_src="fix",
-                 ban=False, mask_warp=None, synth=None):
+                 ban=False, mask_warp=None, synth=None, causal=False,
+                 conf_gate=None, conf_band=(300.0, 3400.0), conf_smooth=0.9,
+                 conf_alpha=None, sd_eps=1e-2, sd_field="spherical"):
         # Ventana de SINTESIS (None = la misma del analisis: comportamiento
         # historico, bit a bit). Ver `ola_taper`.
         self.synth = synth
+        # CADENA CAUSAL. El camino historico tiene dos etapas que miran toda la
+        # senal y por lo tanto no son implementables online:
+        #   * la normalizacion por el PICO GLOBAL del canal antes de enmarcar
+        #     (dentro de get_dtln_masks_*), en las DOS pasadas;
+        #   * el STRETCH min-max global de la mascara, tambien en las dos.
+        # causal=True las reemplaza: escala fija 1.0 (el hardware entrega
+        # unidades de fondo de escala; medido: corr 0.999 / MAE 0.009 contra el
+        # pico global) y post-proceso PUNTUAL -- la potencia si mask_warp es
+        # None, o el warp calibrado si se pasa. Default False = historico.
+        self.causal = causal
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
@@ -2551,6 +2566,24 @@ class NM_MVDR_DSM_BLIND:
         self.lambda_floor = lambda_floor
         self.psd_project = psd_project
         self.mask_shift = mask_shift
+        # --- ARRANQUE EN FRIO del estimador de RTF (todo apagado = historico) --
+        # Ver `estimate_rtf_recursive`. Atacan el modo de falla medido en
+        # tests/window_mismatch/dsm_blind_feedback_diag.py: si el archivo empieza
+        # con ruido NO estacionario y la voz entra tarde, la sustraccion no se
+        # cancela, d se va de e_ref y la masa contaminada que se acumula tarda
+        # 1/(1-rtf_alpha) = 8 s de voz en olvidarse (con 8 s de prefijo no se
+        # recupera dentro del archivo: la ganancia del front-end cae a 0 dB).
+        self.conf_gate = conf_gate            # gate duro de la rama de senal
+        self.conf_band = conf_band
+        # --- SUPERDIRECTIVIDAD del front-end (w_mode="sd") ---------------------
+        # Semi-ciego: usa la coherencia difusa TEORICA, que sale solo de la
+        # geometria del arreglo. NO usa scene_config['source_pos'], asi que el
+        # sistema sigue sin saber donde esta la fuente. sd_eps es la carga
+        # diagonal: 1 = DS exacto, ->0 = superdirectivo sin restriccion.
+        self.sd_eps = sd_eps
+        self.sd_field = sd_field
+        self.conf_smooth = conf_smooth
+        self.conf_alpha = conf_alpha
         # --- lazo de realimentacion ---
         self.rtf_alpha = rtf_alpha
         self.rtf_loading = rtf_loading
@@ -2593,10 +2626,13 @@ class NM_MVDR_DSM_BLIND:
         win_spec = resolve_stft_window(scene_config, self.win_type, nperseg_dyn)
 
         # 1. PRIMERA PASADA: la mascara del sistema actual, sobre el canal crudo.
+        # Solo sirve para estimar la RTF ciega; no llega al beamformer final.
+        _causal = getattr(self, 'causal', False)
         mask_s, mask_n = get_dtln_masks_sharpen(
             mic_signals, ref_mic_idx, model_path,
             block_len=nperseg_dyn, block_shift=hop_length_dyn,
-            sharpen_exp=sharpen_exp)
+            sharpen_exp=sharpen_exp,
+            **({'peak_norm': 1.0, 'stretch': False} if _causal else {}))
         mask_s, mask_n = align_mask_frames((mask_s, mask_n), self.mask_shift)
         mask_s_ref = mask_s  # la del canal crudo: ablacion del post-filtro
 
@@ -2607,11 +2643,25 @@ class NM_MVDR_DSM_BLIND:
                 nperseg=nperseg_dyn, noverlap=noverlap_dyn, window=win_spec,
                 rtf_alpha=self.rtf_alpha, rtf_loading=self.rtf_loading,
                 rtf_mode=self.rtf_mode, w_mode=self.w_mode,
-                bf_loading=self.bf_loading)
+                bf_loading=self.bf_loading,
+                conf_gate=getattr(self, 'conf_gate', None),
+                mic_coords=(scene_config.get('mic_coords')
+                            if self.w_mode == "sd" else None),
+                sd_eps=getattr(self, 'sd_eps', 1e-2),
+                sd_field=getattr(self, 'sd_field', "spherical"),
+                conf_band=getattr(self, 'conf_band', (300.0, 3400.0)),
+                conf_smooth=getattr(self, 'conf_smooth', 0.9),
+                conf_alpha=getattr(self, 'conf_alpha', None))
             m_raw, _ = get_dtln_masks_soft(y_fix[None, :], 0, model_path,
                                            block_len=nperseg_dyn,
-                                           block_shift=hop_length_dyn)
-            if self.mask_warp is None:
+                                           block_shift=hop_length_dyn,
+                                           **({'peak_norm': 1.0} if _causal else {}))
+            if self.mask_warp is None and _causal:
+                # Potencia PUNTUAL, sin el stretch global: mismo realce que
+                # produccion pero causal.
+                m = np.clip(np.asarray(m_raw, dtype=np.float64), 0.0, 1.0)
+                mask_s, mask_n = m ** sharpen_exp, (1.0 - m) ** sharpen_exp
+            elif self.mask_warp is None:
                 # Post-proceso de PRODUCCION (stretch global + sharpen).
                 mask_s, mask_n = stretch_sharpen(m_raw, sharpen_exp=sharpen_exp)
             else:
@@ -2680,3 +2730,219 @@ class NM_MVDR_DSM_BLIND:
         else:
             y_time = ola_taper(Y_stft, nperseg_dyn, hop_length_dyn, self.synth, n_out)
         return y_time, weights
+
+
+class NM_MVDR_DSM_FB:
+    """
+    NM_MVDR_DSM_BLIND con UN SOLO DTLN y el lazo cerrado FRAME A FRAME.
+
+    Es la variante online de `NM_MVDR_DSM_BLIND`. La cadena de dos pasadas corre
+    el DTLN dos veces sobre toda la senal, y la primera pasada (sobre el canal
+    crudo) no llega al beamformer: es solo un BOOTSTRAP para poder estimar la
+    RTF. Aca esa pasada desaparece, porque el lazo se bootstrapea solo: el
+    estimador arranca con las dos mascaras en cero, con lo cual Phi_SS = 0,
+    d = e_ref y el front-end ES el canal de referencia en el primer frame.
+
+        mascara(t) = DTLN( w(d(t))^H x(t) ) ,   d(t) = RTF( Phi_SS(mascara(t-1)) )
+
+    Ver `beamforming/mask/blind_feedback.py` para el detalle y la verificacion de
+    equivalencia contra los cores batch.
+
+    MODOS (`mode`)
+    --------------
+    Hay DOS cambios respecto de `NM_MVDR_DSM_BLIND` y conviene poder separarlos,
+    porque no tienen por que aportar lo mismo:
+
+      "fb"   : el lazo cerrado con UN DTLN. Los dos cambios juntos.
+      "spec" : ABLACION. Mantiene las dos pasadas y el bootstrap por el canal
+          crudo -- o sea, sin realimentacion -- pero calcula la mascara(2)
+          alimentando al DTLN con el ESPECTRO conformado en vez de resintetizar
+          y volver a enmarcar. Aisla el efecto de sacar el ida y vuelta al
+          tiempo.
+
+    POR QUE EL ESPECTRO SE PUEDE ALIMENTAR DIRECTO
+    ----------------------------------------------
+    Con analisis RECTANGULAR, el bloque que enmarcaria el DTLN y el frame de la
+    STFT son las mismas muestras: rFFT(bloque i) == L * X(:, i-1), con error
+    EXACTAMENTE 0 (verificado). Como el bloque i corresponde al frame i-1, la
+    mascara sale ya alineada y `align_mask_frames` no hace falta.
+
+    En el camino de dos pasadas, en cambio, la mascara(2) se calcula sobre y_fix
+    RESINTETIZADA: como w varia con (k,t), Y_fix no es la STFT de ninguna senal,
+    asi que resintetizar y re-analizar es una proyeccion que mezcla 4 frames
+    filtrados. No es lo mismo, y por eso existe el modo "spec".
+
+    EL LAZO CERRADO NO TIENE ANCLA
+    ------------------------------
+    En la cadena de dos pasadas la mascara(1) es independiente del lazo: pase lo
+    que pase con la realimentacion, las SCM del estimador se pesan con algo que
+    no se puede corromper. Aca no. Por eso `conf_gate` deja de ser opcional --
+    es el seguro que corta la rama de senal mientras no haya evidencia -- y
+    conviene prenderlo si la escena puede arrancar con ruido no estacionario.
+    """
+
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-9, alpha=0.99,
+                 sharpen_exp=8.0, win_type='rect', synth='hann', mu=0.0,
+                 lambda_floor=1e-3, psd_project=True, rtf_alpha=0.999,
+                 rtf_loading=1e-2, rtf_mode="cs", w_mode="ds", bf_loading=1e-6,
+                 smooth=None, ban=False, mask_warp=None, conf_gate=None,
+                 conf_band=(300.0, 3400.0), conf_smooth=0.9, conf_alpha=None,
+                 sd_eps=1e-2, sd_field="spherical", mode="fb"):
+        if mode not in ("fb", "spec"):
+            raise ValueError(f"mode desconocido: {mode!r} ('fb' | 'spec')")
+        self.mode = mode
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+        self.alpha = alpha
+        self.sharpen_exp = sharpen_exp
+        self.win_type = win_type
+        self.synth = synth
+        self.mu = mu
+        self.lambda_floor = lambda_floor
+        self.psd_project = psd_project
+        self.rtf_alpha = rtf_alpha
+        self.rtf_loading = rtf_loading
+        self.rtf_mode = rtf_mode
+        self.w_mode = w_mode
+        self.bf_loading = bf_loading
+        self.smooth = smooth
+        self.ban = ban
+        self.mask_warp = mask_warp
+        self.conf_gate = conf_gate
+        self.conf_band = conf_band
+        self.conf_smooth = conf_smooth
+        self.conf_alpha = conf_alpha
+        self.sd_eps = sd_eps
+        self.sd_field = sd_field
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        fs = scene_config['fs']
+        model_path = scene_config.get('dtln_model_path',
+                                      'dnn_denoise/models/model_quant_1.tflite')
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        hop_dyn = nperseg_dyn - noverlap_dyn
+
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
+        sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
+        win_spec = resolve_stft_window(scene_config, self.win_type, nperseg_dyn)
+
+        # UNA sola STFT en toda la cadena (analisis rectangular).
+        freqs, _, Zxx = sig.stft(mic_signals, fs=fs, window=win_spec,
+                                 nperseg=nperseg_dyn, noverlap=noverlap_dyn,
+                                 nfft=nperseg_dyn)
+        X_stft = np.transpose(Zxx, (1, 2, 0))                    # (K, T, M)
+
+        conf_bins = None
+        if self.conf_band is not None:
+            conf_bins = (freqs >= self.conf_band[0]) & (freqs <= self.conf_band[1])
+
+        common = dict(
+            ref_mic_idx=ref_mic_idx, sharpen_exp=sharpen_exp,
+            rtf_alpha=self.rtf_alpha, rtf_loading=self.rtf_loading,
+            rtf_mode=self.rtf_mode, w_mode=self.w_mode,
+            bf_loading=self.bf_loading, alpha=self.alpha,
+            min_loading=self.min_loading, mu=self.mu,
+            lambda_floor=self.lambda_floor, psd_project=self.psd_project,
+            ban=self.ban, smooth=self.smooth, conf_gate=self.conf_gate,
+            conf_bins=conf_bins, conf_smooth=self.conf_smooth,
+            conf_alpha=self.conf_alpha,
+            mic_coords=(scene_config.get('mic_coords')
+                        if self.w_mode == "sd" else None),
+            freqs=freqs, sd_eps=self.sd_eps, sd_field=self.sd_field,
+            mask_warp=self.mask_warp,
+        )
+
+        if self.mode == "fb":
+            Y_stft, weights = blind_feedback_stft(
+                X_stft, model_path, nperseg_dyn, feedback=True, **common)
+        else:
+            Y_stft, weights = self._process_spec(
+                X_stft, mic_signals, freqs, fs, win_spec, model_path,
+                nperseg_dyn, noverlap_dyn, hop_dyn, ref_mic_idx, sharpen_exp,
+                mic_coords=scene_config.get('mic_coords'))
+
+        n_out = mic_signals.shape[1]
+        if self.synth is None:
+            _, y_time = sig.istft(Y_stft, fs=fs, window=win_spec,
+                                  nperseg=nperseg_dyn, noverlap=noverlap_dyn,
+                                  nfft=nperseg_dyn)
+            y_time = y_time[:n_out]
+        else:
+            y_time = ola_taper(Y_stft, nperseg_dyn, hop_dyn, self.synth, n_out)
+        return y_time, weights
+
+    # -- ABLACION "spec": dos pasadas, pero sin ida y vuelta al tiempo ------
+    def _process_spec(self, X_stft, mic_signals, freqs, fs, win_spec,
+                      model_path, nperseg, noverlap, hop, ref_mic_idx,
+                      sharpen_exp, mic_coords=None):
+        from beamforming.mask.blind_feedback import SoudenSubtractCore
+
+        # Pasada 1: el bootstrap de siempre, sobre el canal crudo.
+        m_s1, m_n1 = get_dtln_masks_sharpen(
+            mic_signals, ref_mic_idx, model_path, block_len=nperseg,
+            block_shift=hop, sharpen_exp=sharpen_exp, peak_norm=1.0, stretch=False)
+        m_s1, m_n1 = align_mask_frames((m_s1, m_n1), None)
+
+        K, T, M = X_stft.shape
+
+        def _fit_T(m):
+            m = np.asarray(m, dtype=np.float64)
+            if m.shape[1] >= T:
+                return m[:, :T]
+            return np.concatenate(
+                [m, np.repeat(m[:, -1:], T - m.shape[1], axis=1)], axis=1)
+
+        m_s1, m_n1 = _fit_T(m_s1), _fit_T(m_n1)
+
+        conf_bins = None
+        if self.conf_band is not None:
+            conf_bins = (freqs >= self.conf_band[0]) & (freqs <= self.conf_band[1])
+        Gamma = None
+        if self.w_mode == "sd":
+            if mic_coords is None:
+                raise ValueError("w_mode='sd' necesita scene_config['mic_coords'].")
+            Gamma = diffuse_coherence(np.asarray(mic_coords, dtype=np.float64),
+                                      freqs, field=self.sd_field)
+
+        W_fix, _ = estimate_rtf_recursive(
+            X_stft, m_s1, m_n1, ref_mic_idx=ref_mic_idx, rtf_alpha=self.rtf_alpha,
+            rtf_loading=self.rtf_loading, rtf_mode=self.rtf_mode,
+            w_mode=self.w_mode, bf_loading=self.bf_loading,
+            conf_gate=self.conf_gate, conf_bins=conf_bins,
+            conf_smooth=self.conf_smooth, conf_alpha=self.conf_alpha,
+            Gamma=Gamma, sd_eps=self.sd_eps)
+
+        # Pasada 2: el DTLN come el ESPECTRO conformado, sin resintetizar. Al
+        # corresponder el bloque t+1 al frame t, la mascara sale ya alineada.
+        Y_fix = np.einsum("ktm,ktm->kt", W_fix.conj(), X_stft)
+        dtln = DTLNStream(model_path)
+        p = float(sharpen_exp)
+        core = SoudenSubtractCore(K, M, ref_mic_idx, alpha=self.alpha,
+                                  min_loading=self.min_loading, mu=self.mu,
+                                  lambda_floor=self.lambda_floor,
+                                  psd_project=self.psd_project, ban=self.ban)
+        Y_stft = np.zeros((K, T), dtype=np.complex128)
+        W_out = np.zeros((K, T, M), dtype=np.complex128)
+        for t in range(T):
+            if t % 32 == 0 or t == T - 1:
+                print(f"\r  [spec] frame {t+1}/{T}", end="")
+            m_raw = np.clip(np.asarray(dtln.step(np.abs(nperseg * Y_fix[:, t])),
+                                       dtype=np.float64), 0.0, 1.0)
+            if self.mask_warp is None:
+                m_s, m_n = m_raw ** p, (1.0 - m_raw) ** p
+            else:
+                a_s, b_s, a_n, b_n = self.mask_warp
+                m_s = np.clip(a_s * m_raw + b_s, 1e-4, 1.0)
+                m_n = np.clip(a_n * (1.0 - m_raw) + b_n, 1e-4, 1.0)
+            Y, w = core.step(X_stft[:, t, :], m_s, m_n)
+            if self.smooth is not None:
+                Y = Y * (self.smooth + (1.0 - self.smooth) * m_raw)
+            Y_stft[:, t] = Y
+            W_out[:, t, :] = w
+        print()
+        return Y_stft, W_out

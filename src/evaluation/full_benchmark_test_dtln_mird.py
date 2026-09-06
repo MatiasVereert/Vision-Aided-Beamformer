@@ -36,10 +36,12 @@ from evaluation.bf_wrappers import (
     DTLN_MB_MVDR_SOUDEN_BAN,
     DTLN_MB_MVDR_SOUDEN_SLOW,
     NM_MVDR_PF,
+    
     ORACLE_MB_MVDR_SOUDEN,
     SOUDEN_ORACLE_SCM,
     DTLN_MB_MVDR_SOUDEN_BAN_alphaless,
     NM_MVDR_DSM_BLIND,
+    NM_MVDR_DSM_FB
 
     
 
@@ -317,7 +319,15 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
     mic_simulator = Microphone(fs=scene_base_config['fs'])
     start_total_time = time.time()
-    eval_start_s = min(5.0, scene_base_config['duration'] * 0.3)
+    # Segundos iniciales que NO entran en ninguna metrica. El default historico
+    # (min(5, 0.3*duracion)) esconde todo transitorio de convergencia de los
+    # procesadores adaptativos: para medirlo hay que poner 'eval_start_s': 0.0 en
+    # la config de escena. Ojo que con use_wpe=True eso mete tambien el arranque
+    # en frio del WPE dentro de la ventana.
+    eval_start_s = scene_base_config.get('eval_start_s')
+    if eval_start_s is None:
+        eval_start_s = min(5.0, scene_base_config['duration'] * 0.3)
+    eval_start_s = float(eval_start_s)
 
     use_dtln = interpreter_1 is not None and interpreter_2 is not None
 
@@ -1100,7 +1110,7 @@ if __name__ == "__main__":
             [(45, 1.0)],
         ],
 
-        'isir_db': [0,5],
+        'isir_db': [-5,0,10],
         'mismatch_gain': [0],
         'mismatch_phase': [0],
         'use_wpe': [  False],
@@ -1130,18 +1140,27 @@ if __name__ == "__main__":
     processors_dict = {
        # "DS" :DS(),
         "NM_MVDR" : NM_MVDR(min_loading =1e-9, alpha =0.99),
-        "NM_MVDR_PF" : NM_MVDR_PF(min_loading =1e-9, alpha =0.99),
-        "NM_MVDR_DSM_BLIND" : NM_MVDR_DSM_BLIND(min_loading =1e-9, alpha =0.99),
-        "NM_MVDR_DSM_BLIND_PF" : NM_MVDR_DSM_BLIND(min_loading =1e-9, alpha =0.99, smooth = 0.5), 
-        "Oracle-MVDR_alpha_0.99" : ORACLE_MB_MVDR_SOUDEN(min_loading =1e-6, alpha = 0.99, sharpen_exp=1.0)
+
+        "NM_MVDR_DSM_FB_4" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
+               sharpen_exp=4.0, smooth=0.5, alpha=0.99),
+
+        "NM_MVDR_DSM_FB_8" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
+               sharpen_exp=8.0, smooth=0.5, alpha=0.99),
+        "NM_MVDR_PF_05" :NM_MVDR_PF(min_loading =1e-9, alpha =0.99, smooth = 0.5),
+        "NM_MVDR_DSM_BLIND_PF_05": NM_MVDR_DSM_BLIND(win_type='rect', synth='hann', sharpen_exp=8, causal=True, smooth = 0.5, alpha = 0.99),
+
+
+
+
     } 
+
 
     df_final = run_mird_grid_search(
         grid_params=param_grid,
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/mega_king?",
+        output_dir="tests/dataset_out/retroo",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )
@@ -1150,8 +1169,7 @@ if __name__ == "__main__":
 
     cols_to_show = [
         "processor", "rt60", "target_angle", "interf_configs", "use_wpe",
-        "wpe_method", "wpe_taps", "wpe_delay",
-        "error_angle_deg", "Delta_tot_PESQ_early", "Delta_tot_SIR_early"
+        "isir_db", "wpe_taps", "wpe_delay", "Delta_tot_PESQ_early", "Delta_tot_SIR_early"
     ]
 
     cols_exist = [c for c in cols_to_show if c in df_final.columns]

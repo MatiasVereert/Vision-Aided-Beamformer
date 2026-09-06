@@ -1,0 +1,40 @@
+=== NM_MVDR_DSM_BLIND: ventana x sintesis (ref 'early') ===
+                       proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                                 
+blind_hamming                    1.722            0.917              5.705           8.352          21.895           8.612
+blind_hamming_pow8               1.736            0.921              6.300           8.760          22.471           8.996
+blind_rect                       1.700            0.917              5.767           8.429          20.750           8.761
+blind_rect_synhann               1.734            0.920              6.099           8.539          21.005           8.869
+blind_rect_synhann_p8            1.737            0.923              6.694           8.971          21.985           9.264
+
+--- blind_rect_synhann - blind_rect (8 escenas) ---
+   proc_PESQ_early      media  +0.034  mediana  +0.032  gana 7/8
+   proc_STOI_early      media  +0.003  mediana  +0.003  gana 8/8
+   proc_SI-SDR_early    media  +0.332  mediana  +0.325  gana 8/8
+   proc_SDR_early       media  +0.109  mediana  +0.087  gana 7/8
+   proc_SIR_early       media  +0.255  mediana  -0.180  gana 3/8
+   proc_SAR_early       media  +0.108  mediana  +0.115  gana 7/8
+
+--- blind_rect_synhann - blind_hamming (8 escenas) ---
+   proc_PESQ_early      media  +0.012  mediana  +0.015  gana 7/8
+   proc_STOI_early      media  +0.003  mediana  +0.002  gana 6/8
+   proc_SI-SDR_early    media  +0.394  mediana  +0.378  gana 8/8
+   proc_SDR_early       media  +0.187  mediana  +0.155  gana 6/8
+   proc_SIR_early       media  -0.890  mediana  -0.181  gana 3/8
+   proc_SAR_early       media  +0.257  mediana  +0.203  gana 8/8
+
+--- blind_rect_synhann_p8 - blind_hamming (8 escenas) ---
+   proc_PESQ_early      media  +0.015  mediana  +0.013  gana 6/8
+   proc_STOI_early      media  +0.006  mediana  +0.006  gana 8/8
+   proc_SI-SDR_early    media  +0.988  mediana  +0.941  gana 8/8
+   proc_SDR_early       media  +0.619  mediana  +0.556  gana 8/8
+   proc_SIR_early       media  +0.090  mediana  +0.583  gana 5/8
+   proc_SAR_early       media  +0.653  mediana  +0.599  gana 8/8
+
+--- blind_hamming_pow8 - blind_hamming (8 escenas) ---
+   proc_PESQ_early      media  +0.014  mediana  +0.013  gana 6/8
+   proc_STOI_early      media  +0.004  mediana  +0.004  gana 8/8
+   proc_SI-SDR_early    media  +0.595  mediana  +0.594  gana 8/8
+   proc_SDR_early       media  +0.408  mediana  +0.418  gana 8/8
+   proc_SIR_early       media  +0.576  mediana  +0.461  gana 5/8
+   proc_SAR_early       media  +0.384  mediana  +0.376  gana 8/8

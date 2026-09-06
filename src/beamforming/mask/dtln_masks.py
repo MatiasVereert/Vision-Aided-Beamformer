@@ -89,10 +89,28 @@ def get_dtln_masks(time_domain_input, ref_mic, model1_path, block_len=512, block
 
 
 def get_dtln_masks_sharpen(time_domain_input, ref_mic, model1_path,
-                           block_len=512, block_shift=128, sharpen_exp=4.0):
+                           block_len=512, block_shift=128, sharpen_exp=4.0,
+                           peak_norm="global", stretch=True):
     """
     Copia de get_dtln_masks con el exponente de sharpening parametrizable.
     sharpen_exp=4.0 -> identico al original. Devuelve (mask_s, mask_n), shape (K, T).
+
+    CAUSALIDAD (peak_norm / stretch)
+    --------------------------------
+    El camino historico tiene DOS etapas que miran TODA la senal, o sea que NO son
+    implementables en tiempo real:
+
+      1. `peak_norm="global"`: divide el canal por su pico sobre el archivo entero
+         antes de enmarcar. Alternativa causal: pasar un FLOAT (la escala fija; el
+         hardware entrega unidades de fondo de escala, asi que 1.0 es lo natural).
+         Medido sobre MIRD: escala fija 1.0 vs pico global -> corr 0.999,
+         MAE 0.009 en la mascara. Un pico corriente (cummax) es MUCHO peor
+         (corr 0.87): tarda ~8 s en converger.
+      2. `stretch=True`: reescala la mascara por su min/max global sobre (k, t).
+         `stretch=False` la saltea y deja solo la potencia, que es puntual y por
+         lo tanto causal.
+
+    Los defaults conservan el comportamiento historico bit a bit.
     """
     M, samples = time_domain_input.shape
     num_blocks = (samples - (block_len - block_shift)) // block_shift
@@ -106,10 +124,14 @@ def get_dtln_masks_sharpen(time_domain_input, ref_mic, model1_path,
     # Isolate the audio from the selected reference microphone
     audio_mono = time_domain_input[ref_mic, :]
 
-    # Normalize channel audio to prevent DTLN saturation
-    max_val = np.max(np.abs(audio_mono))
-    if max_val > 0:
-        audio_mono = audio_mono / max_val
+    # Normalize channel audio to prevent DTLN saturation.
+    # "global" = pico de TODA la senal (no causal); un float = escala fija.
+    if peak_norm == "global":
+        max_val = np.max(np.abs(audio_mono))
+        if max_val > 0:
+            audio_mono = audio_mono / max_val
+    elif peak_norm is not None:
+        audio_mono = audio_mono / float(peak_norm)
 
     # Initialize LSTM states for the reference channel
     states_1 = np.zeros(input_details_1[1]['shape'], dtype=np.float32)
@@ -145,11 +167,13 @@ def get_dtln_masks_sharpen(time_domain_input, ref_mic, model1_path,
     # Skip median pooling as we only have one channel mask now
     sp_mask_condensed = ch_mask
 
-    # Contrast patch: stretch values between 0 and 1
+    # Contrast patch: stretch values between 0 and 1. NO CAUSAL (min/max global):
+    # stretch=False lo saltea.
     def stretch_mask(m):
         return (m - np.min(m)) / (np.max(m) - np.min(m) + 1e-12)
 
-    sp_mask_condensed = stretch_mask(sp_mask_condensed)
+    if stretch:
+        sp_mask_condensed = stretch_mask(sp_mask_condensed)
 
     # Calculate noise mask mathematically
     n_mask_condensed = 1.0 - sp_mask_condensed
@@ -162,7 +186,8 @@ def get_dtln_masks_sharpen(time_domain_input, ref_mic, model1_path,
     return sp_mask_condensed, n_mask_condensed
 
 
-def get_dtln_masks_soft(time_domain_input, ref_mic, model1_path, block_len=512, block_shift=128):
+def get_dtln_masks_soft(time_domain_input, ref_mic, model1_path, block_len=512,
+                        block_shift=128, peak_norm="global"):
     """
     Variante SUAVE (sin sharpening): procesa el canal de referencia offline y
     devuelve mascaras continuas en [0,1]. A diferencia de get_dtln_masks_sharpen,
@@ -182,10 +207,15 @@ def get_dtln_masks_soft(time_domain_input, ref_mic, model1_path, block_len=512, 
     # Isolate the audio from the selected reference microphone
     audio_mono = time_domain_input[ref_mic, :]
 
-    # Normalize channel audio to prevent DTLN saturation
-    max_val = np.max(np.abs(audio_mono))
-    if max_val > 0:
-        audio_mono = audio_mono / max_val
+    # Normalize channel audio to prevent DTLN saturation.
+    # "global" = pico de TODA la senal (NO CAUSAL); un float = escala fija.
+    # Ver la nota de causalidad en get_dtln_masks_sharpen.
+    if peak_norm == "global":
+        max_val = np.max(np.abs(audio_mono))
+        if max_val > 0:
+            audio_mono = audio_mono / max_val
+    elif peak_norm is not None:
+        audio_mono = audio_mono / float(peak_norm)
 
     # Initialize LSTM states for the reference channel
     states_1 = np.zeros(input_details_1[1]['shape'], dtype=np.float32)

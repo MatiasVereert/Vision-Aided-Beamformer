@@ -1,0 +1,39 @@
+=== DSM_BLIND causal (ref 'early') ===
+                    proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                              
+blind_prod                    1.722            0.917              5.705           8.352          21.895           8.612
+blind_rect_p8                 1.737            0.923              6.694           8.971          21.985           9.264
+blind_rect_p8_cau             1.769            0.922              6.658           8.919          21.640           9.209
+blind_rect_p8_warp            1.712            0.918              6.488           8.713          20.543           9.085
+
+--- blind_rect_p8_cau - blind_rect_p8 (8 escenas) ---
+   proc_PESQ_early      media  +0.032  mediana  +0.019  gana 6/8
+   proc_STOI_early      media  -0.001  mediana  -0.000  gana 3/8
+   proc_SI-SDR_early    media  -0.036  mediana  +0.008  gana 5/8
+   proc_SDR_early       media  -0.052  mediana  -0.001  gana 4/8
+   proc_SIR_early       media  -0.345  mediana  +0.068  gana 5/8
+   proc_SAR_early       media  -0.055  mediana  -0.005  gana 3/8
+
+--- blind_rect_p8_cau - blind_prod (8 escenas) ---
+   proc_PESQ_early      media  +0.047  mediana  +0.037  gana 6/8
+   proc_STOI_early      media  +0.005  mediana  +0.004  gana 8/8
+   proc_SI-SDR_early    media  +0.952  mediana  +0.857  gana 8/8
+   proc_SDR_early       media  +0.568  mediana  +0.479  gana 8/8
+   proc_SIR_early       media  -0.255  mediana  -0.015  gana 4/8
+   proc_SAR_early       media  +0.598  mediana  +0.536  gana 8/8
+
+--- blind_rect_p8_warp - blind_rect_p8_cau (8 escenas) ---
+   proc_PESQ_early      media  -0.057  mediana  -0.036  gana 0/8
+   proc_STOI_early      media  -0.004  mediana  -0.003  gana 0/8
+   proc_SI-SDR_early    media  -0.169  mediana  -0.106  gana 0/8
+   proc_SDR_early       media  -0.207  mediana  -0.139  gana 1/8
+   proc_SIR_early       media  -1.097  mediana  -0.889  gana 1/8
+   proc_SAR_early       media  -0.124  mediana  -0.092  gana 2/8
+
+--- blind_rect_p8_warp - blind_prod (8 escenas) ---
+   proc_PESQ_early      media  -0.010  mediana  -0.022  gana 2/8
+   proc_STOI_early      media  +0.001  mediana  +0.001  gana 5/8
+   proc_SI-SDR_early    media  +0.783  mediana  +0.649  gana 8/8
+   proc_SDR_early       media  +0.361  mediana  +0.298  gana 7/8
+   proc_SIR_early       media  -1.352  mediana  -1.998  gana 2/8
+   proc_SAR_early       media  +0.474  mediana  +0.406  gana 8/8

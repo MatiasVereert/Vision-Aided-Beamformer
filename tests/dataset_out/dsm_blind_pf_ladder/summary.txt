@@ -1,0 +1,140 @@
+=== ESCALERA con smooth=0.5 -- referencia 'early' ===
+            proc_PESQ_early  proc_STOI_early  proc_SI-SDR_early  proc_SDR_early  proc_SIR_early  proc_SAR_early
+processor                                                                                                      
+L1_base               1.832            0.916              4.921           8.326          27.558           8.450
+L2_causal             1.847            0.914              4.910           8.080          20.669           8.320
+L3_exp8               1.867            0.918              5.679           8.651          25.271           8.746
+L4_rect               1.865            0.918              5.738           8.686          23.820           8.919
+L5_synhann            1.905            0.921              6.117           8.818          23.075           9.058
+
+--- escalon a escalon (referencia 'early') ---
+  L2_causal - L1_base:
+     proc_PESQ_early        media  +0.015  mediana  +0.002  gana 5/8
+     proc_STOI_early        media  -0.002  mediana  -0.000  gana 1/8
+     proc_SI-SDR_early      media  -0.011  mediana  -0.002  gana 4/8
+     proc_SDR_early         media  -0.246  mediana  -0.226  gana 1/8
+     proc_SIR_early         media  -3.188  mediana  -2.272  gana 0/8
+     proc_SAR_early         media  -0.130  mediana  -0.030  gana 1/8
+  L3_exp8 - L2_causal:
+     proc_PESQ_early        media  +0.020  mediana  +0.025  gana 6/8
+     proc_STOI_early        media  +0.004  mediana  +0.003  gana 8/8
+     proc_SI-SDR_early      media  +0.768  mediana  +0.746  gana 8/8
+     proc_SDR_early         media  +0.570  mediana  +0.503  gana 8/8
+     proc_SIR_early         media  +4.613  mediana  +2.646  gana 5/8
+     proc_SAR_early         media  +0.426  mediana  +0.420  gana 8/8
+  L4_rect - L3_exp8:
+     proc_PESQ_early        media  -0.002  mediana  -0.019  gana 3/8
+     proc_STOI_early        media  -0.000  mediana  -0.001  gana 4/8
+     proc_SI-SDR_early      media  +0.059  mediana  +0.053  gana 4/8
+     proc_SDR_early         media  +0.035  mediana  +0.036  gana 4/8
+     proc_SIR_early         media  -0.657  mediana  -0.501  gana 2/8
+     proc_SAR_early         media  +0.173  mediana  +0.136  gana 6/8
+  L5_synhann - L4_rect:
+     proc_PESQ_early        media  +0.040  mediana  +0.048  gana 7/8
+     proc_STOI_early        media  +0.003  mediana  +0.003  gana 8/8
+     proc_SI-SDR_early      media  +0.379  mediana  +0.360  gana 8/8
+     proc_SDR_early         media  +0.131  mediana  +0.088  gana 5/8
+     proc_SIR_early         media  -0.745  mediana  -0.929  gana 4/8
+     proc_SAR_early         media  +0.139  mediana  +0.150  gana 8/8
+
+  TOTAL L5_synhann - L1_base:
+     proc_PESQ_early        media  +0.072  mediana  +0.075  gana 8/8
+     proc_STOI_early        media  +0.005  mediana  +0.004  gana 8/8
+     proc_SI-SDR_early      media  +1.196  mediana  +1.069  gana 8/8
+     proc_SDR_early         media  +0.492  mediana  +0.364  gana 8/8
+     proc_SIR_early         media  -4.381  mediana  -2.466  gana 1/8
+     proc_SAR_early         media  +0.608  mediana  +0.551  gana 8/8
+
+=== ESCALERA con smooth=0.5 -- referencia 'anechoic' ===
+            proc_PESQ_anechoic  proc_STOI_anechoic  proc_SI-SDR_anechoic  proc_SDR_anechoic  proc_SIR_anechoic  proc_SAR_anechoic
+processor                                                                                                                        
+L1_base                  1.820               0.929                 4.798             12.047             23.874             12.377
+L2_causal                1.838               0.926                 4.664             11.795             23.675             12.117
+L3_exp8                  1.834               0.930                 4.422             12.332             24.169             12.653
+L4_rect                  1.758               0.926                 4.396             12.245             23.276             12.630
+L5_synhann               1.804               0.927                 4.277             12.433             23.708             12.794
+
+--- escalon a escalon (referencia 'anechoic') ---
+  L2_causal - L1_base:
+     proc_PESQ_anechoic     media  +0.018  mediana  +0.008  gana 5/8
+     proc_STOI_anechoic     media  -0.002  mediana  -0.001  gana 1/8
+     proc_SI-SDR_anechoic   media  -0.134  mediana  -0.045  gana 3/8
+     proc_SDR_anechoic      media  -0.252  mediana  -0.085  gana 3/8
+     proc_SIR_anechoic      media  -0.199  mediana  -0.013  gana 4/8
+     proc_SAR_anechoic      media  -0.260  mediana  -0.068  gana 3/8
+  L3_exp8 - L2_causal:
+     proc_PESQ_anechoic     media  -0.004  mediana  -0.004  gana 3/8
+     proc_STOI_anechoic     media  +0.003  mediana  +0.003  gana 8/8
+     proc_SI-SDR_anechoic   media  -0.242  mediana  -0.246  gana 0/8
+     proc_SDR_anechoic      media  +0.537  mediana  +0.529  gana 8/8
+     proc_SIR_anechoic      media  +0.494  mediana  +0.494  gana 7/8
+     proc_SAR_anechoic      media  +0.536  mediana  +0.505  gana 8/8
+  L4_rect - L3_exp8:
+     proc_PESQ_anechoic     media  -0.076  mediana  -0.091  gana 0/8
+     proc_STOI_anechoic     media  -0.004  mediana  -0.004  gana 0/8
+     proc_SI-SDR_anechoic   media  -0.025  mediana  -0.013  gana 4/8
+     proc_SDR_anechoic      media  -0.087  mediana  +0.046  gana 5/8
+     proc_SIR_anechoic      media  -0.893  mediana  -1.186  gana 2/8
+     proc_SAR_anechoic      media  -0.023  mediana  +0.048  gana 4/8
+  L5_synhann - L4_rect:
+     proc_PESQ_anechoic     media  +0.046  mediana  +0.051  gana 7/8
+     proc_STOI_anechoic     media  +0.001  mediana  +0.001  gana 7/8
+     proc_SI-SDR_anechoic   media  -0.119  mediana  -0.126  gana 0/8
+     proc_SDR_anechoic      media  +0.187  mediana  +0.193  gana 7/8
+     proc_SIR_anechoic      media  +0.432  mediana  +0.419  gana 6/8
+     proc_SAR_anechoic      media  +0.164  mediana  +0.177  gana 7/8
+
+  TOTAL L5_synhann - L1_base:
+     proc_PESQ_anechoic     media  -0.016  mediana  -0.033  gana 2/8
+     proc_STOI_anechoic     media  -0.002  mediana  -0.002  gana 0/8
+     proc_SI-SDR_anechoic   media  -0.521  mediana  -0.462  gana 0/8
+     proc_SDR_anechoic      media  +0.386  mediana  +0.384  gana 6/8
+     proc_SIR_anechoic      media  -0.166  mediana  +0.104  gana 4/8
+     proc_SAR_anechoic      media  +0.417  mediana  +0.377  gana 7/8
+
+=== ESCALERA con smooth=0.5 -- referencia 'reverberant' ===
+            proc_PESQ_reverberant  proc_STOI_reverberant  proc_SI-SDR_reverberant  proc_SDR_reverberant  proc_SIR_reverberant  proc_SAR_reverberant
+processor                                                                                                                                          
+L1_base                     1.686                  0.843                    4.410                 7.051                18.846                 7.426
+L2_causal                   1.699                  0.841                    4.397                 6.987                19.289                 7.322
+L3_exp8                     1.717                  0.845                    5.119                 7.464                21.092                 7.728
+L4_rect                     1.741                  0.845                    5.238                 7.695                20.751                 7.908
+L5_synhann                  1.759                  0.848                    5.560                 7.799                21.330                 8.046
+
+--- escalon a escalon (referencia 'reverberant') ---
+  L2_causal - L1_base:
+     proc_PESQ_reverberant  media  +0.012  mediana  -0.001  gana 3/8
+     proc_STOI_reverberant  media  -0.002  mediana  -0.001  gana 1/8
+     proc_SI-SDR_reverberant media  -0.013  mediana  -0.003  gana 3/8
+     proc_SDR_reverberant   media  -0.064  mediana  +0.001  gana 4/8
+     proc_SIR_reverberant   media  +0.442  mediana  +0.188  gana 4/8
+     proc_SAR_reverberant   media  -0.105  mediana  -0.023  gana 1/8
+  L3_exp8 - L2_causal:
+     proc_PESQ_reverberant  media  +0.019  mediana  +0.016  gana 8/8
+     proc_STOI_reverberant  media  +0.004  mediana  +0.004  gana 8/8
+     proc_SI-SDR_reverberant media  +0.722  mediana  +0.701  gana 8/8
+     proc_SDR_reverberant   media  +0.478  mediana  +0.468  gana 8/8
+     proc_SIR_reverberant   media  +1.803  mediana  +0.913  gana 8/8
+     proc_SAR_reverberant   media  +0.406  mediana  +0.400  gana 8/8
+  L4_rect - L3_exp8:
+     proc_PESQ_reverberant  media  +0.024  mediana  +0.012  gana 5/8
+     proc_STOI_reverberant  media  +0.001  mediana  +0.001  gana 5/8
+     proc_SI-SDR_reverberant media  +0.119  mediana  +0.098  gana 6/8
+     proc_SDR_reverberant   media  +0.231  mediana  +0.139  gana 6/8
+     proc_SIR_reverberant   media  -0.217  mediana  +1.010  gana 5/8
+     proc_SAR_reverberant   media  +0.180  mediana  +0.122  gana 6/8
+  L5_synhann - L4_rect:
+     proc_PESQ_reverberant  media  +0.018  mediana  +0.015  gana 6/8
+     proc_STOI_reverberant  media  +0.002  mediana  +0.002  gana 8/8
+     proc_SI-SDR_reverberant media  +0.322  mediana  +0.279  gana 8/8
+     proc_SDR_reverberant   media  +0.104  mediana  +0.120  gana 7/8
+     proc_SIR_reverberant   media  +0.429  mediana  +0.657  gana 4/8
+     proc_SAR_reverberant   media  +0.138  mediana  +0.144  gana 8/8
+
+  TOTAL L5_synhann - L1_base:
+     proc_PESQ_reverberant  media  +0.073  mediana  +0.073  gana 8/8
+     proc_STOI_reverberant  media  +0.005  mediana  +0.005  gana 8/8
+     proc_SI-SDR_reverberant media  +1.150  mediana  +1.043  gana 8/8
+     proc_SDR_reverberant   media  +0.748  mediana  +0.754  gana 8/8
+     proc_SIR_reverberant   media  +2.483  mediana  +2.259  gana 8/8
+     proc_SAR_reverberant   media  +0.619  mediana  +0.588  gana 8/8

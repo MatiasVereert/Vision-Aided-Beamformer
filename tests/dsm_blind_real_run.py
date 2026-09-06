@@ -29,7 +29,7 @@ import tensorflow as tf
 from evaluation.intrusive_benchmark_real import (
     run_intrusive_benchmark, default_base_config, DTLN_MODEL_1, DTLN_MODEL_2,
 )
-from evaluation.bf_wrappers import NM_MVDR_DSM_BLIND
+from evaluation.bf_wrappers import NM_MVDR_DSM_BLIND, NM_MVDR_DSM_FB
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 CAPTURE = "/home/matias/pdm_mic_interface/kria_app/capture/wavs_paso5"
@@ -74,6 +74,8 @@ def main():
         "NM_MVDR_DSM_BLIND": NM_MVDR_DSM_BLIND(min_loading=args.min_loading, alpha=args.alpha),
         "NM_MVDR_DSM_BLIND_PF": NM_MVDR_DSM_BLIND(min_loading=args.min_loading, alpha=args.alpha,
                                                    smooth=args.smooth),
+        "NM_MVDR_DSM_FB_8": NM_MVDR_DSM_FB(mode="fb", win_type="rect", synth="hann",
+                                           sharpen_exp=8.0, smooth=0.5, alpha=0.99),
     }
 
     print(f"[*] senal: {args.senal}")
