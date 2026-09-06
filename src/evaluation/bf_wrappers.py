@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import scipy.signal as sig
 # Assuming compute_rtf_steering_vector is imported in your module
@@ -33,6 +34,7 @@ from beamforming.mask.ds_mask import (
 from beamforming.mask.blind_feedback import (
     blind_feedback_stft, DTLNStream,
 )
+from beamforming.mask.output_feedback import output_feedback_stft
 from beamforming.MWF.wiener_postfilter import (
     MVDR_Souden_mask_specsub_MWF, estimate_isir_db, schedule_aggressiveness,
 )
@@ -2965,3 +2967,176 @@ class NM_MVDR_DSM_FB:
             W_out[:, t, :] = w
         print()
         return Y_stft, W_out
+
+
+class NM_MVDR_OFB:
+    """
+    LAZO CERRADO SOBRE LA SALIDA: un solo beamformer, sin front-end ni RTF.
+
+    `NM_MVDR_DSM_FB` mantiene DOS beamformers semi-desacoplados: uno (apuntado
+    con la RTF estimada) fabrica la senal que ve el DTLN, y otro -- el nucleo de
+    Souden -- produce la salida. Aca hay UNO SOLO: como con `block_update` el
+    frame t se filtra con pesos calculados en t-1, esos pesos estan listos antes
+    de correr la red, asi que la red puede comer directamente la SALIDA del
+    beamformer:
+
+        Y(t) = w(t-1)^H x(t) ,   m(t) = DTLN(Y(t)) ,   w(t) = Souden(SCM(m(t)))
+
+    Se cae el eigh de Phi_SS del front-end y toda la estimacion de RTF, y el
+    DTLN pasa a ver el iSIR del MVDR completo en vez del de un DS apuntado.
+
+    El riesgo es de otra categoria: la realimentacion ya no entra por el
+    apuntamiento (donde el peor caso era d -> e_ref) sino por la SENAL, y el
+    self-nulling es un estado absorbente -- voz cancelada -> mascara sin voz ->
+    la voz entra a Phi_NN -> mas cancelacion. Las defensas estan en
+    `beamforming/mask/output_feedback.py`:
+
+        leak       fuga del canal de referencia en la ENTRADA de la red,
+                   y_mask = (1-b) Y + b x_ref. Como el nucleo es distorsionless
+                   respecto del mic de referencia, la voz de los dos terminos es
+                   la misma senal y se suma coherente. En el peor caso (Y = 0)
+                   la red ve b * x_ref: el sistema base escalado, no el vacio.
+        mask_floor piso de la rama de senal: Phi_XX nunca deja de acumular.
+        guard      'snr'  -> perro guardian con un estadistico independiente de
+                             la mascara (min-tracking del canal crudo); si hay
+                             energia y no hay mascara, abre el lazo.
+                   'dual' -> segunda red sobre el canal de referencia,
+                             m = max(m_out, m_ref). La defensa fuerte, pero
+                             cuesta la red que este esquema queria ahorrar.
+                   'both' -> las dos.
+
+    `block_update` es P: el default 1 ya retiene un frame (no es opcional aca).
+    """
+
+    def __init__(self, nperseg=512, noverlap=384, min_loading=1e-9, alpha=0.99,
+                 sharpen_exp=8.0, win_type='rect', synth='hann', mu=0.0,
+                 lambda_floor=1e-3, psd_project=True, smooth=None, ban=False,
+                 mask_warp=None, block_update=1, leak=0.05, leak_smooth=0.5,
+                 warmup=0, mask_floor=0.0, guard=None,
+                 guard_band=(300.0, 3400.0), guard_snr_db=6.0, guard_mass=0.08,
+                 guard_smooth=0.9, guard_hold=64, guard_rise=1.0005,
+                 stage2=None):
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.nfft = nperseg
+        self.hop_length = nperseg - noverlap
+        self.min_loading = min_loading
+        self.alpha = alpha
+        self.sharpen_exp = sharpen_exp
+        self.win_type = win_type
+        self.synth = synth
+        self.mu = mu
+        self.lambda_floor = lambda_floor
+        self.psd_project = psd_project
+        self.smooth = smooth
+        self.ban = ban
+        self.mask_warp = mask_warp
+        self.block_update = block_update
+        self.leak = leak
+        self.leak_smooth = leak_smooth
+        self.warmup = warmup
+        self.mask_floor = mask_floor
+        self.guard = guard
+        self.guard_band = guard_band
+        self.guard_snr_db = guard_snr_db
+        self.guard_mass = guard_mass
+        self.guard_smooth = guard_smooth
+        self.guard_hold = guard_hold
+        self.guard_rise = guard_rise
+        # stage2='pf': el post-filtro pasa a ser el DTLN COMPLETO sobre la salida
+        # del beamformer (la etapa 1 ya se corria para la mascara; se agrega la
+        # etapa 2 y su overlap-add). Se aplica exactamente sobre la senal en la
+        # que se estimo. Ver `output_feedback_stft`.
+        self.stage2 = stage2
+
+    def _model2_path(self, scene_config, model_path):
+        """
+        .tflite de la segunda etapa. Muchas configuraciones de escena no traen
+        'dtln_model2_path' (el resto del sistema no lo necesita), asi que se
+        deriva del modelo 1 por el sufijo _1 -> _2, que es como estan nombrados
+        en dnn_denoise/models.
+        """
+        if self.stage2 is None:
+            return None
+        m2 = scene_config.get('dtln_model2_path')
+        if m2 is None and '_1.tflite' in model_path:
+            cand = model_path.replace('_1.tflite', '_2.tflite')
+            if os.path.exists(cand):
+                m2 = cand
+        if m2 is None:
+            raise ValueError(
+                "stage2='pf' necesita la segunda etapa del DTLN: pasala en "
+                "scene_config['dtln_model2_path'] (no se pudo derivar de "
+                f"{model_path!r}).")
+        return m2
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        fs = scene_config['fs']
+        model_path = scene_config.get('dtln_model_path',
+                                      'dnn_denoise/models/model_quant_1.tflite')
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        hop_dyn = nperseg_dyn - noverlap_dyn
+
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
+        sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
+        win_spec = resolve_stft_window(scene_config, self.win_type, nperseg_dyn)
+
+        freqs, _, Zxx = sig.stft(mic_signals, fs=fs, window=win_spec,
+                                 nperseg=nperseg_dyn, noverlap=noverlap_dyn,
+                                 nfft=nperseg_dyn)
+        X_stft = np.transpose(Zxx, (1, 2, 0))                    # (K, T, M)
+
+        guard_bins = None
+        if self.guard_band is not None:
+            guard_bins = ((freqs >= self.guard_band[0]) &
+                          (freqs <= self.guard_band[1]))
+
+        # `diag_sink`: si se le asigna un dict, el wrapper guarda ahi el
+        # diagnostico del lazo (beta, masa de la mascara, gate). Es la unica via
+        # para mirar la trayectoria del lazo desde dentro de un barrido.
+        want_diag = getattr(self, 'diag_sink', None) is not None
+        out = output_feedback_stft(
+            X_stft, model_path, nperseg_dyn, ref_mic_idx=ref_mic_idx,
+            return_diag=want_diag,
+            sharpen_exp=sharpen_exp, alpha=self.alpha,
+            min_loading=self.min_loading, mu=self.mu,
+            lambda_floor=self.lambda_floor, psd_project=self.psd_project,
+            ban=self.ban, smooth=self.smooth, mask_warp=self.mask_warp,
+            block_update=self.block_update, leak=self.leak,
+            leak_smooth=self.leak_smooth, warmup=self.warmup,
+            mask_floor=self.mask_floor, guard=self.guard, guard_bins=guard_bins,
+            guard_snr_db=self.guard_snr_db, guard_mass=self.guard_mass,
+            guard_smooth=self.guard_smooth, guard_hold=self.guard_hold,
+            guard_rise=self.guard_rise,
+            # Gancho de banco de estres (ver `output_feedback_stft`): fuerza el
+            # estado de self-nulling para medir si se sale. No es produccion.
+            poison=getattr(self, 'poison', None),
+            stage2=self.stage2, hop=hop_dyn,
+            model2_path=self._model2_path(scene_config, model_path))
+        # (Y, W) | (Y, W, diag) | (Y, W, y_time) | (Y, W, y_time, diag)
+        Y_stft, weights = out[0], out[1]
+        y_ola = out[2] if self.stage2 is not None else None
+        if want_diag:
+            d = out[-1]
+            d['freqs'] = freqs
+            self.diag_sink.clear()
+            self.diag_sink.update(d)
+
+        n_out = mic_signals.shape[1]
+        if y_ola is not None:
+            # Con la etapa 2 la salida YA es de tiempo: la reconstruye el
+            # overlap-add del propio DTLN, no la sintesis de la STFT.
+            y = np.zeros(n_out, dtype=np.float64)
+            k = min(n_out, len(y_ola))
+            y[:k] = y_ola[:k]
+            return y, weights
+        if self.synth is None:
+            _, y_time = sig.istft(Y_stft, fs=fs, window=win_spec,
+                                  nperseg=nperseg_dyn, noverlap=noverlap_dyn,
+                                  nfft=nperseg_dyn)
+            y_time = y_time[:n_out]
+        else:
+            y_time = ola_taper(Y_stft, nperseg_dyn, hop_dyn, self.synth, n_out)
+        return y_time, weights
