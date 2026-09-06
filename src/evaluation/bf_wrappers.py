@@ -2772,6 +2772,18 @@ class NM_MVDR_DSM_FB:
     asi que resintetizar y re-analizar es una proyeccion que mezcla 4 frames
     filtrados. No es lo mismo, y por eso existe el modo "spec".
 
+    ACTUALIZACION POR BLOQUES (`block_update`)
+    ------------------------------------------
+    Por default (None) el frame t se filtra con los pesos calculados a partir de
+    x(t): es causal, pero mete todo el computo --dos eigh y un solve de M x M
+    por bin-- en serie dentro del periodo de hop. Con `block_update=P` el frame
+    t se filtra con los pesos que quedaron listos en t-1 (o en el ultimo
+    multiplo de P) y el camino critico se reduce a la FFT, dos productos punto y
+    la sintesis. Las SCM se siguen acumulando en todos los frames; lo unico que
+    se espacia es el calculo de los pesos del nucleo MVDR, que es lo caro.
+    `fe_update` hace lo mismo con el front-end de la mascara (default 1, o sea
+    cada frame: es la mitad barata y no conviene espaciarla).
+
     EL LAZO CERRADO NO TIENE ANCLA
     ------------------------------
     En la cadena de dos pasadas la mascara(1) es independiente del lazo: pase lo
@@ -2787,10 +2799,15 @@ class NM_MVDR_DSM_FB:
                  rtf_loading=1e-2, rtf_mode="cs", w_mode="ds", bf_loading=1e-6,
                  smooth=None, ban=False, mask_warp=None, conf_gate=None,
                  conf_band=(300.0, 3400.0), conf_smooth=0.9, conf_alpha=None,
-                 sd_eps=1e-2, sd_field="spherical", mode="fb"):
+                 sd_eps=1e-2, sd_field="spherical", mode="fb",
+                 block_update=None, fe_update=1):
         if mode not in ("fb", "spec"):
             raise ValueError(f"mode desconocido: {mode!r} ('fb' | 'spec')")
+        if block_update is not None and mode != "fb":
+            raise ValueError("block_update solo aplica al lazo (mode='fb').")
         self.mode = mode
+        self.block_update = block_update
+        self.fe_update = int(fe_update)
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
@@ -2859,7 +2876,9 @@ class NM_MVDR_DSM_FB:
 
         if self.mode == "fb":
             Y_stft, weights = blind_feedback_stft(
-                X_stft, model_path, nperseg_dyn, feedback=True, **common)
+                X_stft, model_path, nperseg_dyn, feedback=True,
+                block_update=self.block_update, fe_update=self.fe_update,
+                **common)
         else:
             Y_stft, weights = self._process_spec(
                 X_stft, mic_signals, freqs, fs, win_spec, model_path,
