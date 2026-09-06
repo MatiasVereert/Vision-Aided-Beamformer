@@ -36,6 +36,7 @@ from evaluation.bf_wrappers import (
     DTLN_MB_MVDR_SOUDEN_BAN,
     DTLN_MB_MVDR_SOUDEN_SLOW,
     NM_MVDR_PF,
+    NM_MVDR_OFB,
     
     ORACLE_MB_MVDR_SOUDEN,
     SOUDEN_ORACLE_SCM,
@@ -1092,7 +1093,7 @@ if __name__ == "__main__":
         'stft_window': 512,
         'stft_overlap': 384,
 
-        'eval_references': ['anechoic', 'early', 'reverberant'],
+        'eval_references': ['early'],
         'dtln_model_path': r"/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
 
     }
@@ -1110,7 +1111,7 @@ if __name__ == "__main__":
             [(45, 1.0)],
         ],
 
-        'isir_db': [-5,0,10],
+        'isir_db': [-5,0,5,10,15],
         'mismatch_gain': [0],
         'mismatch_phase': [0],
         'use_wpe': [  False],
@@ -1139,15 +1140,29 @@ if __name__ == "__main__":
 
     processors_dict = {
        # "DS" :DS(),
-        "NM_MVDR" : NM_MVDR(min_loading =1e-9, alpha =0.99),
+        #"NM_MVDR" : NM_MVDR(min_loading =1e-9, alpha =0.99),
 
-        "NM_MVDR_DSM_FB_4" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
-               sharpen_exp=4.0, smooth=0.5, alpha=0.99),
+        #"NM_MVDR_PF" :NM_MVDR_PF(min_loading =1e-9, alpha =0.99, smooth = 0.5),
 
-        "NM_MVDR_DSM_FB_8" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
-               sharpen_exp=8.0, smooth=0.5, alpha=0.99),
-        "NM_MVDR_PF_05" :NM_MVDR_PF(min_loading =1e-9, alpha =0.99, smooth = 0.5),
-        "NM_MVDR_DSM_BLIND_PF_05": NM_MVDR_DSM_BLIND(win_type='rect', synth='hann', sharpen_exp=8, causal=True, smooth = 0.5, alpha = 0.99),
+
+        "NM_MVDR_DSM_FB" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
+               sharpen_exp=8.0, smooth=0.5, alpha=0.99, block_update=True, fe_update=1),
+
+        "NM_MVDR_DSM_FB_no_project_back" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
+               sharpen_exp=8.0, smooth=0.5, alpha=0.99, block_update=True, fe_update=1, psd_project=False),
+
+
+
+        #"NM_MVDR_OFB":  NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
+         #   block_update=1, leak=0.05, smooth=0.5,
+          #  guard=None, mask_floor=0.0),
+
+        #"NM_MVDR_OFB_full": NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
+        #    block_update=1, leak=0.05, smooth=None, stage2='pf',
+        #    guard=None, mask_floor=0.0)
+
+
+
 
 
 
@@ -1169,7 +1184,7 @@ if __name__ == "__main__":
 
     cols_to_show = [
         "processor", "rt60", "target_angle", "interf_configs", "use_wpe",
-        "isir_db", "wpe_taps", "wpe_delay", "Delta_tot_PESQ_early", "Delta_tot_SIR_early"
+        "isir_db", "Delta_tot_PESQ_early", "Delta_tot_SIR_early"
     ]
 
     cols_exist = [c for c in cols_to_show if c in df_final.columns]

@@ -116,7 +116,7 @@ class DTLNStream:
     por que eso es equivalente a enmarcar con ventana rectangular.
     """
 
-    def __init__(self, model_path):
+    def __init__(self, model_path, model2_path=None):
         from ai_edge_litert.interpreter import Interpreter
 
         self.interpreter = Interpreter(model_path=model_path)
@@ -124,6 +124,20 @@ class DTLNStream:
         self.inp = self.interpreter.get_input_details()
         self.out = self.interpreter.get_output_details()
         self.states = np.zeros(self.inp[1]['shape'], dtype=np.float32)
+
+        # SEGUNDA ETAPA (opcional). Es el nucleo de separacion en el TIEMPO del
+        # DTLN: come el bloque ya enmascarado por la etapa 1 y devuelve otro
+        # bloque, que en el DTLN original se reconstruye por overlap-add simple.
+        # Ojo que NO es una mascara espectral: medido sobre voz limpia, el
+        # cociente |rfft(out_block)|/|E| va de 0.12 (p05) a 3.0 (p95), asi que
+        # no se puede usar como razon; hay que quedarse en el tiempo.
+        self.itp2 = None
+        if model2_path is not None:
+            self.itp2 = Interpreter(model_path=model2_path)
+            self.itp2.allocate_tensors()
+            self.inp2 = self.itp2.get_input_details()
+            self.out2 = self.itp2.get_output_details()
+            self.states2 = np.zeros(self.inp2[1]['shape'], dtype=np.float32)
 
     def step(self, mag):
         """mag: (K,) magnitud del bloque. Devuelve la mascara (K,) en [0,1]."""
@@ -134,6 +148,23 @@ class DTLNStream:
         m = self.interpreter.get_tensor(self.out[0]['index'])
         self.states = self.interpreter.get_tensor(self.out[1]['index'])
         return np.squeeze(m)
+
+    def step2(self, block):
+        """
+        Segunda etapa: bloque de L muestras (ya enmascarado por la etapa 1) ->
+        bloque de L muestras. El que llama hace el overlap-add, igual que
+        `apply_dtln_post_tflite_realtime`.
+        """
+        if self.itp2 is None:
+            raise RuntimeError("DTLNStream sin segunda etapa (model2_path=None).")
+        b = np.ascontiguousarray(np.reshape(np.asarray(block, dtype=np.float32),
+                                            (1, 1, -1)), dtype=np.float32)
+        self.itp2.set_tensor(self.inp2[1]['index'], self.states2)
+        self.itp2.set_tensor(self.inp2[0]['index'], b)
+        self.itp2.invoke()
+        ob = self.itp2.get_tensor(self.out2[0]['index']).copy()
+        self.states2 = self.itp2.get_tensor(self.out2[1]['index']).copy()
+        return np.squeeze(ob)
 
 
 # =====================================================================

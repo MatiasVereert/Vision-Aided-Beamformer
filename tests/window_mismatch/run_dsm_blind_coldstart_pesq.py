@@ -57,7 +57,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from evaluation.full_benchmark_test_dtln_mird import run_mird_grid_search   # noqa: E402
-from evaluation.bf_wrappers import NM_MVDR_DSM_BLIND, NM_MVDR_DSM_FB       # noqa: E402
+from evaluation.bf_wrappers import (NM_MVDR_DSM_BLIND, NM_MVDR_DSM_FB,   # noqa: E402
+                                    NM_MVDR_OFB)
 from propagation.mird_loader import MirdDatasetProvider                     # noqa: E402
 
 MODEL_1 = f"{ROOT}/src/dnn_denoise/models/model_quant_1.tflite"
@@ -119,6 +120,38 @@ def build_fb_processors():
         "fb": NM_MVDR_DSM_FB(mode="fb", **cfg),
         "fb_gate": NM_MVDR_DSM_FB(mode="fb", conf_gate=CONF_GATE,
                                   conf_alpha=CONF_ALPHA, **cfg),
+    }
+
+
+def build_ofb_processors():
+    """
+    LA MASCARA SOBRE LA SALIDA DEL BEAMFORMER, EN LA ESCENA QUE MAS DUELE.
+
+    `NM_MVDR_OFB` cierra el lazo un paso mas: saca el front-end (y con el la
+    estimacion de RTF) y le da al DTLN la SALIDA del beamformer, aprovechando
+    que con la retencion de un frame los pesos ya estan listos. La contra es el
+    self-nulling, que es un estado ABSORBENTE -- y el prefijo de ruido es
+    exactamente donde se puede caer adentro: mientras no hay voz, la unica
+    evidencia que tiene el lazo es la que el mismo fabrica.
+
+        ofb_raw    sin ninguna defensa. Es el control: mide si el peligro es
+                   real o teorico.
+        ofb_lk05   fuga del canal de referencia (b=0.05) en la ENTRADA de la
+                   red: en el peor caso la red ve b*x_ref, o sea el sistema base
+                   escalado, y el lazo puede salir del pozo.
+        ofb_lk05_g fuga + perro guardian con un estadistico independiente de la
+                   mascara (min-tracking del canal crudo).
+        ofb_dual   segunda red sobre el canal de referencia, m = max(m_out,
+                   m_ref): la defensa fuerte, pero paga la red que este esquema
+                   queria ahorrar. Es el TECHO.
+    """
+    cfg = dict(win_type='rect', synth='hann', sharpen_exp=8.0, smooth=0.5, alpha=0.99)
+    return {
+        "fb":         NM_MVDR_DSM_FB(mode="fb", **cfg),
+        "ofb_raw":    NM_MVDR_OFB(leak=0.0, **cfg),
+        "ofb_lk05":   NM_MVDR_OFB(leak=0.05, **cfg),
+        "ofb_lk05_g": NM_MVDR_OFB(leak=0.05, guard="snr", **cfg),
+        "ofb_dual":   NM_MVDR_OFB(leak=0.0, guard="dual", **cfg),
     }
 
 
@@ -206,6 +239,9 @@ def main():
     ap.add_argument("--fb", action="store_true",
                     help="compara el lazo realimentado (un solo DTLN) contra el "
                          "de dos pasadas")
+    ap.add_argument("--ofb", action="store_true",
+                    help="la mascara sobre la SALIDA del beamformer (sin "
+                         "front-end ni RTF) y sus defensas contra el self-nulling")
     ap.add_argument("--sd", action="store_true",
                     help="compara DS vs superdirectivo (semi-ciego), todo con gate")
     ap.add_argument("--snr-db", type=float, default=60.0,
@@ -243,7 +279,8 @@ def main():
         'eval_references': ['early'],
         'dtln_model_path': MODEL_1, 'dtln_model2_path': MODEL_2,
     }
-    procs = (build_fb_sd_processors() if args.fb_sd else
+    procs = (build_ofb_processors() if args.ofb else
+             build_fb_sd_processors() if args.fb_sd else
              build_fb_processors() if args.fb else
              build_sd_processors() if args.sd else build_processors())
     param_grid = {
@@ -275,7 +312,8 @@ def summarize(df, ref='early'):
     order = ["blind_prod", "blind_causal", "blind_cau_gate",
              "gate_ds", "gate_sd_e30", "gate_sd_e10", "gate_sd_free",
              "base", "spec", "fb", "fb_gate",
-             "sd_base", "sd_base_ng", "sd_fb", "sd_fb_ng"]
+             "sd_base", "sd_base_ng", "sd_fb", "sd_fb_ng",
+             "ofb_raw", "ofb_lk05", "ofb_lk05_g", "ofb_dual"]
     order = [p for p in order if p in set(df.processor)]
     pd.set_option('display.width', 230)
 
