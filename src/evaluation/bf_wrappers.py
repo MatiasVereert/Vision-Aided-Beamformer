@@ -3015,7 +3015,7 @@ class NM_MVDR_OFB:
                  warmup=0, mask_floor=0.0, guard=None,
                  guard_band=(300.0, 3400.0), guard_snr_db=6.0, guard_mass=0.08,
                  guard_smooth=0.9, guard_hold=64, guard_rise=1.0005,
-                 stage2=None):
+                 stage2=None, fuse=None, fuse_src="ref"):
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
@@ -3048,6 +3048,17 @@ class NM_MVDR_OFB:
         # etapa 2 y su overlap-add). Se aplica exactamente sobre la senal en la
         # que se estimo. Ver `output_feedback_stft`.
         self.stage2 = stage2
+        # fuse: funde la mascara de la salida con la de un segundo DTLN sobre el
+        # canal de referencia, con una regla SIN parametros. Las dos fuentes
+        # fallan en extremos opuestos del iSIR (ver `output_feedback_stft`), y
+        # la segunda red cuesta 0.009 ms/frame contra los 1.554 ms del eigh que
+        # este esquema ya elimino.
+        self.fuse = fuse
+        # fuse_src='median': un DTLN por canal y la mediana sobre los M, o sea
+        # la forma clasica de la literatura de mask-beamforming, usada como la
+        # mascara de ATRAS de la fusion. M invokes por frame (10.7 us c/u en
+        # x86, pesos compartidos entre canales).
+        self.fuse_src = fuse_src
 
     def _model2_path(self, scene_config, model_path):
         """
@@ -3113,6 +3124,7 @@ class NM_MVDR_OFB:
             # Gancho de banco de estres (ver `output_feedback_stft`): fuerza el
             # estado de self-nulling para medir si se sale. No es produccion.
             poison=getattr(self, 'poison', None),
+            fuse=self.fuse, fuse_src=self.fuse_src,
             stage2=self.stage2, hop=hop_dyn,
             model2_path=self._model2_path(scene_config, model_path))
         # (Y, W) | (Y, W, diag) | (Y, W, y_time) | (Y, W, y_time, diag)

@@ -26,6 +26,7 @@ frame, que es la comparacion justa: OFB tambien retiene un frame).
 
 Uso:
     python tests/window_mismatch/run_output_feedback.py [--full] [--pf] [--isir]
+                                                       [--fuse] [--median]
                                                        [--diag] [--poison]
 """
 
@@ -49,6 +50,77 @@ OUT_DIR = os.environ.get("SWEEP_OUT", "tests/dataset_out/output_feedback")
 
 # La configuracion final del sistema (la misma de tests/dsm_blind_real_run.py).
 CFG = dict(win_type='rect', synth='hann', sharpen_exp=8.0, smooth=0.5, alpha=0.99)
+
+
+def build_median_processors():
+    """
+    ¿PAGA UNA MASCARA POR CANAL (la forma clasica) COMO MITAD DE ATRAS?
+
+    En la literatura de mask-beamforming la mascara se estima por canal y se
+    combina con la MEDIANA sobre canales. Eso existe porque ahi no hay otra
+    senal sobre la cual estimar: es el problema del huevo y la gallina. La
+    mediana baja la VARIANZA del estimador, pero NO mejora el SNR de entrada --
+    los M canales ven la misma mezcla con casi el mismo SIR (un array compacto
+    tiene poca diversidad). Aca la mascara de la salida se estima sobre una
+    senal con ~20 dB mas de SIR, asi que la mediana por canal cae en la familia
+    de la mascara de ATRAS, que midio peor a iSIR bajo y mejor a iSIR alto.
+
+    Prediccion a falsar: la mediana deberia mejorar `ofb_ref` -> `ofb_med` y
+    `fuse_mean` -> `fuse_mean_med`, y sobre todo por ARRIBA de iSIR ~9, que es
+    donde la mitad de atras manda.
+
+    COSTO: M invokes por frame (M=8 -> 86 us, 1.1% del periodo de hop en x86;
+    los M canales comparten los mismos pesos). Contra los 1.554 ms del eigh que
+    OFB ya elimino, sigue siendo barato -- pero es 8x la unica parte del sistema
+    que en un ARM chico podria no entrar.
+    """
+    ns = {k: v for k, v in CFG.items() if k != 'smooth'}
+    return {
+        "fb_pf":        NM_MVDR_DSM_FB(mode="fb", block_update=1, smooth=0.5, **ns),
+        "ofb_lk00":     NM_MVDR_OFB(leak=0.0, smooth=0.5, **ns),
+        "ofb_ref":      NM_MVDR_OFB(leak=0.0, smooth=0.5, fuse="back",
+                                    fuse_src="ref", **ns),
+        "ofb_med":      NM_MVDR_OFB(leak=0.0, smooth=0.5, fuse="back",
+                                    fuse_src="median", **ns),
+        "fuse_mean":    NM_MVDR_OFB(leak=0.0, smooth=0.5, fuse="mean",
+                                    fuse_src="ref", **ns),
+        "fuse_mean_md": NM_MVDR_OFB(leak=0.0, smooth=0.5, fuse="mean",
+                                    fuse_src="median", **ns),
+    }
+
+
+def build_fuse_processors():
+    """
+    LAS DOS MASCARAS FUNDIDAS, A LO LARGO DEL iSIR.
+
+    El barrido `--isir` mostro que OFB gana por debajo de iSIR ~5 y pierde por
+    arriba de ~10, y que el `leak` optimo crece monotono con el iSIR. Eso apunta
+    a que las dos fuentes de mascara fallan en extremos OPUESTOS: la del canal
+    de referencia se queda sin target con iSIR bajo, y la de la salida SATURA
+    con iSIR alto (con sharpen 8, m_n=(1-m)^8 -> 0 y Phi_NN queda mal
+    condicionada). Si es asi, fundirlas deberia cubrir todo el rango -- y sale
+    barato: la segunda red son 0.009 ms/frame contra los 1.554 ms del eigh que
+    ya se elimino.
+
+    La pregunta es CON QUE REGLA, y el requisito es que no tenga parametros que
+    calibrar (que es lo que descalifica al `leak`). Ver `output_feedback_stft`
+    para el fundamento de cada una; "bayes" (suma de log-odds) es la unica que
+    sale de un modelo y no de una heuristica.
+
+    Filas de control: `fb_pf` (el sistema de hoy), `ofb_lk00` (una sola mascara,
+    la de la salida) y `ofb_ref` -- que es la otra mitad del experimento: la
+    mascara del canal de referencia SOLA, o sea NM_MVDR_PF sin front-end. Sin
+    esas dos no se puede saber si la fusion aporta algo o solo interpola.
+    """
+    ns = {k: v for k, v in CFG.items() if k != 'smooth'}
+    procs = {
+        "fb_pf":    NM_MVDR_DSM_FB(mode="fb", block_update=1, smooth=0.5, **ns),
+        "ofb_lk00": NM_MVDR_OFB(leak=0.00, smooth=0.5, **ns),
+        "ofb_ref":  NM_MVDR_OFB(leak=1.00, smooth=0.5, **ns),
+    }
+    for f in ("max", "min", "mean", "gmean", "bayes", "nor"):
+        procs[f"fuse_{f}"] = NM_MVDR_OFB(leak=0.0, smooth=0.5, fuse=f, **ns)
+    return procs
 
 
 def build_isir_processors():
@@ -169,14 +241,18 @@ def main():
     param_grid = {
         'rt60': [0.360, 0.610], 'target_angle': [0], 'target_dist': [1.0],
         'interf_configs': ([[(45, 1.0)], [(90, 2.0)]] if full else [[(45, 1.0)]]),
-        'isir_db': ([-5, 0, 5, 10, 15] if "--isir" in sys.argv else [-5, 0]),
+        'isir_db': ([-5, 0, 5, 10, 15]
+                    if any(a in sys.argv for a in ("--isir", "--fuse", "--median"))
+                    else [-5, 0]),
         'mismatch_gain': [0], 'mismatch_phase': [0],
         'use_wpe': [False], 'wpe_method': ['online'], 'wpe_taps': [7], 'wpe_delay': [2],
         'error_angle_deg': [0.0], 'error_distance_m': [0.0],
     }
     df = run_mird_grid_search(
         grid_params=param_grid, dataset_provider=provider,
-        processors=(build_isir_processors() if "--isir" in sys.argv
+        processors=(build_median_processors() if "--median" in sys.argv
+                    else build_fuse_processors() if "--fuse" in sys.argv
+                    else build_isir_processors() if "--isir" in sys.argv
                     else build_pf_processors() if "--pf" in sys.argv
                     else build_processors()),
         scene_base_config=base_config(),
@@ -200,9 +276,11 @@ def summarize(df, ref='early'):
         print("\n=== SDR por iSIR ===")
         print(df.pivot_table(index='isir_db', columns='processor',
                              values='proc_SDR_early').round(2).to_string())
-    refs = [b for b in ("fb", "fb_P1", "fb_nopf", "fb_pf", "ofb_nopf", "ofb_pf")
+    refs = [b for b in ("fb", "fb_P1", "fb_nopf", "fb_pf", "ofb_nopf", "ofb_pf",
+                        "ofb_lk00")
             if b in set(df.processor)]
-    for a in [p for p in df.processor.unique() if p.startswith("ofb")]:
+    for a in [p for p in df.processor.unique()
+              if p.startswith("ofb") or p.startswith("fuse")]:
         for b in refs:
             if b == a:
                 continue

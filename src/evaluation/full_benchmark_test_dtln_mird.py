@@ -1148,14 +1148,16 @@ if __name__ == "__main__":
         "NM_MVDR_DSM_FB" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
                sharpen_exp=8.0, smooth=0.5, alpha=0.99, block_update=True, fe_update=1),
 
-        "NM_MVDR_DSM_FB_no_project_back" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
-               sharpen_exp=8.0, smooth=0.5, alpha=0.99, block_update=True, fe_update=1, psd_project=False),
+        "NM_MVDR_OFB":  NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
+            block_update=1, leak=0.05, smooth=0.5,
+            guard=None, mask_floor=0.0),
+            
+        "NM_MVDR_OFB_mean" : NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
+            block_update=1, leak=0.0, smooth=0.5, fuse='mean'),
 
 
 
-        #"NM_MVDR_OFB":  NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
-         #   block_update=1, leak=0.05, smooth=0.5,
-          #  guard=None, mask_floor=0.0),
+  
 
         #"NM_MVDR_OFB_full": NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
         #    block_update=1, leak=0.05, smooth=None, stage2='pf',

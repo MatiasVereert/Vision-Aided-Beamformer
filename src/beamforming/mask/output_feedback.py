@@ -86,15 +86,49 @@ LAS TRES DEFENSAS (independientes, se pueden combinar)
    puro tambien dispara (energia alta, mascara baja) y lo unico que pasa es que
    durante ese tramo la mascara sale del canal crudo, o sea del sistema base.
 
-3. `guard='dual'` -- LA SEGUNDA MASCARA (la idea "cara", como control).
-   Un segundo DTLN sobre el canal de referencia, combinado con
-   m = max(m_out, m_ref): el lazo nunca puede NEGAR voz que la rama de
-   referencia ve. Es la defensa mas fuerte y la que ancla el lazo de verdad,
-   pero cuesta la segunda red -- que es justo lo que este esquema queria
-   ahorrar. Sirve como techo: si `leak`/`snr` empatan con `dual`, la proteccion
-   barata alcanza.
+3. `fuse` -- LAS DOS MASCARAS, FUNDIDAS (y no cuesta lo que parece).
+   Un segundo DTLN sobre el canal de referencia, y las dos mascaras crudas se
+   combinan con una regla SIN PARAMETROS. La medicion de costo dice que esto no
+   es la opcion cara: la etapa 1 del DTLN son 0.009 ms/frame contra los 1.554 ms
+   del eigh de Phi_SS que este esquema elimina -- 170 veces menos. Lo caro era
+   el autovector, no la red.
 
-   `guard='both'` = dual + snr.
+   Las dos fuentes tienen modos de falla COMPLEMENTARIOS, que es lo que hace
+   que valga la pena fundirlas y no elegir una:
+
+     mascara del canal de referencia : buena con iSIR ALTO (el target ya se ve
+         solo); mala con iSIR bajo, donde el target esta enterrado.
+     mascara de la salida del BF     : buena con iSIR BAJO (el beamformer
+         limpia el interferente); con iSIR alto la senal es tan limpia que la
+         mascara SATURA y, con sharpen_exp=8, la rama de RUIDO se queda sin
+         masa (m_n=(1-m)^8 -> 0) y Phi_NN queda mal condicionada.
+
+   Medido: OFB gana por debajo de iSIR ~5 y pierde por arriba de ~10, que es
+   exactamente el cruce que predice esa complementariedad.
+
+   Reglas implementadas (a, b = mascaras CRUDAS de referencia y de salida):
+     "max"   1 - (1-a)(1-b) al limite duro: protege contra la auto-cancelacion
+             (el lazo nunca puede NEGAR voz que la rama de atras ve), pero
+             AGRAVA la saturacion de iSIR alto.
+     "min"   consenso para declarar voz. Al reves: arregla la saturacion y
+             desprotege la auto-cancelacion.
+     "mean"  promedio aritmetico. El compromiso ingenuo.
+     "gmean" media geometrica sqrt(ab) = promedio en el dominio log.
+     "bayes" SUMA DE LOG-ODDS: p = ab / (ab + (1-a)(1-b)). Es la fusion de dos
+             detectores independientes de P(voz), y es la unica de la lista que
+             sale de un modelo en vez de una heuristica. Propiedad util: una
+             mascara INSEGURA (p ~ 0.5, log-odds ~ 0) no aporta nada y manda la
+             segura -- que es el comportamiento que se busca. Contra: si una se
+             equivoca CON CONFIANZA, la arrastra.
+     "nor"   noisy-OR, 1 - (1-a)(1-b): la version blanda de "max", protectora
+             por construccion.
+     "back"  CONTROL: se descarta la mascara de la salida y queda solo la de
+             atras. Con fuse_src="median" es la forma clasica de la literatura
+             (una mascara por canal, mediana sobre canales); con "ref" es la
+             mascara del mic de referencia sola. Sin este control no se puede
+             saber si fundir aporta o solo interpola.
+
+   `guard='dual'` queda como alias historico de `fuse="max"`.
 
 Ademas, `mask_floor` pone un piso a la rama de senal (m_s <- f + (1-f) m_s), lo
 que garantiza que Phi_XX nunca deja de acumular: es una defensa continua sobre
@@ -121,6 +155,7 @@ def output_feedback_stft(X_stft, model_path, nperseg, ref_mic_idx=None,
                          warmup=0, mask_floor=0.0, guard=None,
                          guard_bins=None, guard_snr_db=6.0, guard_mass=0.08,
                          guard_smooth=0.9, guard_hold=64, guard_rise=1.0005,
+                         fuse=None, fuse_src="ref", fuse_model_path=None,
                          guard_model_path=None, poison=None, stage2=None,
                          model2_path=None, hop=None, return_diag=False,
                          progress=True):
@@ -138,6 +173,20 @@ def output_feedback_stft(X_stft, model_path, nperseg, ref_mic_idx=None,
             red, que tiene estado LSTM).
         warmup: frames iniciales con b = 1.
         mask_floor: piso de la rama de senal.
+        fuse: None | 'max' | 'min' | 'mean' | 'gmean' | 'bayes' | 'nor' | 'back'.
+            Funde la mascara de la salida con la de un segundo DTLN sobre el
+            canal de referencia. Ninguna de las reglas tiene parametros.
+        fuse_src: de donde sale la mascara de ATRAS. "ref" (default) = un solo
+            DTLN sobre el canal de referencia. "median" = un DTLN POR CANAL y la
+            MEDIANA sobre los M canales, que es la forma clasica de la
+            literatura de mask-beamforming. La mediana reduce la VARIANZA del
+            estimador, no el SNR de entrada (los M canales ven la misma mezcla
+            con casi el mismo SIR), asi que deberia mejorar la mitad de atras de
+            la fusion -- la que manda con iSIR alto. Cuesta M invokes por frame:
+            medido, 361 k MACs int8 y 10.7 us por canal en x86, o sea 86 us para
+            M=8 (1.1% del periodo de hop). Los M canales comparten los MISMOS
+            pesos, asi que el tráfico de memoria no se multiplica por M.
+        fuse_model_path: .tflite de la segunda red (default: el mismo).
         guard: None | 'snr' | 'dual' | 'both'.
         guard_bins: (K,) bool, banda donde se miden el proxy y la masa.
         guard_model_path: .tflite de la segunda red (default: el mismo).
@@ -176,6 +225,11 @@ def output_feedback_stft(X_stft, model_path, nperseg, ref_mic_idx=None,
         raise ValueError(f"ref_mic_idx={ref_mic_idx} fuera de rango para M={M}.")
     if guard not in (None, "snr", "dual", "both"):
         raise ValueError(f"guard desconocido: {guard!r} (None|'snr'|'dual'|'both')")
+    _FUSE = (None, "max", "min", "mean", "gmean", "bayes", "nor", "back")
+    if fuse not in _FUSE:
+        raise ValueError(f"fuse desconocido: {fuse!r} {_FUSE}")
+    if fuse is None and guard in ("dual", "both"):
+        fuse = "max"                      # alias historico
     if stage2 not in (None, "pf"):
         raise ValueError(f"stage2 desconocido: {stage2!r} (None|'pf')")
     if stage2 is not None and model2_path is None:
@@ -189,8 +243,16 @@ def output_feedback_stft(X_stft, model_path, nperseg, ref_mic_idx=None,
                               mu=mu, lambda_floor=lambda_floor,
                               psd_project=psd_project, ban=ban)
     dtln = DTLNStream(model_path, model2_path=model2_path if stage2 else None)
-    dtln_ref = (DTLNStream(guard_model_path or model_path)
-                if guard in ("dual", "both") else None)
+    _mpath = fuse_model_path or guard_model_path or model_path
+    if fuse is None:
+        dtln_ref = None
+    elif fuse_src == "median":
+        # Un interprete POR CANAL: cada uno lleva su propio estado LSTM.
+        dtln_ref = [DTLNStream(_mpath) for _ in range(M)]
+    elif fuse_src == "ref":
+        dtln_ref = DTLNStream(_mpath)
+    else:
+        raise ValueError(f"fuse_src desconocido: {fuse_src!r} ('ref'|'median')")
     use_snr = guard in ("snr", "both")
 
     # Arranque: w = e_ref  ->  Y(0) = x_ref (el canal crudo, como el bootstrap
@@ -234,15 +296,50 @@ def output_feedback_stft(X_stft, model_path, nperseg, ref_mic_idx=None,
         # --- entrada de la red: salida del BF + fuga del canal de referencia -
         b_tgt = 1.0 if (t < warmup or hold_left > 0) else b_nom
         b = leak_smooth * b + (1.0 - leak_smooth) * b_tgt
+        assert np.isscalar(b) or np.ndim(b) == 0, (
+            "el coeficiente de fuga tiene que seguir siendo ESCALAR: si alguna "
+            "rama lo pisa con un vector, la fuga pasa a ser por bin sin que se "
+            "note (y rompe return_diag).")
         Y_mask = (1.0 - b) * Y + b * X_frame[:, ref]
 
         m_raw = np.clip(np.asarray(dtln.step(np.abs(nperseg * Y_mask)),
                                    dtype=np.float64), 0.0, 1.0)
         if dtln_ref is not None:
-            m_ref = np.clip(np.asarray(dtln_ref.step(np.abs(nperseg * X_frame[:, ref])),
-                                       dtype=np.float64), 0.0, 1.0)
-            # El lazo puede AGREGAR voz, nunca negarla.
-            m_raw = np.maximum(m_raw, m_ref)
+            if isinstance(dtln_ref, list):
+                # Mediana sobre los canales (la forma clasica). La mediana --y no
+                # la media-- porque un canal con un nulo espacial en la fuente da
+                # una mascara arbitrariamente mala, y la mediana la ignora.
+                a = np.median(
+                    [np.asarray(d.step(np.abs(nperseg * X_frame[:, m])),
+                                dtype=np.float64)
+                     for m, d in enumerate(dtln_ref)], axis=0)
+                a = np.clip(a, 0.0, 1.0)
+            else:
+                a = np.clip(np.asarray(
+                    dtln_ref.step(np.abs(nperseg * X_frame[:, ref])),
+                    dtype=np.float64), 0.0, 1.0)
+            # OJO: aca NO se puede usar `b`, que es el coeficiente ESCALAR de
+            # fuga y sobrevive de un frame al siguiente (b = leak_smooth * b +
+            # ...). Pisarlo con la mascara convertia la fuga en un vector por
+            # bin desde el frame 2. m_out = mascara de la SALIDA, a = la de atras.
+            m_out = m_raw
+            if fuse == "back":
+                m_raw = a
+            elif fuse == "max":
+                m_raw = np.maximum(a, m_out)
+            elif fuse == "min":
+                m_raw = np.minimum(a, m_out)
+            elif fuse == "mean":
+                m_raw = 0.5 * (a + m_out)
+            elif fuse == "gmean":
+                m_raw = np.sqrt(a * m_out)
+            elif fuse == "nor":
+                m_raw = 1.0 - (1.0 - a) * (1.0 - m_out)
+            else:                                    # "bayes": suma de log-odds
+                e = 1e-6
+                aa, oo = np.clip(a, e, 1 - e), np.clip(m_out, e, 1 - e)
+                num = aa * oo
+                m_raw = num / (num + (1.0 - aa) * (1.0 - oo))
 
         if mask_warp is None:
             m_s, m_n = m_raw ** p, (1.0 - m_raw) ** p
