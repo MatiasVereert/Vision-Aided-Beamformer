@@ -1,0 +1,48 @@
+==============================================================================
+ESTIMADOR CIEGO DE iSIR -- calibracion contra el iSIR verdadero
+==============================================================================
+escenas: 8   iSIR: [np.int64(-10), np.int64(-5), np.int64(0), np.int64(5), np.int64(10), np.int64(15), np.int64(20)]   alpha=0.999
+interferente NO-voz: ['techno_gated commune.wav']
+interferente VOZ   : []  (se reporta aparte)
+
+--- CALIBRACION (solo interferente NO-voz) ---------------------------
+     est     rho  rho_min  g[dB/dB]   b[dB]   sigma  sigma/g  fluct/g  t_conv
+                                               (dB) (dB real) (dB real) (s,p90)
+     sum   0.957    1.000     0.552   -1.09    1.47     2.66     1.16     4.5
+    norm   0.923    0.857     0.362   -0.34    1.29     3.56     2.69     1.8
+    band   0.972    1.000     0.566    1.87    1.19     2.10     2.72     1.5
+ bandsum   0.971    1.000     0.759    0.73    1.74     2.29     1.28     3.9
+    wien   0.938    0.893     0.466   -0.83    1.19     2.55     2.82     1.7
+     sat   0.951    1.000     0.008    0.09    0.03     3.85     2.03    12.1
+
+  rho       Spearman(isir_hat, iSIR) sobre todas las celdas NO-voz.
+  rho_min   la peor escena. Si cae, el estimador se rompe en algun caso.
+  g,b       ajuste isir_hat = g*iSIR + b. Es la CALIBRACION: el sistema
+            invierte esta recta para hablar en dB reales.
+  sigma/g   dispersion entre escenas a iSIR fijo, EN dB REALES. Es la
+            cifra de merito: cuanto se corre el cruce de la agenda al
+            cambiar de sala, de locutor o de angulo. Comparar contra el
+            ancho del sigmoide (unos 3.5 dB reales).
+  fluct/g   fluctuacion temporal dentro de una celda, en dB reales (la
+            fuente no es estacionaria: el estimador nunca se queda quieto).
+  t_conv    p90 de la PRIMERA entrada a 1 dB del valor final.
+
+--- ERROR DE DECISION (lo unico que el sistema consume) --------------
+c = sigmoide((isir_est - centro)/ancho) con centro/ancho en dB REALES y
+isir_est = (hat - b)/g. c_oraculo usa el iSIR verdadero. centro=2.2 dB, ancho=3.5 dB.
+     est   |dc|med   |dc|p90  lado erroneo
+     sum     0.027     0.071      0/56    
+    norm     0.041     0.116      0/56    
+    band     0.017     0.099      2/56    
+ bandsum     0.019     0.100      2/56    
+    wien     0.036     0.134      0/56    
+
+  'lado erroneo' cuenta las celdas donde el estimador cruza el centro
+  para el lado que no era. Cerca del cruce eso no cuesta casi nada (las
+  dos mascaras empatan ahi); lo que importa es que no pase LEJOS.
+
+--- (sin interferente de VOZ en esta corrida) ------------------------
+
+--- RECOMENDACION: 'band'   isir_est = (hat - 1.87) / 0.566
+    dispersion 2.10 dB reales entre escenas, rho=0.972 (peor escena 1.000)
+==============================================================================

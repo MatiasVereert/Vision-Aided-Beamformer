@@ -1,0 +1,67 @@
+==============================================================================
+ESTIMADOR CIEGO DE iSIR -- calibracion contra el iSIR verdadero
+==============================================================================
+escenas: 16   iSIR: [np.int64(-10), np.int64(-5), np.int64(0), np.int64(5), np.int64(10), np.int64(15), np.int64(20)]   alpha=0.998
+interferente NO-voz: ['techno_gated commune.wav']
+interferente VOZ   : ['p011_emo_anger_sentences.wav']  (se reporta aparte)
+
+--- CALIBRACION (solo interferente NO-voz) ---------------------------
+     est     rho  rho_min  g[dB/dB]   b[dB]   sigma  sigma/g  fluct/g  t_conv
+                                               (dB) (dB real) (dB real) (s,p90)
+     sum   0.959    1.000     0.559   -1.17    1.43     2.57     1.66     4.4
+    norm   0.893    0.857     0.299    0.81    1.35     4.51     3.91     1.5
+    band   0.977    1.000     0.496    3.77    0.95     1.92     3.69     0.8
+ bandsum   0.976    1.000     0.768    0.61    1.61     2.10     1.80     3.8
+    wien   0.917    0.857     0.389    0.82    1.32     3.40     3.91     1.5
+     sat   0.960    1.000     0.010    0.10    0.04     3.54     2.11     3.6
+
+  rho       Spearman(isir_hat, iSIR) sobre todas las celdas NO-voz.
+  rho_min   la peor escena. Si cae, el estimador se rompe en algun caso.
+  g,b       ajuste isir_hat = g*iSIR + b. Es la CALIBRACION: el sistema
+            invierte esta recta para hablar en dB reales.
+  sigma/g   dispersion entre escenas a iSIR fijo, EN dB REALES. Es la
+            cifra de merito: cuanto se corre el cruce de la agenda al
+            cambiar de sala, de locutor o de angulo. Comparar contra el
+            ancho del sigmoide (unos 3.5 dB reales).
+  fluct/g   fluctuacion temporal dentro de una celda, en dB reales (la
+            fuente no es estacionaria: el estimador nunca se queda quieto).
+  t_conv    p90 de la PRIMERA entrada a 1 dB del valor final.
+
+  La dispersion crece arriba de +15 dB en todos los estimadores, pero
+  ahi la agenda ya esta saturada (c ~ 1): el error no cambia ninguna
+  decision. Lo que importa es la dispersion CERCA DEL CRUCE.
+
+--- ERROR DE DECISION (lo unico que el sistema consume) --------------
+c = sigmoide((isir_est - centro)/ancho) con centro/ancho en dB REALES y
+isir_est = (hat - b)/g. c_oraculo usa el iSIR verdadero. centro=2.2 dB, ancho=3.5 dB.
+     est   |dc|med   |dc|p90  lado erroneo
+     sum     0.027     0.064      0/56    
+    norm     0.061     0.163      0/56    
+    band     0.018     0.077      1/56    
+ bandsum     0.019     0.095      2/56    
+    wien     0.041     0.160      1/56    
+
+  'lado erroneo' cuenta las celdas donde el estimador cruza el centro
+  para el lado que no era. Cerca del cruce eso no cuesta casi nada (las
+  dos mascaras empatan ahi); lo que importa es que no pase LEJOS.
+
+--- LIMITE CONOCIDO: interferente de VOZ -----------------------------
+La mascara del DTLN detecta VOZ, no el TARGET. Con un interferente
+hablado, la 'senal' del estimador incluye al interferente y el iSIR deja
+de ser observable por esta via. No es un problema de calibracion:
+     est  rho NO-voz   rho VOZ  rho_min VOZ
+     sum       0.959     0.037       -0.607
+    norm       0.893    -0.113       -0.607
+    band       0.977     0.204       -0.429
+ bandsum       0.976     0.174       -0.607
+    wien       0.917    -0.138       -0.750
+     sat       0.960     0.015       -0.857
+
+  Consecuencia practica: en ese caso la agenda elige un punto arbitrario
+  de la interpolacion. El dano esta ACOTADO -- los dos extremos son
+  mascaras razonables (0.46 vs 0.51 de Delta PESQ en la peor celda del
+  barrido de pf_mask) -- pero la ganancia de la agenda se pierde.
+
+--- RECOMENDACION: 'band'   isir_est = (hat - 3.77) / 0.496
+    dispersion 1.92 dB reales entre escenas, rho=0.977 (peor escena 1.000)
+==============================================================================

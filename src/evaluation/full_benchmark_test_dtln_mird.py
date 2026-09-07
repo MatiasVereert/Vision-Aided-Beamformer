@@ -42,7 +42,9 @@ from evaluation.bf_wrappers import (
     SOUDEN_ORACLE_SCM,
     DTLN_MB_MVDR_SOUDEN_BAN_alphaless,
     NM_MVDR_DSM_BLIND,
-    NM_MVDR_DSM_FB
+    NM_MVDR_DSM_FB,
+    NM_MVDR_OFB_AUTO
+    
 
     
 
@@ -831,6 +833,10 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
         proc_config = scene_base_config.copy()
         proc_config['source_pos'] = assumed_source_pos
+        # iSIR VERDADERO de la celda. Ningun procesador de produccion lo mira:
+        # esta para los modos oraculo (p.ej. NM_MVDR_OFB(pf_isir_db='scene'),
+        # que mide el techo de la agenda de mascara sin el error del estimador).
+        proc_config['isir_db'] = exp['isir_db']
 
         for p_idx, (proc_name, processor) in enumerate(processors.items()):
             ui.stage(f"[BF {p_idx+1}/{len(processors)}] {proc_name} "
@@ -1139,34 +1145,12 @@ if __name__ == "__main__":
     }
 
     processors_dict = {
-       # "DS" :DS(),
-        #"NM_MVDR" : NM_MVDR(min_loading =1e-9, alpha =0.99),
 
-        #"NM_MVDR_PF" :NM_MVDR_PF(min_loading =1e-9, alpha =0.99, smooth = 0.5),
+        "NM_MVDR_OFB_AUTO_8": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=8.0),
+                    
+        "NM_MVDR_OFB_AUTO_4": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=4.0),
 
-
-        "NM_MVDR_DSM_FB" : NM_MVDR_DSM_FB(mode="fb", win_type='rect', synth='hann',
-               sharpen_exp=8.0, smooth=0.5, alpha=0.99, block_update=True, fe_update=1),
-
-        "NM_MVDR_OFB":  NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
-            block_update=1, leak=0.05, smooth=0.5,
-            guard=None, mask_floor=0.0),
-            
-        "NM_MVDR_OFB_mean" : NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
-            block_update=1, leak=0.0, smooth=0.5, fuse='mean'),
-
-
-
-  
-
-        #"NM_MVDR_OFB_full": NM_MVDR_OFB(win_type='rect', synth='hann', sharpen_exp=8.0, alpha=0.99,
-        #    block_update=1, leak=0.05, smooth=None, stage2='pf',
-        #    guard=None, mask_floor=0.0)
-
-
-
-
-
+        "NM_MVDR_OFB_AUTO_1": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=1)
 
 
     } 

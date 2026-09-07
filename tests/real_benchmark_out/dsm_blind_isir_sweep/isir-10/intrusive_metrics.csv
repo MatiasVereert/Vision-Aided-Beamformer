@@ -1,7 +1,7 @@
 senal,PESQ,STOI,SI-SDR,SDR,SAR,SIR
 mixture_raw,1.1664,0.4685,-9.2202,-9.1669,-9.1669,nan
 ref_mic_raw,1.1664,0.4685,-9.2202,-9.1669,-9.1669,nan
-NM_MVDR_OFB,1.5403,0.6795,6.7718,9.1820,9.1820,nan
+NM_MVDR_OFB_AUTO,1.8569,0.7135,6.1496,9.2955,9.2955,nan
 dtln_mono,1.4370,0.6346,8.0347,9.4967,9.4967,nan
 dtln_souden_ban_mvdr,1.2465,0.5825,-1.6685,-1.5022,-1.5022,nan
 dtln_souden_ban_then_dtln,1.3888,0.6931,6.7953,7.7856,7.7856,nan

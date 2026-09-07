@@ -3015,7 +3015,9 @@ class NM_MVDR_OFB:
                  warmup=0, mask_floor=0.0, guard=None,
                  guard_band=(300.0, 3400.0), guard_snr_db=6.0, guard_mass=0.08,
                  guard_smooth=0.9, guard_hold=64, guard_rise=1.0005,
-                 stage2=None, fuse=None, fuse_src="ref"):
+                 stage2=None, fuse=None, fuse_src="ref", pf_mask=None,
+                 pf_isir=(0.0, 2.0), pf_isir_alpha=0.995, pf_isir_db=None,
+                 fuse_isir=(9.0, 3.0)):
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.nfft = nperseg
@@ -3059,6 +3061,20 @@ class NM_MVDR_OFB:
         # mascara de ATRAS de la fusion. M invokes por frame (10.7 us c/u en
         # x86, pesos compartidos entre canales).
         self.fuse_src = fuse_src
+        # fuse='isir': la mezcla del SCM tambien agendada, con su propio cruce.
+        self.fuse_isir = fuse_isir
+        # pf_mask: que mascara multiplica la SALIDA (post-filtro `smooth`), que
+        # no tiene por que ser la que alimenta el SCM. El PF multiplica Y, y la
+        # mascara que describe Y es la de la salida ('out'); la de atras
+        # describe x_ref (iSIR peor) y sobre-suprime. None = la del SCM.
+        self.pf_mask = pf_mask
+        # pf_mask='isir': interpola m_out -> a segun el iSIR estimado. El cruce
+        # medido esta cerca de 0 dB (ver el docstring de output_feedback).
+        self.pf_isir = pf_isir
+        self.pf_isir_alpha = pf_isir_alpha
+        # Oraculo: si es 'scene', toma el iSIR verdadero de scene_config. Sirve
+        # para medir el techo de la agenda separado del error del estimador.
+        self.pf_isir_db = pf_isir_db
 
     def _model2_path(self, scene_config, model_path):
         """
@@ -3108,6 +3124,14 @@ class NM_MVDR_OFB:
         # diagnostico del lazo (beta, masa de la mascara, gate). Es la unica via
         # para mirar la trayectoria del lazo desde dentro de un barrido.
         want_diag = getattr(self, 'diag_sink', None) is not None
+        pf_isir_db = self.pf_isir_db
+        if pf_isir_db == 'scene':
+            if 'isir_db' not in scene_config:
+                raise ValueError(
+                    "pf_isir_db='scene' necesita scene_config['isir_db'] (el "
+                    "iSIR verdadero de la escena). Es un ORACULO: solo para "
+                    "medir el techo de la agenda, no para produccion.")
+            pf_isir_db = float(scene_config['isir_db'])
         out = output_feedback_stft(
             X_stft, model_path, nperseg_dyn, ref_mic_idx=ref_mic_idx,
             return_diag=want_diag,
@@ -3124,7 +3148,10 @@ class NM_MVDR_OFB:
             # Gancho de banco de estres (ver `output_feedback_stft`): fuerza el
             # estado de self-nulling para medir si se sale. No es produccion.
             poison=getattr(self, 'poison', None),
-            fuse=self.fuse, fuse_src=self.fuse_src,
+            fuse=self.fuse, fuse_src=self.fuse_src, fuse_isir=self.fuse_isir,
+            pf_mask=self.pf_mask,
+            pf_isir=self.pf_isir, pf_isir_alpha=self.pf_isir_alpha,
+            pf_isir_db=pf_isir_db,
             stage2=self.stage2, hop=hop_dyn,
             model2_path=self._model2_path(scene_config, model_path))
         # (Y, W) | (Y, W, diag) | (Y, W, y_time) | (Y, W, y_time, diag)
@@ -3151,4 +3178,166 @@ class NM_MVDR_OFB:
             y_time = y_time[:n_out]
         else:
             y_time = ola_taper(Y_stft, nperseg_dyn, hop_dyn, self.synth, n_out)
+        return y_time, weights
+
+
+class NM_MVDR_OFB_AUTO:
+    """
+    EL SISTEMA. Lazo cerrado sobre la salida + post-filtro con la mascara
+    agendada por un estimador CIEGO del iSIR. Es `NM_MVDR_OFB` con la mejor
+    configuracion medida CLAVADA, sin los ejes que ya fueron barridos:
+
+        win_type='rect', synth='hann'   la STFT de analisis tiene que ser
+            rectangular para que el frame de la STFT y el bloque del DTLN sean
+            las mismas muestras; la sintesis con taper de Hann es lo que mide
+            mejor. No son opciones: son la definicion del esquema.
+        block_update=1                  el frame t se filtra con los pesos de
+            t-1. Es la condicion que hace posible alimentar la red con la
+            SALIDA del beamformer, no una optimizacion.
+        leak=0                          se cayo. La fuga del canal de referencia
+            era la defensa contra el self-nulling, y el barrido mostro que el
+            estado absorbente NO es alcanzable en este esquema (Phi_XX se
+            congela, ver el docstring de output_feedback.py): la defensa costaba
+            iSIR de entrada a la red sin comprar nada.
+        fuse='mean', fuse_src='ref'     el SCM come el promedio de las dos
+            mascaras crudas (la de la salida y la del canal de referencia).
+        pf_mask='isir'                  el POST-FILTRO usa su propia mascara,
+            interpolada entre las dos segun el iSIR: la de la SALIDA con iSIR
+            bajo (describe la senal que multiplica) y la de ATRAS con iSIR alto
+            (donde la salida se va del dominio de entrenamiento de la red y su
+            mascara satura).
+
+    Lo unico que queda regulable de la cadena es `smooth` -- la relajacion del
+    post-filtro, G = smooth + (1-smooth)*m -- porque es el tradeoff
+    PESQ/STOI y depende de para que se use la salida.
+
+    EL ESTIMADOR DE iSIR
+    --------------------
+    Lo que hace autonoma la agenda. Sale de la mascara del DTLN sobre el canal
+    de referencia (que ya se calcula para la fusion) y del espectro de ese
+    canal: cociente de energias voz/resto POR BIN OCUPADO y dentro de
+    300-3400 Hz, suavizado con constante de tiempo larga, y una recta de
+    calibracion que lo devuelve a dB de iSIR REAL. Ver `ISIRTracker`.
+
+    Que el estimador este calibrado en dB reales es lo que hace que
+    `isir_center`/`isir_width` sean magnitudes fisicas y que el modo oraculo
+    (`isir_db='scene'`) corra EXACTAMENTE la misma agenda que el ciego -- que es
+    la unica forma de medir el costo del estimador sin confundirlo con un cambio
+    de agenda.
+
+    MEDIDO, EL ESTIMADOR (tests/ofb_isir_estimator_check.py, 8 escenas MIRD sin
+    voz de fondo): monotonia perfecta por escena (Spearman 1.00), dispersion
+    entre escenas de 1.9 dB reales contra un sigmoide de 3.5 dB de ancho,
+    convergencia < 1 s, y ninguna celda que caiga del lado equivocado del cruce.
+
+    MEDIDO, EL SISTEMA (tests/ofb_auto_benchmark.py, 20 celdas: 2 salas x 2
+    angulos x 5 iSIR). Delta PESQ, promedio sobre salas y angulos:
+
+        iSIR            -5      0      5     10     15   | media
+        pf_mask='out'  0.618  0.900  1.039  1.040  0.850 | 0.889
+        pf_mask='back' 0.559  0.898  1.087  1.136  0.964 | 0.929
+        OFB_AUTO       0.613  0.910  1.084  1.130  0.960 | 0.939
+
+    o sea que la agenda se queda con el mejor de los dos extremos en cada punto
+    en vez de promediarlos, y encima conserva el STOI de 'out' (0.274 contra
+    0.264 de 'back' en iSIR -5), que es donde 'back' sobre-suprime.
+
+    COSTO DEL ESTIMADOR: contra el ORACULO corriendo la misma agenda, +0.0004
+    Delta PESQ de media, +0.006 en la peor celda, y en 9 de 20 celdas el ciego
+    gana. Es ruido de medicion: saber el iSIR de antemano no compra nada.
+
+    Contra la agenda con el estimador VIEJO ('sum') este barrido EMPATA (0.939
+    contra 0.940 de media, 12 de 20 celdas). La razon para cambiar de estimador
+    no es este numero -- es que el barrido corre con UN solo locutor, y el
+    defecto de 'sum' es justamente la dependencia del locutor.
+
+    LIMITE CONOCIDO: con un interferente HABLADO el estimador no funciona (la
+    mascara del DTLN detecta voz, no el target). La agenda queda en un punto
+    arbitrario de la interpolacion; los dos extremos son mascaras razonables,
+    asi que el sistema no se rompe, pero la ganancia de la agenda se pierde.
+    """
+
+    # Recta de calibracion del estimador 'band' medida en el barrido MIRD con
+    # ISIR_ALPHA: hat = g * iSIR_real + b. Van JUNTAS con ISIR_ALPHA -- mas
+    # suavizado comprime menos y sube la pendiente.
+    ISIR_ALPHA = 0.998
+    ISIR_CALIB = (0.496, 3.77)
+    # Cruce y ancho de la agenda, en dB de iSIR REAL. Es la misma agenda que
+    # corria `pf_isir=(0.0, 2.0)` con el estimador viejo (centro 0 y ancho 2 en
+    # aquel dominio son +2.2 y 3.5 dB reales), o sea que el cambio de estimador
+    # no mueve el punto de operacion: solo lo hace robusto al locutor.
+    ISIR_CENTER = 2.2
+    ISIR_WIDTH = 3.5
+
+    def __init__(self, nperseg=512, noverlap=384, alpha=0.99, sharpen_exp=8.0,
+                 min_loading=1e-9, smooth=0.5,
+                 isir_center=ISIR_CENTER, isir_width=ISIR_WIDTH,
+                 isir_alpha=ISIR_ALPHA, isir_calib=ISIR_CALIB, isir_db=None):
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.hop_length = nperseg - noverlap
+        self.alpha = alpha
+        self.sharpen_exp = sharpen_exp
+        self.min_loading = min_loading
+        # smooth=None apaga el post-filtro (la salida es el MVDR pelado). Con la
+        # agenda encendida eso no tiene mucho sentido, pero sirve de ablacion.
+        self.smooth = smooth
+        self.isir_center = isir_center
+        self.isir_width = isir_width
+        self.isir_alpha = isir_alpha
+        self.isir_calib = isir_calib
+        # ORACULO (validacion): None = ciego (produccion); 'scene' = toma el
+        # iSIR verdadero de scene_config['isir_db']; un float lo fija a mano.
+        # Al estar en dB reales, es intercambiable con el estimador.
+        self.isir_db = isir_db
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        fs = scene_config['fs']
+        model_path = scene_config.get('dtln_model_path',
+                                      'dnn_denoise/models/model_quant_1.tflite')
+        nperseg_dyn = scene_config.get('stft_window', self.nperseg)
+        noverlap_dyn = scene_config.get('stft_overlap', self.noverlap)
+        hop_dyn = nperseg_dyn - noverlap_dyn
+
+        M_tot = mic_signals.shape[0]
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', M_tot // 2))
+        sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
+        win_spec = resolve_stft_window(scene_config, 'rect', nperseg_dyn)
+
+        freqs, _, Zxx = sig.stft(mic_signals, fs=fs, window=win_spec,
+                                 nperseg=nperseg_dyn, noverlap=noverlap_dyn,
+                                 nfft=nperseg_dyn)
+        X_stft = np.transpose(Zxx, (1, 2, 0))                    # (K, T, M)
+
+        isir_db = self.isir_db
+        if isir_db == 'scene':
+            if 'isir_db' not in scene_config:
+                raise ValueError(
+                    "isir_db='scene' necesita scene_config['isir_db'] (el iSIR "
+                    "verdadero de la escena). Es un ORACULO: sirve para medir "
+                    "el costo del estimador, no para produccion.")
+            isir_db = float(scene_config['isir_db'])
+
+        want_diag = getattr(self, 'diag_sink', None) is not None
+        out = output_feedback_stft(
+            X_stft, model_path, nperseg_dyn, ref_mic_idx=ref_mic_idx,
+            return_diag=want_diag,
+            sharpen_exp=sharpen_exp, alpha=self.alpha,
+            min_loading=self.min_loading, smooth=self.smooth,
+            # --- lo clavado (ver el docstring) ------------------------------
+            block_update=1, leak=0.0, fuse='mean', fuse_src='ref',
+            pf_mask='isir',
+            # --- la agenda, en dB de iSIR REAL ------------------------------
+            pf_isir=(self.isir_center, self.isir_width),
+            pf_isir_alpha=self.isir_alpha, pf_isir_db=isir_db,
+            isir_est='band', isir_calib=self.isir_calib, isir_freqs=freqs)
+        Y_stft, weights = out[0], out[1]
+        if want_diag:
+            d = out[-1]
+            d['freqs'] = freqs
+            self.diag_sink.clear()
+            self.diag_sink.update(d)
+
+        y_time = ola_taper(Y_stft, nperseg_dyn, hop_dyn, 'hann',
+                           mic_signals.shape[1])
         return y_time, weights
