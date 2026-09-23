@@ -33,7 +33,7 @@ from evaluation.bf_wrappers import (NM_MVDR_DSM_BLIND, NM_MVDR_DSM_FB, NM_MVDR_O
                                     NM_MVDR_OFB_AUTO)
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-CAPTURE = "/home/matias/pdm_mic_interface/kria_app/capture/wavs_paso5"
+CAPTURE = "/home/matias/Documents/Tesis/mic-array-platform/kria_app/capture/wavs_paso5"
 DEFAULT_SENAL = os.path.join(CAPTURE, "senal12.wav")
 DEFAULT_RUIDO = os.path.join(CAPTURE, "ruido12.wav")
 DEFAULT_OUT = os.path.join(PROJECT_ROOT, "tests", "real_benchmark_out", "dsm_blind")

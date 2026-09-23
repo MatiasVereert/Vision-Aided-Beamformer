@@ -1146,11 +1146,13 @@ if __name__ == "__main__":
 
     processors_dict = {
 
-        "NM_MVDR_OFB_AUTO_8": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=8.0),
-                    
-        "NM_MVDR_OFB_AUTO_4": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=4.0),
+        "NM_MVDR_OFB_AUTO": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=8.0),
+        "NM_MVDR_OFB_AUTO_BAN": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=8.0, ban = True),
 
-        "NM_MVDR_OFB_AUTO_1": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=1)
+                    
+        #"NM_MVDR_OFB_AUTO_4": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=4.0),
+
+       # "NM_MVDR_OFB_AUTO_1": NM_MVDR_OFB_AUTO(smooth=0.2, sharpen_exp=1)
 
 
     } 
@@ -1161,7 +1163,7 @@ if __name__ == "__main__":
         dataset_provider=provider,
         processors=processors_dict,
         scene_base_config=base_config,
-        output_dir="tests/dataset_out/retroo",
+        output_dir="tests/dataset_out/retroo_ban",
         interpreter_1=interpreter_1,
         interpreter_2=interpreter_2
     )

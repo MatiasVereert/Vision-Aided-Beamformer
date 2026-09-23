@@ -35,6 +35,9 @@ from beamforming.mask.blind_feedback import (
     blind_feedback_stft, DTLNStream,
 )
 from beamforming.mask.output_feedback import output_feedback_stft
+from beamforming.mask.ofb import (
+    output_feedback_run, ISIR_CENTER, ISIR_WIDTH, ISIR_ALPHA, ISIR_CALIB,
+)
 from beamforming.MWF.wiener_postfilter import (
     MVDR_Souden_mask_specsub_MWF, estimate_isir_db, schedule_aggressiveness,
 )
@@ -3272,7 +3275,7 @@ class NM_MVDR_OFB_AUTO:
     def __init__(self, nperseg=512, noverlap=384, alpha=0.99, sharpen_exp=8.0,
                  min_loading=1e-9, smooth=0.5,
                  isir_center=ISIR_CENTER, isir_width=ISIR_WIDTH,
-                 isir_alpha=ISIR_ALPHA, isir_calib=ISIR_CALIB, isir_db=None):
+                 isir_alpha=ISIR_ALPHA, isir_calib=ISIR_CALIB, isir_db=None, ban = False):
         self.nperseg = nperseg
         self.noverlap = noverlap
         self.hop_length = nperseg - noverlap
@@ -3290,6 +3293,7 @@ class NM_MVDR_OFB_AUTO:
         # iSIR verdadero de scene_config['isir_db']; un float lo fija a mano.
         # Al estar en dB reales, es intercambiable con el estimador.
         self.isir_db = isir_db
+        self.ban = ban
 
     def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
         fs = scene_config['fs']
@@ -3330,7 +3334,7 @@ class NM_MVDR_OFB_AUTO:
             # --- la agenda, en dB de iSIR REAL ------------------------------
             pf_isir=(self.isir_center, self.isir_width),
             pf_isir_alpha=self.isir_alpha, pf_isir_db=isir_db,
-            isir_est='band', isir_calib=self.isir_calib, isir_freqs=freqs)
+            isir_est='band', isir_calib=self.isir_calib, isir_freqs=freqs, ban =self.ban)
         Y_stft, weights = out[0], out[1]
         if want_diag:
             d = out[-1]
@@ -3340,4 +3344,120 @@ class NM_MVDR_OFB_AUTO:
 
         y_time = ola_taper(Y_stft, nperseg_dyn, hop_dyn, 'hann',
                            mic_signals.shape[1])
+        return y_time, weights
+
+
+class OFB_MVDR:
+    """
+    EL SISTEMA, en su version cristalizada -- la que se porta a C++.
+
+    Es `NM_MVDR_OFB_AUTO` reescrito sobre `beamforming/mask/ofb.py` en vez de
+    sobre el banco de pruebas `output_feedback.py`: MISMO algoritmo, sin los 40
+    parametros de los barridos que ya se cerraron (las tres defensas contra el
+    self-nulling, las ocho reglas de fusion, la fusion en covarianza, la
+    mascara por canal, `mask_warp`, la segunda etapa del DTLN, BAN, el
+    estimador de iSIR viejo, el gancho de envenenamiento). Lo que queda:
+
+        Y(t)   = w(t-1)^H x(t)
+        m_out  = DTLN(Y)        m_ref = DTLN(x_ref)
+        w(t)   = Souden( SCM( (m_out + m_ref)/2 ) )
+        m_pf   = (1-c) m_out + c m_ref,  c = sigmoide((iSIR_est - 2.2)/3.5)
+        y      = OLA_hann( Y * (smooth + (1-smooth) m_pf) )
+
+    El porque de cada pieza, con los numeros, esta en `ofb.py`; el registro de
+    lo que se probo y se descarto, en `output_feedback.py`.
+
+    DIFERENCIA NUMERICA CONOCIDA CONTRA `NM_MVDR_OFB_AUTO`: alla, aun con
+    `leak=0`, el coeficiente de fuga arrancaba en 1 y se suavizaba hacia 0
+    (b = 0.5, 0.25, 0.125 ...), asi que la red veia una mezcla con el canal
+    crudo durante los primeros ~8 frames. Aca ve `Y` puro desde el arranque.
+    Medido en tests/ofb_refactor_equivalence.py.
+
+    PARAMETROS
+    ----------
+    smooth       relajacion del post-filtro, G = smooth + (1-smooth) m_pf. Es
+                 EL tradeoff PESQ/STOI; 1.0 (o None) lo apaga.
+    block_update P: cada cuantos frames se recalculan los pesos. La estadistica
+                 se acumula siempre; lo que se espacia es el `solve` (eigh +
+                 sistema M x M por bin), que es toda la cuenta cara. Es la
+                 palanca de presupuesto del port; el default medido es 1.
+    isir_db      VALIDACION: None = ciego (produccion); 'scene' = el iSIR
+                 verdadero de scene_config['isir_db']; un float lo fija. Como
+                 la agenda esta en dB REALES, el oraculo corre exactamente la
+                 misma curva que el ciego.
+    diag         True deja en `self.diag` las trayectorias del estimador, de la
+                 agenda y de las tres mascaras.
+    """
+
+    def __init__(self, smooth=0.2, block_update=1, alpha=0.99, sharpen_exp=8.0,
+                 min_loading=1e-9, nperseg=512, noverlap=384,
+                 isir_center=ISIR_CENTER, isir_width=ISIR_WIDTH,
+                 isir_alpha=ISIR_ALPHA, isir_calib=ISIR_CALIB, isir_db=None,
+                 solve_mode="direct", diag=False, return_weights=True):
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.hop_length = nperseg - noverlap
+        self.smooth = smooth
+        self.block_update = block_update
+        self.alpha = alpha
+        self.sharpen_exp = sharpen_exp
+        self.min_loading = min_loading
+        self.isir_center = isir_center
+        self.isir_width = isir_width
+        self.isir_alpha = isir_alpha
+        self.isir_calib = isir_calib
+        self.isir_db = isir_db
+        # 'chol' = la forma que implementa el port (dos Cholesky + una
+        # sustitucion triangular-triangular). Identica a 'direct'; existe para
+        # poder comparar el C++ contra la MISMA aritmetica.
+        self.solve_mode = solve_mode
+        self.want_diag = diag
+        self.return_weights = return_weights
+        self.diag = None
+
+    def _isir_oracle(self, scene_config):
+        """Resuelve `isir_db='scene'` contra la escena. None = ciego."""
+        if self.isir_db != 'scene':
+            return None if self.isir_db is None else float(self.isir_db)
+        if 'isir_db' not in scene_config:
+            raise ValueError(
+                "isir_db='scene' necesita scene_config['isir_db'] (el iSIR "
+                "verdadero de la escena). Es un ORACULO: sirve para medir el "
+                "costo del estimador, no para produccion.")
+        return float(scene_config['isir_db'])
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        fs = scene_config['fs']
+        model_path = scene_config.get('dtln_model_path',
+                                      'dnn_denoise/models/model_quant_1.tflite')
+        nperseg = scene_config.get('stft_window', self.nperseg)
+        noverlap = scene_config.get('stft_overlap', self.noverlap)
+        hop = nperseg - noverlap
+        ref_mic_idx = int(scene_config.get('ref_mic_idx', mic_signals.shape[0] // 2))
+        sharpen_exp = scene_config.get('dtln_sharpen_exp', self.sharpen_exp)
+
+        # Analisis RECTANGULAR: es lo que hace que el frame de la STFT y el
+        # bloque que ve el DTLN sean las mismas muestras. No es una opcion.
+        freqs, _, Zxx = sig.stft(mic_signals, fs=fs, window='boxcar',
+                                 nperseg=nperseg, noverlap=noverlap, nfft=nperseg)
+        X_stft = np.transpose(Zxx, (1, 2, 0))                    # (K, T, M)
+
+        out = output_feedback_run(
+            X_stft, model_path, nperseg, ref_mic_idx, freqs,
+            alpha=self.alpha, sharpen_exp=sharpen_exp,
+            min_loading=self.min_loading, block_update=self.block_update,
+            smooth=self.smooth, isir_center=self.isir_center,
+            isir_width=self.isir_width, isir_alpha=self.isir_alpha,
+            isir_calib=self.isir_calib, isir_db=self._isir_oracle(scene_config),
+            solve_mode=self.solve_mode, return_diag=self.want_diag,
+            return_weights=self.return_weights)
+        if self.want_diag:
+            Y_stft, weights, self.diag = out
+        else:
+            Y_stft, weights = out
+
+        # Sintesis con taper de Hann: el analisis rectangular es el que deja el
+        # frame y el bloque alineados, y el taper suprime las discontinuidades
+        # de borde que aparecen cuando el filtro cambia frame a frame.
+        y_time = ola_taper(Y_stft, nperseg, hop, 'hann', mic_signals.shape[1])
         return y_time, weights

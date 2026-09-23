@@ -32,7 +32,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__fi
 DTLN_1 = f"{PROJECT_ROOT}/src/dnn_denoise/models/model_quant_1.tflite"
 DTLN_2 = f"{PROJECT_ROOT}/src/dnn_denoise/models/model_quant_2.tflite"
 
-DEFAULT_WAV = "/home/matias/pdm_mic_interface/kria_app/capture/wavs_paso4/test_1.wav"
+DEFAULT_WAV = "/home/matias/Documents/Tesis/mic-array-platform/kria_app/capture/wavs_paso4/test_1.wav"
 DEFAULT_OUT = os.path.join(PROJECT_ROOT, "tests", "real_benchmark_out", "sub_test")
 
 

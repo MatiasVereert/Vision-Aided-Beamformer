@@ -78,7 +78,7 @@ from evaluation.metrics import evaluate_full_pipeline
 from lowfreq_diagnostic_run import PROJECT_ROOT
 from lowfreq_audio_export import band_energy_ratio, BANDS
 
-CAPTURE = "/home/matias/pdm_mic_interface/kria_app/capture/wavs_paso5"
+CAPTURE = "/home/matias/Documents/Tesis/mic-array-platform/kria_app/capture/wavs_paso5"
 OUT_DIR = os.path.join(PROJECT_ROOT, "tests", "dataset_out", "real_mix_isir")
 DTLN_1 = f"{PROJECT_ROOT}/src/dnn_denoise/models/model_quant_1.tflite"
 DTLN_2 = f"{PROJECT_ROOT}/src/dnn_denoise/models/model_quant_2.tflite"
