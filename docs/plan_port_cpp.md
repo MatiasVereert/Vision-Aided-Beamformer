@@ -1,6 +1,6 @@
 # Plan de desarrollo: el OFB-MVDR en C++ para ARM
 
-Estado a 2026-09-23. Este documento se edita a medida que avanza el port.
+Estado a 2026-09-25. Este documento se edita a medida que avanza el port.
 
 ---
 
@@ -11,7 +11,8 @@ La fase de caracterización terminó. Todo lo de abajo está medido, no supuesto
 | decisión | por qué | dónde está el número |
 |---|---|---|
 | **Sin sustracción de covarianza** | se cae el `eigh`, que era el 77 % del sistema | `psd-projection-is-load-bearing`, 49 celdas MIRD + aro12 |
-| **`solve` en forma Cholesky** | 1.55× medido en el ARM (y hay otro ~1.35× si se aprovechan los ceros) | `ofb_solve_variants.py` |
+| **`solve` en forma Cholesky, explotando que el lado derecho `LA` es TRIANGULAR** | medido de punta a punta en la Kria: ×1.32 (M=8) / ×1.42 (M=12) sobre el `solve` completo contra la misma forma sin explotar el triángulo; ×1.85–2.26 sobre la fase que toca | `docs/resultado_kria_solve_libs.md` |
+| **Cholesky y sustituciones ESCRITAS A MANO, no Eigen/LAPACK** | a mano es ×1.8–2.7 más rápido que Eigen (tamaño fijo, cero heap) y ×1.8–2.5 que OpenBLAS en la Kria — no por artesanía: ninguna API de biblioteca puede expresar que el lado derecho de `LB Z = LA` es triangular. LAPACK además no está desplegado en la placa (agregaría ~26 MB via snap, ILP64, símbolos `_64_`) | `docs/resultado_kria_solve_libs.md` |
 | **`float`, no `double`** | entra en un núcleo con P=1; double necesita P=2 | `arm-kernel-budget` |
 | **`min_loading = 1e-5`** | el 1e-9 de Python está debajo del epsilon de float32 | barrido de carga, 8 celdas |
 | **`update` con storage completo** | en float + fast-math empata al triangular y es más simple | `arm-kernel-budget` |
@@ -308,9 +309,44 @@ La diagonal de `L` es **real y positiva** (por eso el `sqrt` de un número real)
 Es el lugar clásico de errores: conjugar el factor equivocado da una matriz que
 parece razonable y produce resultados sutilmente malos.
 
-Y el detalle que el benchmark del ARM sugiere que puede costar 1.35×: al
-resolver `LB·Z = LA`, la columna `j` de `LA` tiene ceros arriba de la fila `j`.
-**El bucle tiene que arrancar en `j`, no en `0`.**
+Y el detalle que definió TODO el resultado del benchmark contra bibliotecas
+(`docs/resultado_kria_solve_libs.md`): al resolver `LB·Z = LA`, la columna `j`
+de `LA` tiene ceros arriba de la fila `j`. **El bucle tiene que arrancar en
+`j`, no en `0`.** No es un ajuste fino — es la ÚNICA razón medida por la que
+la forma a mano le gana a Eigen/LAPACK (×2.26 en esa fase, M=12): ninguna
+biblioteca tiene una API para decir "este lado derecho es triangular". Si el
+C++ no explota esto, se pierde exactamente la ventaja por la que se descartó
+usar una biblioteca — ver la nota debajo de "C++ que aparece".
+
+**Bibliotecas externas para este `solve`: evaluadas y descartadas, con
+números.** Antes de escribir esto a mano se armó un banco de pruebas en
+`mic-array-platform/embedded/bench/bench_solve_lib.cpp` comparando la forma a
+mano contra Eigen (`LLT` de tamaño fijo, cero allocación en heap, verificado
+interceptando `operator new`) y contra LAPACK/OpenBLAS, sobre el lote real de
+K=257 sistemas, en la Kria y en x86. Resultado completo en
+`docs/resultado_kria_solve_libs.md`; resumen:
+
+- A mano gana por ×1.8–2.7 (Eigen) y ×1.8–2.5 (OpenBLAS) en la Kria, con
+  `-O3` y también con `-ffast-math`.
+- La causa NO es gestión de memoria (Eigen con tamaño fijo no toca el heap,
+  confirmado). Es que el algoritmo interno de Eigen usa bloques de tamaño
+  `Dynamic` aun sobre una matriz de tamaño fijo — el cruce donde una
+  biblioteca empieza a ganar está en M≈64, cinco veces por encima de M=8-12.
+- LAPACK, además de perder en velocidad, no está desplegado en la Kria: el
+  único BLAS de la placa vive dentro de un snap (ILP64, símbolos `_64_`, ruta
+  con número de revisión que cambia sola).
+- **Matiz importante para no generalizar mal**: la regla "sin bibliotecas
+  externas" es correcta ACÁ, pero no porque las bibliotecas externas sean
+  malas en general — Eigen no cuesta nada desplegar (header-only, ya está en
+  la placa) y a ×1.7-2.0 con `-ffast-math` seguiría entrando en el
+  presupuesto. Lo que decide es la estructura triangular de este problema
+  puntual. La misma regla aplicada a ciegas a otra pieza (la FFT, por
+  ejemplo) daría la respuesta equivocada.
+- **Repliegue de bajo riesgo si escribir el Cholesky a mano se complica**:
+  Eigen entra en presupuesto (×1.7–2.7), no cuesta desplegar, y es mucho más
+  difícil de romper que 40 líneas de Cholesky a mano. Es una decisión de
+  riesgo, no de rendimiento — válida si el tiempo de aprender C++ se vuelve
+  el cuello de botella real de esta fase.
 
 **C++ que aparece**: `std::complex<float>` (y su costo: puede inhibir la
 vectorización por las reglas de aliasing y NaN — si más adelante el perfilado lo

@@ -451,6 +451,7 @@ def blind_feedback_stft(X_stft, model_path, nperseg, ref_mic_idx=None,
                        Gamma=Gamma, sd_eps=sd_eps, conf_gate=conf_gate,
                        conf_bins=conf_bins, conf_smooth=conf_smooth,
                        conf_alpha=conf_alpha)
+    
     core = SoudenSubtractCore(K, M, ref, alpha=alpha, min_loading=min_loading,
                               mu=mu, lambda_floor=lambda_floor,
                               psd_project=psd_project, ban=ban)

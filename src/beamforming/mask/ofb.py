@@ -76,10 +76,10 @@ LO QUE NO ESTA, Y POR QUE
   (voz cancelada -> mascara sin voz -> la voz entra a Phi_NN -> mas
   cancelacion). El estado absorbente NO es alcanzable en este esquema: la rama
   de senal del SCM se alimenta de la mascara FUNDIDA, y `m_ref` no depende del
-  lazo, asi que Phi_XX nunca deja de ver la voz. Las defensas costaban iSIR de
+  lazo, asi que Phi_SS nunca deja de ver la voz. Las defensas costaban iSIR de
   entrada a la red sin comprar nada.
   SUSTRACCION DE COVARIANZA Y PROYECCION PSD (`SoudenSubtractCore`): el camino
-  anterior estimaba el target restando, Phi_SS = Phi_XX - Phi_NN, y tenia que
+  anterior estimaba el target restando, Phi_SS - Phi_NN, y tenia que
   proyectar el resultado al cono PSD con un eigh por bin para que la
   normalizacion de Souden no cambiara de signo. Ese eigh era el ~77 % del
   sistema. Aca la mezcla enmascarada entra directo en la formula: PSD por
@@ -104,8 +104,8 @@ LO QUE NO ESTA, Y POR QUE
 ESTADO (lo que hay que llevarse al port; K = 257)
 -------------------------------------------------
                                             M=8 (MIRD)      M=12 (el aro)
-    Num_XX, Num_NN   2 x K x M x M cplx     2 x 263 kB      2 x 592 kB
-    Den_XX, Den_NN   2 x K reales           2 x 2.1 kB      2 x 2.1 kB
+    Num_SS, Num_NN   2 x K x M x M cplx     2 x 263 kB      2 x 592 kB
+    Den_SS, Den_NN   2 x K reales           2 x 2.1 kB      2 x 2.1 kB
     w_hold           K x M cplx             32.9 kB         49.3 kB
     estado LSTM      2 redes x el tensor del tflite
     tracker de iSIR  4 reales
@@ -280,24 +280,26 @@ class SoudenCore:
 
     Dos acumuladores, uno por rama de la mascara, y la formula de Souden:
 
-        Phi_XX = sum a^t m_s x x^H / sum a^t m_s      <- MEZCLA enmascarada por
-                                                         la rama de voz
-        Phi_NN = sum a^t m_n x x^H / sum a^t m_n
-        B      = Phi_NN^-1 Phi_XX
+        Phi_SS = sum a^t m_s x x^H / sum a^t m_s      <- SCM de la rama de voz
+        Phi_NN = sum a^t m_n x x^H / sum a^t m_n      <- SCM de la rama de ruido
+        B      = Phi_NN^-1 Phi_SS
         w      = B e_ref / tr(B)
 
     POR QUE NO SE RESTA (la decision que define este nucleo)
     -------------------------------------------------------
-    Phi_XX no es la covarianza del TARGET sino la de la mezcla enmascarada,
-    Phi_XX ~= Phi_SS + Phi_NN. El camino anterior (`SoudenSubtractCore`)
-    estimaba el target restando, Phi_SS = Phi_XX - Phi_NN, y ese es el origen de
-    TODO el costo del sistema: la resta de dos estimaciones ruidosas sale del
-    cono PSD en el 99.6 % de los bins, lambda_S = tr(Phi_NN^-1 Phi_SS) queda
+    Phi_SS es la MEJOR ESTIMACION DISPONIBLE de la covarianza del target, que no
+    es lo mismo que la covarianza del target: enmascarar es SELECCIONAR celdas
+    tiempo-frecuencia, y en las celdas donde la voz domina el ruido SIGUE
+    ESTANDO, asi que la estimacion arrastra un residuo aditivo,
+    Phi_SS ~= Phi_SS_ideal + Phi_NN. El camino anterior (`SoudenSubtractCore`)
+    le quitaba ese residuo restando, Phi_SS - Phi_NN, y ese es el origen de TODO
+    el costo del sistema: la resta de dos estimaciones ruidosas sale del cono PSD
+    en el 99.6 % de los bins, lambda_S = tr(Phi_NN^-1 (Phi_SS - Phi_NN)) queda
     NEGATIVO en el 27 %, y hay que proyectar con un eigh por bin para que la
     normalizacion signifique algo. Ese eigh era el 81 % del `solve` y el ~77 %
     del sistema entero.
 
-    Sin restar, Phi_XX = sum (pesos >= 0) x x^H es PSD POR CONSTRUCCION:
+    Sin restar, Phi_SS = sum (pesos >= 0) x x^H es PSD POR CONSTRUCCION:
 
       * no hay autovalores negativos -> NO HAY NADA QUE PROYECTAR: se cae el
         eigh, y con el la unica descomposicion espectral del sistema. Queda un
@@ -305,9 +307,13 @@ class SoudenCore:
         decision, sin tolerancias de convergencia, sin autovalores repetidos.
         Para un port a mano eso no es solo mas rapido: es una clase entera de
         bugs que desaparece.
-      * tr(B) = tr(Phi_NN^-1 Phi_SS) + M = lambda_S + M >= M, asi que el
+      * tr(B) = tr(Phi_NN^-1 Phi_SS_ideal) + M = lambda_S + M >= M, asi que el
         denominador NO PUEDE acercarse a cero y el piso `lambda_floor` deja de
-        hacer falta.
+        hacer falta. OJO CON EL ORDEN CAUSAL: el residuo de ruido no se deja
+        adentro de Phi_SS PARA ahorrarse un epsilon --sumar un epsilon es
+        baratisimo--, se deja porque quitarlo cuesta un eigh por bin. Que la
+        indeterminacion de `lambda_floor` desaparezca es una CONSECUENCIA
+        gratuita de esa decision, no su motivo.
       * cuando la estimacion es mala (lambda_S << M) el filtro degrada suave a
         e_ref / M, o sea al mic de referencia atenuado, en vez de explotar.
 
@@ -330,7 +336,7 @@ class SoudenCore:
     la rama de senal nunca se queda sin masa. Ver `souden_mvdr.py` para el
     analisis del colapso en los cores de un solo camino de mascara.
 
-    ESTADO: Num_XX, Num_NN (K, M, M) complejos + Den_XX, Den_NN (K,) reales.
+    ESTADO: Num_SS, Num_NN (K, M, M) complejos + Den_SS, Den_NN (K,) reales.
     Son TODO el presupuesto de memoria del sistema.
     """
 
@@ -344,9 +350,9 @@ class SoudenCore:
         # triangular-triangular y UN lado derecho. Ver `_solve_chol`.
         self.solve_mode = solve_mode
         self.eye = np.eye(self.M)[None, :, :]
-        self.Num_XX = np.zeros((self.K, self.M, self.M), dtype=np.complex128)
+        self.Num_SS = np.zeros((self.K, self.M, self.M), dtype=np.complex128)
         self.Num_NN = np.zeros((self.K, self.M, self.M), dtype=np.complex128)
-        self.Den_XX = np.zeros((self.K, 1, 1), dtype=np.float64)
+        self.Den_SS = np.zeros((self.K, 1, 1), dtype=np.float64)
         self.Den_NN = np.zeros((self.K, 1, 1), dtype=np.float64)
 
     def update(self, X_frame, m_s, m_n):
@@ -357,8 +363,9 @@ class SoudenCore:
         """
         R = np.einsum("fm,fn->fmn", X_frame, X_frame.conj())
         ms, mn = m_s[:, None, None], m_n[:, None, None]
-        self.Num_XX = self.alpha * self.Num_XX + ms * R
-        self.Den_XX = self.alpha * self.Den_XX + ms
+        self.Num_SS = self.alpha * self.Num_SS + ms * R
+        self.Den_SS = self.alpha * self.Den_SS + ms
+        
         self.Num_NN = self.alpha * self.Num_NN + mn * R
         self.Den_NN = self.alpha * self.Den_NN + mn
 
@@ -368,9 +375,9 @@ class SoudenCore:
         un sistema lineal M x M por bin: Phi_NN cargada es hermitiana definida
         positiva, asi que en el port esto es un Cholesky y dos sustituciones.
         """
-        Phi_XX = self.Num_XX / (self.Den_XX + 1e-15)
+        Phi_SS = self.Num_SS / (self.Den_SS + 1e-15)
         Phi_NN = self.Num_NN / (self.Den_NN + 1e-15)
-        Phi_XX = 0.5 * (Phi_XX + np.conj(np.transpose(Phi_XX, (0, 2, 1))))
+        Phi_SS = 0.5 * (Phi_SS + np.conj(np.transpose(Phi_SS, (0, 2, 1))))
         Phi_NN = 0.5 * (Phi_NN + np.conj(np.transpose(Phi_NN, (0, 2, 1))))
 
         # Carga diagonal RELATIVA a la traza: invariante a la escala de entrada.
@@ -384,48 +391,53 @@ class SoudenCore:
         Phi_NN = Phi_NN + self.eye * ((self.min_loading * (tr / self.M))[:, None, None]
                                       + 1e-12)
 
-        if self.solve_mode == "chol":
-            return self._solve_chol(Phi_XX, Phi_NN)
-        B = np.linalg.solve(Phi_NN, Phi_XX)
+        if self.solve_mode in ("chol", "chol_loadnum"):
+            return self._solve_chol(Phi_SS, Phi_NN)
+        B = np.linalg.solve(Phi_NN, Phi_SS)
         # lambda = lambda_S + M >= M por construccion: sin piso, sin sorpresas.
         lam = np.real(np.trace(B, axis1=1, axis2=2))
         return B[:, :, self.ref] / (lam[:, None] + 1e-15)
 
-    def _solve_chol(self, Phi_XX, Phi_NN):
+    def _solve_chol(self, Phi_SS, Phi_NN):
         """
         LA FORMA DEL PORT. Identica a la directa, con 2.3x menos trabajo.
 
-        La forma directa resuelve las M columnas de X = Phi_NN^-1 Phi_XX solo
+        La forma directa resuelve las M columnas de X = Phi_NN^-1 Phi_SS solo
         para sumarle la diagonal y sacar lambda -- y despues usa UNA sola de esas
         columnas para los pesos. Las otras M-1 se calculan y se tiran.
 
-        Con Phi_NN = LB LB^H y Phi_XX = LA LA^H (las dos Cholesky existen: la de
-        Phi_NN porque esta cargada, la de Phi_XX PORQUE NO SE RESTA, ver el
+        Con Phi_NN = LB LB^H y Phi_SS = LA LA^H (las dos Cholesky existen: la de
+        Phi_NN porque esta cargada, la de Phi_SS PORQUE NO SE RESTA, ver el
         docstring de la clase):
 
-            lambda = tr(Phi_NN^-1 Phi_XX) = tr(LA^H Phi_NN^-1 LA)
+            lambda = tr(Phi_NN^-1 Phi_SS) = tr(LA^H Phi_NN^-1 LA)
                    = || LB^-1 LA ||_F^2
 
         o sea una norma de Frobenius sobre una sustitucion triangular con lado
         derecho TRIANGULAR, y los pesos salen de resolver UN solo lado derecho,
-        la columna `ref` de Phi_XX:
+        la columna `ref` de Phi_SS:
 
             actual     chol(B) M^3/6 + M lados derechos M^3   = 1.17 M^3
             esta       chol(B) + chol(A) + tri-tri + 1 RHS    = 0.50 M^3
 
         La equivalencia es exacta (verificado a 4e-16, tests/ofb_solve_variants.py);
         lo unico que las separa es la carga diagonal que hay que ponerle a
-        Phi_XX para que su Cholesky exista siempre -- al arranque Phi_XX tiene
+        Phi_SS para que su Cholesky exista siempre -- al arranque Phi_SS tiene
         rango 1 y no es definida positiva hasta acumular M frames.
         """
         M, ref = self.M, self.ref
-        tr_A = np.real(np.trace(Phi_XX, axis1=1, axis2=2))
-        A = Phi_XX + self.eye * ((self.min_loading * (tr_A / M))[:, None, None] + 1e-30)
+        tr_A = np.real(np.trace(Phi_SS, axis1=1, axis2=2))
+        A = Phi_SS + self.eye * ((self.min_loading * (tr_A / M))[:, None, None] + 1e-30)
         LB = np.linalg.cholesky(Phi_NN)
         LA = np.linalg.cholesky(A)
         Z = _forward_sub(LB, LA)                       # LB Z = LA
         lam = np.real(np.einsum("kij,kij->k", Z.conj(), Z))     # ||Z||_F^2
-        y = _forward_sub(LB, Phi_XX[:, :, ref:ref + 1])
+        # 'chol'         -> numerador con Phi_SS SIN cargar: es lo que preserva
+        #                   la equivalencia exacta con la forma directa (4e-16).
+        # 'chol_loadnum' -> numerador con A (cargada), que es lo que hace el port
+        #                   en C++ por no guardar una copia sin cargar.
+        num = A if self.solve_mode == "chol_loadnum" else Phi_SS
+        y = _forward_sub(LB, num[:, :, ref:ref + 1])
         w = _back_sub(np.conj(np.transpose(LB, (0, 2, 1))), y)  # LB^H w = y
         return w[:, :, 0] / (lam[:, None] + 1e-15)
 
@@ -544,7 +556,7 @@ class OutputFeedbackMVDR:
         self.isir_db, self.c_pf = isir_db, c
         self.w_used = w_used
         return Y
-
+    
     def _mask(self, net, spectrum):
         """La red come la magnitud SIN normalizar del bloque; sale (K,) en [0,1]."""
         m = net.step(np.abs(self.nperseg * spectrum))
