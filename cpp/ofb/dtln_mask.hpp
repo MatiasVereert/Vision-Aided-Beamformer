@@ -16,12 +16,63 @@
 
 namespace ofb{
 
+// La STFT del beamformer y la entrada de la red tienen que ser el mismo numero.
+// Hoy coinciden por casualidad (K = kFft/2+1 = 257 = k_bins); si algun dia tocas
+// kFft, esto avisa al compilar en vez de fallar en silencio.
+static_assert(K == k_bins, "la STFT del beamformer y la entrada del DTLN no coinciden");
+
+
+// =====================================================================
+// Lo que COMPARTEN las dos instancias de la red. Medido:
+//   el TfLiteModel          ahorra  ~95 kB  (el interprete NO copia los pesos:
+//                                            apunta al buffer del flatbuffer)
+//   el weights_cache        ahorra ~530 kB  (XNNPACK REEMPAQUETA los pesos a un
+//                                            formato SIMD, ~540 kB POR interprete)
+// El segundo es el que importa en el A53, con 1 MB de L2.
+// =====================================================================
+class DtlnModel {
+  public:
+    explicit DtlnModel(const char* model_path){
+      model_ = TfLiteModelCreateFromFile(model_path);
+      if (model_ == nullptr)
+        throw std::runtime_error("no se pudo abrir el .tflite");
+      cache_ = TfLiteXNNPackDelegateWeightsCacheCreate();
+      if (cache_ == nullptr)
+        throw std::runtime_error("no se pudo crear el weights cache de XNNPACK");
+    }
+
+    ~DtlnModel(){
+      // OJO: esto tiene que correr DESPUES de que mueran los DtlnMask, porque
+      // sus delegates apuntan al cache. Se consigue solo declarando el DtlnModel
+      // ANTES que los DtlnMask en la clase que los contiene: los miembros se
+      // destruyen en orden INVERSO al de declaracion.
+      TfLiteXNNPackDelegateWeightsCacheDelete(cache_);
+      TfLiteModelDelete(model_);
+    }
+
+    DtlnModel(const DtlnModel&)            = delete;
+    DtlnModel& operator=(const DtlnModel&) = delete;
+
+    TfLiteModel*                        model() const { return model_; }
+    TfLiteXNNPackDelegateWeightsCache*  cache() const { return cache_; }
+
+    // Se llama UNA vez, DESPUES de construir todos los DtlnMask que comparten
+    // este cache. Antes de eso el cache todavia esta recibiendo pesos.
+    void finalize(){
+      if (!TfLiteXNNPackDelegateWeightsCacheFinalizeHard(cache_))
+        throw std::runtime_error("FinalizeHard del weights cache fallo");
+    }
+
+  private:
+    TfLiteModel*                       model_ = nullptr;
+    TfLiteXNNPackDelegateWeightsCache* cache_ = nullptr;
+};
+
 
 class DtlnMask{
  private:
-      // model an intepreter
+      // interprete (el modelo NO es miembro: lo comparte el DtlnModel)
       TfLiteInterpreter* interpreter_m0_ = nullptr;
-      TfLiteModel* model_ = nullptr;
       // delegate
       TfLiteDelegate* xnnpack_delegate_m0_ = nullptr;
       // state
@@ -33,35 +84,29 @@ class DtlnMask{
       const TfLiteTensor* h_m0_state_out_ = nullptr;
       //kissfft config
       kiss_fftr_cfg fftr_cfg_ = nullptr; 
-      kiss_fftr_cfg ifftr_cfg_ = nullptr; 
 
   public: 
 
-    DtlnMask( const char* model_path_0 ){
-      // Load and create  model
-      model_ = TfLiteModelCreateFromFile( model_path_0);
-      if (model_ == nullptr )
-        throw std::runtime_error("no se pudo abrir el .tflite");
+    // Recibe el modelo y el cache YA creados: no es dueno de ninguno de los dos,
+    // y los dos tienen que sobrevivirlo.
+    explicit DtlnMask( const DtlnModel& shared ){
 
       // create Options
       TfLiteInterpreterOptions* options_0 = TfLiteInterpreterOptionsCreate();
 
-      // delegate model 0
+      // delegate model 0, con el cache COMPARTIDO
       TfLiteXNNPackDelegateOptions xnnpack_options = TfLiteXNNPackDelegateOptionsDefault();
-      xnnpack_options.num_threads = 1;
+      xnnpack_options.num_threads   = 1;
+      xnnpack_options.weights_cache = shared.cache();
       xnnpack_delegate_m0_ = TfLiteXNNPackDelegateCreate( &xnnpack_options );
       TfLiteInterpreterOptionsAddDelegate( options_0, xnnpack_delegate_m0_);
-;
 
       // create interpeter and delete options
-      interpreter_m0_ = TfLiteInterpreterCreate(model_, options_0);
+      interpreter_m0_ = TfLiteInterpreterCreate(shared.model(), options_0);
 
       TfLiteInterpreterOptionsDelete(options_0);
       if (interpreter_m0_ == nullptr )
         throw std::runtime_error("TfLiteInterpreterCreate fallo");
-
-      // el interprete ya no necesita el model: se puede borrar aca
-      TfLiteModelDelete(model_);  model_ = nullptr;
 
       // Allocate
       if (TfLiteInterpreterAllocateTensors(interpreter_m0_) != kTfLiteOk )
@@ -72,16 +117,23 @@ class DtlnMask{
       h_m0_mask_out_  = TfLiteInterpreterGetOutputTensor(interpreter_m0_, 0);
       h_m0_state_out_ = TfLiteInterpreterGetOutputTensor(interpreter_m0_, 1);
 
-      // fft config 
-      fftr_cfg_ =  kiss_fftr_alloc( block_len, 0, nullptr, nullptr) ;
-      ifftr_cfg_  = kiss_fftr_alloc( block_len, 1, nullptr, nullptr) ;
+      // fft config: solo la DIRECTA. La inversa no hace falta: esta clase
+      // produce una mascara, no resintetiza audio.
+      fftr_cfg_ = kiss_fftr_alloc( block_len, 0, nullptr, nullptr) ;
+      if (fftr_cfg_ == nullptr)
+        throw std::runtime_error("kiss_fftr_alloc fallo");
     }
 
     ~DtlnMask(){
       // el interprete primero: usa el delegate 
       TfLiteInterpreterDelete(interpreter_m0_);
       TfLiteXNNPackDelegateDelete(xnnpack_delegate_m0_);
+      kiss_fftr_free(fftr_cfg_);          // kiss_fftr_alloc hace malloc
     }
+
+    // Tiene punteros crudos y destructor: copiarla seria doble liberacion.
+    DtlnMask(const DtlnMask&)            = delete;
+    DtlnMask& operator=(const DtlnMask&) = delete;
 
     Frame_mag process_mask( const Frame_real& audio_input);
 
@@ -122,9 +174,3 @@ inline Frame_mag DtlnMask::process_mask(const Frame_real& input_frame){
   };
 
 }
-
-
-
-
-
-
