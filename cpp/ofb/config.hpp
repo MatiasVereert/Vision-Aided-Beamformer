@@ -44,10 +44,15 @@ static_assert(kRefMic >= 0 && kRefMic < M, "ref_mic fuera de rango");
 static_assert(K == kFft / 2 + 1, "K tiene que salir de kFft");
 static_assert(kIsirBinLo <= kIsirBinHi && kIsirBinHi < K,
               "la banda del ISIR tiene que caer dentro de los bins validos");
+//dtln 
+inline constexpr int block_len = 512; 
+inline constexpr int hop_len = 128; 
+inline constexpr int k_bins = 257;
+inline constexpr int k_state = 512;
 
-
-
-
+inline constexpr size_t bytes_mag   = k_bins    * sizeof(float);
+inline constexpr size_t bytes_block = block_len * sizeof(float);
+inline constexpr size_t bytes_state = k_state   * sizeof(float);
 
 
 

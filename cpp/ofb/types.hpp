@@ -15,6 +15,11 @@ using Mat = std::array<Vec, M> ; // (M,M)
 using Frame = std::array<Vec, K> ; //(K, M)
 using Reals = std::array<real_t, K> ; //(K,)
 
+// Single mic 
+using Frame_real= std::array<real_t, block_len>;
+using Frame_complex = std::array<cplx_t, K>;
+using Frame_mag = std::array<real_t, K>;
+
 
 // Helpers 
 constexpr Vec fill_with(real_t v){
