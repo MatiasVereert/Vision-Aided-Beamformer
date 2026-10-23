@@ -9,16 +9,22 @@ namespace ofb {
 
 // Single Bin
 using Vec = std::array<cplx_t, M> ; // (M,1)
+using Vec_real = std::array<real_t, M> ; // (M,1)
 using Mat = std::array<Vec, M> ; // (M,M)
 
 // Multi Bin 
 using Frame = std::array<Vec, K> ; //(K, M)
 using Reals = std::array<real_t, K> ; //(K,)
 
+
+
 // Single mic 
 using Frame_real= std::array<real_t, block_len>;
 using Frame_complex = std::array<cplx_t, K>;
 using Frame_mag = std::array<real_t, K>;
+
+// Real multi mic
+using Frame_real_multi =  std::array<Frame_real, M>; //(M, t)
 
 
 // Helpers 

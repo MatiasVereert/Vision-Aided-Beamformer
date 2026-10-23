@@ -1,12 +1,11 @@
 #pragma once 
 //std
 #include <array>
+#include <algorithm>
 #include <cmath> 
 #include <complex>
 #include <stdexcept>
 //fft
-#include "kiss_fft.h"
-#include "kiss_fftr.h" 
 //
 #include <ofb/config.hpp>
 #include <ofb/types.hpp>
@@ -82,8 +81,6 @@ class DtlnMask{
       TfLiteTensor*       h_m0_state_in_  = nullptr;
       const TfLiteTensor* h_m0_mask_out_  = nullptr;
       const TfLiteTensor* h_m0_state_out_ = nullptr;
-      //kissfft config
-      kiss_fftr_cfg fftr_cfg_ = nullptr; 
 
   public: 
 
@@ -116,26 +113,19 @@ class DtlnMask{
       h_m0_state_in_  = TfLiteInterpreterGetInputTensor (interpreter_m0_, 1);
       h_m0_mask_out_  = TfLiteInterpreterGetOutputTensor(interpreter_m0_, 0);
       h_m0_state_out_ = TfLiteInterpreterGetOutputTensor(interpreter_m0_, 1);
-
-      // fft config: solo la DIRECTA. La inversa no hace falta: esta clase
-      // produce una mascara, no resintetiza audio.
-      fftr_cfg_ = kiss_fftr_alloc( block_len, 0, nullptr, nullptr) ;
-      if (fftr_cfg_ == nullptr)
-        throw std::runtime_error("kiss_fftr_alloc fallo");
     }
 
     ~DtlnMask(){
       // el interprete primero: usa el delegate 
       TfLiteInterpreterDelete(interpreter_m0_);
       TfLiteXNNPackDelegateDelete(xnnpack_delegate_m0_);
-      kiss_fftr_free(fftr_cfg_);          // kiss_fftr_alloc hace malloc
     }
 
     // Tiene punteros crudos y destructor: copiarla seria doble liberacion.
     DtlnMask(const DtlnMask&)            = delete;
     DtlnMask& operator=(const DtlnMask&) = delete;
 
-    Frame_mag process_mask( const Frame_real& audio_input);
+    Frame_mag process_mask( const Frame_complex& audio_input);
 
   };
 
@@ -144,18 +134,14 @@ inline void check(TfLiteStatus s, const char* what){
   if (s != kTfLiteOk) throw std::runtime_error(what);
 }
 
-inline Frame_mag DtlnMask::process_mask(const Frame_real& input_frame){
+inline Frame_mag DtlnMask::process_mask(const Frame_complex& input_frame){
 
-  std::array<kiss_fft_cpx, k_bins> bins{};   // tipo nativo de kissfft: sin reinterpret_cast
   Frame_mag  in_mag{};
   Frame_mag  mask{};
 
-  // ---- FFT real: 512 reales -> 257 complejos. Igual que np.fft.rfft,
-  //      sin normalizar en esta direccion.
-  kiss_fftr(fftr_cfg_, input_frame.data(), bins.data());
 
   for (int k = 0; k < k_bins; ++k)
-    in_mag[k] = std::sqrt(bins[k].r * bins[k].r + bins[k].i * bins[k].i);
+    in_mag[k] = std::sqrt(input_frame[k].real() * input_frame[k].real() + input_frame[k].imag() * input_frame[k].imag());
 
   // ---- modelo 0: (magnitud, estado) -> (mascara, estado')
   check(TfLiteTensorCopyFromBuffer(h_m0_mag_in_,   in_mag.data(),   bytes_mag),
@@ -169,6 +155,10 @@ inline Frame_mag DtlnMask::process_mask(const Frame_real& input_frame){
         "lectura de la mascara (m0)");
   check(TfLiteTensorCopyToBuffer(h_m0_state_out_, state_m0.data(), bytes_state),
         "lectura del estado (m0)");   // <-- la recurrencia: pisa el estado viejo
+
+  // clip in between 0.0 and 1.0
+  for (int k = 0; k < k_bins; ++k)
+    mask[k] = std::clamp(mask[k], 0.0f, 1.0f);
 
   return mask;
   };

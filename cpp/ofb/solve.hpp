@@ -47,6 +47,26 @@ namespace ofb{
         }
       }
 
+  inline Mat hermitian_sym( Mat P ){
+    /**
+        0.5 * (P + P^H), igual que ofb.py. En aritmetica exacta P ya es
+        hermitiana por construccion (suma de x x^H), pero el redondeo de float
+        la desvia y el Cholesky asume hermitiana exacta.
+        OJO: en numpy `0.5*(P + P.conj().T)` crea un array NUEVO; aca es
+        in-place, asi que hay que recorrer SOLO el triangulo superior y escribir
+        los dos lados. El doble bucle completo leeria valores ya modificados.
+    */
+    for (int i = 0; i < M; ++i){
+      for (int j = i + 1; j < M; ++j){
+        const cplx_t s = 0.5f * (P[i][j] + std::conj(P[j][i]));
+        P[i][j] = s;
+        P[j][i] = std::conj(s);
+      }
+      P[i][i] = cplx_t(P[i][i].real(), 0.0f);   // la diagonal es real
+    }
+    return P;
+  }
+
   inline Mat diagonal_load( Mat Cov, real_t rel, real_t abs_floor ){
     /**
         Carga diagonal RELATIVA a la traza, igual que SoudenCore.solve de ofb.py:
@@ -168,18 +188,25 @@ namespace ofb{
     // quedar DESPUES de los helpers: un metodo definido adentro del cuerpo de
     // la clase no ve las funciones libres declaradas mas abajo.
 
-    Mat Phi_SS = Mat_scalar_div( Num_SS[f] , Den_SS[f] );
-    Mat Phi_NN = Mat_scalar_div( Num_NN[f] , Den_NN[f] );
+    // El +1e-15 del denominador es el de ofb.py: al arranque Den puede ser
+    // ~m_scm^8, que es diminuto.
+    Mat Phi_SS = Mat_scalar_div( Num_SS[f] , Den_SS[f] + 1e-15f );
+    Mat Phi_NN = Mat_scalar_div( Num_NN[f] , Den_NN[f] + 1e-15f );
+
+    Phi_SS = hermitian_sym( Phi_SS );
+    Phi_NN = hermitian_sym( Phi_NN );
 
     // Carga diagonal, como en ofb.py. En float32 kMinLoading = 1e-5: el 1e-9 de
     // Python queda POR DEBAJO del epsilon de float y la carga desaparece en el
     // redondeo.
-    Phi_NN = diagonal_load( Phi_NN, kMinLoading, 1e-12f );
-    Phi_SS = diagonal_load( Phi_SS, kMinLoading, 1e-30f );
+    // `A` es una COPIA cargada de Phi_SS: existe solo para que su Cholesky
+    // exista siempre. Phi_SS SIN cargar se sigue necesitando como lado derecho.
+    const Mat A      = diagonal_load( Phi_SS, kMinLoading, 1e-30f );
+    const Mat Phi_NN_load = diagonal_load( Phi_NN, kMinLoading, 1e-12f );
 
     // Cholesky (Phi_NN_inv Phi_SS = L_B_inv L_B_-H L_A L_A_H
-    Mat L_A = Cholesky_bin(Phi_SS);
-    Mat L_B = Cholesky_bin(Phi_NN);
+    Mat L_A = Cholesky_bin(A);
+    Mat L_B = Cholesky_bin(Phi_NN_load);
 
     // Denominator
     // Obtain X = L_B_inv L_A solving L_B X = L_A

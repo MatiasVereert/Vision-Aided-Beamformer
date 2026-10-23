@@ -1,11 +1,10 @@
 #pragma once 
-
 #include <ofb/config.hpp>
 #include <ofb/types.hpp>
 #include <cmath>
 
 namespace ofb{
-
+  
  class isir_tracker{
   public:
     // `m_ref`: la mascara CRUDA de la red sobre el canal de referencia -- sin
