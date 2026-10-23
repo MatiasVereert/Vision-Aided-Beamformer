@@ -126,13 +126,14 @@ class OfbMvdr {
     static_assert(kSharpen == 8.0f, "el desarrollo por cuadrados asume exponente 8");
 
     mvdr_solve_.update( X, m_s, m_n);
+    
     if (t_ % kBlockUpd == 0)
-      for (int f = 0; f < K; f++)
+      for (int f = t_ % kBlockUpd; f < K; f += kBlockUpd)
         weights[f] = mvdr_solve_.solve_bin(f);
     t_++;
 
     // ---- 7. IFFT de la salida ya post-filtrada ------------------------------
-    // Alternativa 3: copio a un buffer del tipo de kissfft en vez de castear.
+    //se copia a un buffer del tipo de kissfft en vez de castear.
     for (int k = 0; k < k_bins; ++k)
       bins[k] = { Y[k].real(), Y[k].imag() };
 
