@@ -26,6 +26,10 @@ using Frame_mag = std::array<real_t, K>;
 // Real multi mic
 using Frame_real_multi =  std::array<Frame_real, M>; //(M, t)
 
+// Un hop: lo que entrega un periodo del DMA
+using Hop_real       = std::array<real_t, hop_len>;  //(hop,)
+using Hop_real_multi = std::array<Hop_real, M>;      //(M, hop)
+
 
 // Helpers 
 constexpr Vec fill_with(real_t v){
