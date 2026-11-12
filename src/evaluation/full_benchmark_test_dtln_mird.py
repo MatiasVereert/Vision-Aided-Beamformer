@@ -24,6 +24,7 @@ from dereverberation.nara_wrappers_fixed import (
 )
 from dereverberation.qrd_wpe_fixed import process_qrd_wpe_online_fixed, QRDFixedPointConfig
 from evaluation.metrics import evaluate_full_pipeline
+from evaluation.nonintrusive import score_nonintrusive, nonintrusive_status, NONINTRUSIVE_KEYS
 from evaluation.bench_ui import BenchmarkUI, compact_config, varying_keys
 
 from evaluation.bf_wrappers import (
@@ -129,7 +130,7 @@ def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, 
         # 3. METRICS
         grp_res = grp.create_group("metrics")
         for k, v in row_data.items():
-            if any(m in k for m in ["PESQ", "STOI", "SDR", "SIR", "SAR", "SINR", "CD"]):
+            if any(m in k for m in ["PESQ", "STOI", "SDR", "SIR", "SAR", "SINR", "CD", "DNSMOS"]):
                 grp_res.attrs[k] = v if not np.isnan(v) else "NaN"
 
         # Infer the correct N_FFT directly from the weights shape (axis 0 is frequency)
@@ -186,7 +187,7 @@ def evaluate_all_references(refs_dict, deg_sig, fs, interf_early, interf_late, t
 def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None, save_catalog=True, apply_dtln_post=True,
                          show_progress=True, quiet_console=True,
                          save_weights_dir=None, save_weights_cells=None,
-                         save_weights_fps=16):
+                         save_weights_fps=16, nonintrusive=False):
     """
     Barrido MIRD. `show_progress`/`quiet_console` SOLO afectan la consola:
       show_progress=False -> sin panel de barras (log plano, util en CI/logs).
@@ -211,6 +212,19 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         sobre-muestrea la dinamica real. Se conservan TODOS los bins de frecuencia
         (a diferencia de `subsample_weights`, que ademas colapsa a tercios de
         octava y serviria solo para los polares).
+
+    METRICAS NO INTRUSIVAS (opcional)
+    ---------------------------------
+    nonintrusive : True agrega DNSMOS P.835 + TorchAudio-SQUIM (ver
+        evaluation/nonintrusive.py) al lado de las intrusivas, con los mismos
+        prefijos (base_/wpe_/proc_/Delta_tot_/Delta_wpe_/Delta_bf_/dtln_alone_/
+        Delta_dtln_alone_/...) y la clave de la metrica SIN sufijo de referencia
+        (no usan ninguna): p.ej. proc_DNSMOS_OVRL, Delta_tot_SQUIM_PESQ. Sirve
+        para validar en simulacion que ordenan los procesadores como las
+        intrusivas antes de usarlas sobre grabaciones reales. Cada senal se
+        recorta a eval_start_s y se normaliza a -26 dBFS RMS (DNSMOS depende del
+        nivel). Si falta una dep/modelo, esas columnas quedan en NaN. False
+        (default) = DataFrame identico al historico.
     """
     os.makedirs(output_dir, exist_ok=True)
     if save_weights_dir is not None:
@@ -334,6 +348,19 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
     use_dtln = interpreter_1 is not None and interpreter_2 is not None
 
+    # Las no-intrusivas se puntuan sobre la MISMA ventana que las intrusivas. La
+    # carga de modelos se hace aca, fuera de ui.quiet(): si falta algo, el aviso
+    # se ve una vez y no queda tragado por el panel (las columnas salen en NaN).
+    def score_ni(x):
+        return score_nonintrusive(x, scene_base_config['fs'], start_s=eval_start_s)
+
+    baseline_ni, wpe_ni, dtln_alone_ni = {}, {}, {}
+    if nonintrusive:
+        _ni_ok = nonintrusive_status()
+        print(f"[*] Metricas no-intrusivas: DNSMOS {'ok' if _ni_ok['dnsmos'] else 'NO DISPONIBLE (NaN)'}"
+              f" / SQUIM {'ok' if _ni_ok['squim'] else 'NO DISPONIBLE (NaN)'} "
+              f"(desde {eval_start_s:.1f} s, -26 dBFS RMS).")
+
     # Dummy dimensions for the Bar-Ilan room to keep HDF5 inspector happy
     mird_room_dims = np.array([6.0, 6.0, 2.41])
     array_center = np.array(scene_base_config['array_center'])
@@ -380,6 +407,13 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             if use_dtln:
                 n_steps += 2
         n_steps += len(processors) * (2 + (2 if (use_dtln and apply_dtln_post) else 0))
+        if nonintrusive:
+            # Una etapa por senal puntuada (baseline/WPE/mono por escena, y cada
+            # salida de procesador / DTLN post).
+            n_steps += (1 if recalc_hardware else 0)
+            if recalc_wpe:
+                n_steps += (1 if exp['use_wpe'] else 0) + (1 if use_dtln else 0)
+            n_steps += len(processors) * (1 + (1 if (use_dtln and apply_dtln_post) else 0))
         ui.begin_experiment(i, compact_config(exp, keep=label_keys), steps=n_steps)
 
         # ---------------------------------------------------------
@@ -572,6 +606,10 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                     target_late=scene_data["target_late"][ref_ch],
                     eval_start_s=eval_start_s, prefix_name=f"Baseline_Exp_{i}"
                 )
+            if nonintrusive:
+                ui.stage("[NODE 3] metricas no-intrusivas del baseline (DNSMOS / SQUIM)")
+                with ui.quiet():
+                    baseline_ni = score_ni(mic_signals_degraded[ref_ch])
 
         # ---------------------------------------------------------
         # NODE 4: WPE PRE-PROCESSING
@@ -764,10 +802,16 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                         target_late=scene_data["target_late"][ref_ch],
                         eval_start_s=eval_start_s, prefix_name=f"WPE_Exp_{i}"
                     )
+                if nonintrusive:
+                    ui.stage("[NODE 4] metricas no-intrusivas del WPE (DNSMOS / SQUIM)")
+                    with ui.quiet():
+                        wpe_ni = score_ni(mic_signals_ready[ref_ch])
             else:
                 ui.stage("[NODE 4] WPE desactivado (bypass)")
                 mic_signals_ready = mic_signals_degraded.copy()
                 wpe_metrics = baseline_metrics.copy()
+                # Misma senal que el baseline: no se vuelve a puntuar.
+                wpe_ni = baseline_ni.copy()
                 # Sin WPE: las refs del oracle son las componentes POST-HW (mismo
                 # dominio que mic_signals_ready = mezcla degradada sin WPE).
                 oracle_target, oracle_noise = hw_oracle_target, hw_oracle_noise
@@ -805,6 +849,10 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                         target_late=scene_data["target_late"][ref_ch],
                         eval_start_s=eval_start_s, prefix_name=f"DTLN_Alone_Exp_{i}"
                     )
+                if nonintrusive:
+                    ui.stage("[NODE 4.5] metricas no-intrusivas DTLN mono (DNSMOS / SQUIM)")
+                    with ui.quiet():
+                        dtln_alone_ni = score_ni(audio_dtln_alone)
         else:
             ui.stage("[CACHE] reusando WPE + DTLN mono de la prueba anterior", advance=False)
 
@@ -882,6 +930,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                     target_late=scene_data["target_late"][ref_ch],
                     eval_start_s=eval_start_s, prefix_name=f"Proc_{proc_name}_Exp_{i}"
                 )
+            proc_ni = {}
+            if nonintrusive:
+                ui.stage(f"[BF {p_idx+1}/{len(processors)}] {proc_name}: metricas no-intrusivas")
+                with ui.quiet():
+                    proc_ni = score_ni(y_processed)
 
             # ---------------------------------------------------------
             # NODE 6: POST-BEAMFORMING DTLN
@@ -907,6 +960,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                         target_late=scene_data["target_late"][ref_ch],
                         eval_start_s=eval_start_s, prefix_name=f"DTLN_Post_{proc_name}_Exp_{i}"
                     )
+            dtln_post_ni = {}
+            if nonintrusive and y_post_dtln is not None:
+                ui.stage(f"[NODE 6] metricas no-intrusivas DTLN post {proc_name}")
+                with ui.quiet():
+                    dtln_post_ni = score_ni(y_post_dtln)
 
             # Compile Dataset Row
             row_data = {
@@ -965,6 +1023,35 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                     if use_dtln:
                         dtln_alone_val = dtln_alone_metrics.get(key, np.nan)
                         dtln_post_val = dtln_post_metrics.get(key, np.nan)
+
+                        row_data[f"dtln_alone_{key}"] = dtln_alone_val
+                        row_data[f"dtln_post_{key}"] = dtln_post_val
+
+                        row_data[f"Delta_dtln_alone_{key}"] = dtln_alone_val - wpe_val
+                        row_data[f"Delta_dtln_post_{key}"] = dtln_post_val - proc_val
+                        row_data[f"Delta_tot_pipeline_{key}"] = dtln_post_val - base_val
+
+            # --- NO INTRUSIVAS: mismos prefijos/deltas, sin sufijo de referencia ---
+            # Van aparte del lazo de arriba (que filtra por *_{ref_name}) y NO entran
+            # en delta_tot_metrics: el leaderboard del catalogo H5 sigue anclado a las
+            # intrusivas 'early'. Se escriben TODAS las claves (NaN si no hay modelo)
+            # para que el esquema de columnas no dependa del entorno.
+            if nonintrusive:
+                for key in NONINTRUSIVE_KEYS:
+                    base_val = baseline_ni.get(key, np.nan)
+                    wpe_val = wpe_ni.get(key, np.nan)
+                    proc_val = proc_ni.get(key, np.nan)
+
+                    row_data[f"base_{key}"] = base_val
+                    row_data[f"wpe_{key}"] = wpe_val
+                    row_data[f"proc_{key}"] = proc_val
+                    row_data[f"Delta_tot_{key}"] = proc_val - base_val
+                    row_data[f"Delta_wpe_{key}"] = wpe_val - base_val
+                    row_data[f"Delta_bf_{key}"] = proc_val - wpe_val
+
+                    if use_dtln:
+                        dtln_alone_val = dtln_alone_ni.get(key, np.nan)
+                        dtln_post_val = dtln_post_ni.get(key, np.nan)
 
                         row_data[f"dtln_alone_{key}"] = dtln_alone_val
                         row_data[f"dtln_post_{key}"] = dtln_post_val

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/test_ofb.dir/tests/test_ofb.cpp.o -o test_ofb  -Wl,-rpath,/home/matias/src/tflite_build libkissfft.a /home/matias/src/tflite_build/libtensorflowlite_c.so 

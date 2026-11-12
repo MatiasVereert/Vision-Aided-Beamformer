@@ -37,6 +37,9 @@ DNSMOS_P808 = os.path.join(DNSMOS_DIR, "model_v8.onnx")
 
 # Flags para imprimir el aviso de "falta instalar" una sola vez
 _warned = {"dnsmos": False, "squim": False}
+# Familias cuya carga ya fallo: no se reintenta en cada senal (p.ej. una descarga
+# de pesos de SQUIM sin red se repetiria en cada llamada).
+_unavailable = set()
 
 
 def _warn_once(key, msg):
@@ -125,18 +128,33 @@ class _DNSMOS:
         }
 
 
-def compute_dnsmos(x, fs):
-    """Devuelve dict con DNSMOS_SIG/BAK/OVRL/P808 (o {} si no esta disponible)."""
+def _dnsmos_model():
+    """Instancia (cacheada) de DNSMOS, o None si faltan modelos/deps (avisa una vez)."""
     if not (os.path.isfile(DNSMOS_PRIMARY) and os.path.isfile(DNSMOS_P808)):
         _warn_once("dnsmos",
                    f"[metricas] DNSMOS deshabilitado: faltan modelos ONNX en {DNSMOS_DIR}\n"
                    f"           (sig_bak_ovr.onnx y model_v8.onnx del repo Microsoft DNS-Challenge/DNSMOS).")
-        return {}
+        return None
+    if "dnsmos" in _unavailable:
+        return None
     try:
-        return _DNSMOS.get()(_to_16k_mono(x, fs))
+        import librosa  # noqa: F401  (la usa _melspec; se chequea aca para no fallar a mitad)
+        return _DNSMOS.get()
     except ImportError:
         _warn_once("dnsmos", "[metricas] DNSMOS deshabilitado: falta `onnxruntime` y/o `librosa` (pip install onnxruntime librosa).")
+    except Exception as e:
+        _warn_once("dnsmos", f"[metricas] DNSMOS fallo: {e}")
+    _unavailable.add("dnsmos")
+    return None
+
+
+def compute_dnsmos(x, fs):
+    """Devuelve dict con DNSMOS_SIG/BAK/OVRL/P808 (o {} si no esta disponible)."""
+    model = _dnsmos_model()
+    if model is None:
         return {}
+    try:
+        return model(_to_16k_mono(x, fs))
     except Exception as e:
         _warn_once("dnsmos", f"[metricas] DNSMOS fallo: {e}")
         return {}
@@ -157,19 +175,28 @@ class _SQUIM:
         return cls._model
 
 
+def _squim_model():
+    """Modelo SQUIM (cacheado), o None si falta torchaudio/los pesos (avisa una vez)."""
+    if "squim" in _unavailable:
+        return None
+    try:
+        import torch  # noqa: F401
+        return _SQUIM.get()
+    except ImportError:
+        _warn_once("squim", "[metricas] SQUIM deshabilitado: falta `torchaudio` (instalar la version que matchee tu torch).")
+    except Exception as e:
+        _warn_once("squim", f"[metricas] SQUIM no disponible: {e}")
+    _unavailable.add("squim")
+    return None
+
+
 def compute_squim(x, fs, chunk_s=10.0):
     """
     Devuelve dict con SQUIM_STOI/PESQ/SISDR (estimados, sin referencia).
     Procesa en ventanas de chunk_s y promedia para robustez/memoria.
     """
-    try:
-        import torch
-        model = _SQUIM.get()
-    except ImportError:
-        _warn_once("squim", "[metricas] SQUIM deshabilitado: falta `torchaudio` (instalar la version que matchee tu torch).")
-        return {}
-    except Exception as e:
-        _warn_once("squim", f"[metricas] SQUIM no disponible: {e}")
+    model = _squim_model()
+    if model is None:
         return {}
 
     try:
@@ -206,6 +233,43 @@ def compute_nonintrusive(x, fs):
     out.update(compute_dnsmos(x, fs))
     out.update(compute_squim(x, fs))
     return out
+
+
+def nonintrusive_status():
+    """
+    Carga (una sola vez) los modelos y devuelve {'dnsmos': bool, 'squim': bool}.
+    Conviene llamarla al arrancar una corrida y FUERA de cualquier bloque que
+    silencie stdout: los avisos de "falta instalar X" salen una sola vez, asi
+    que si se disparan dentro de un ui.quiet() se pierden y las columnas quedan
+    en NaN sin explicacion. De paso saca la carga de los modelos de la 1a celda.
+    """
+    return {"dnsmos": _dnsmos_model() is not None, "squim": _squim_model() is not None}
+
+
+# =============================================================================
+# Preproceso comun: ventana de evaluacion + nivel
+# =============================================================================
+# Nivel al que se lleva cada senal antes de puntuar. DNSMOS depende del nivel y
+# las salidas del simulador estan a escala fisica (cada procesador con su propia
+# ganancia): sin normalizar, la comparacion mezclaria ganancia con calidad.
+TARGET_DBFS = -26.0
+
+
+def prepare_nonintrusive(x, fs, start_s=0.0, target_dbfs=TARGET_DBFS):
+    """
+    Recorta los primeros `start_s` segundos (la misma ventana que ignoran las
+    metricas intrusivas: transitorios de convergencia) y normaliza a
+    `target_dbfs` RMS. Devuelve float64 1-D.
+    """
+    x = np.asarray(x, dtype=np.float64).squeeze()
+    x = x[int(start_s * fs):]
+    rms = np.sqrt(np.mean(x ** 2))
+    return x * (10 ** (target_dbfs / 20) / max(rms, 1e-12))
+
+
+def score_nonintrusive(x, fs, start_s=0.0, target_dbfs=TARGET_DBFS):
+    """prepare_nonintrusive + compute_nonintrusive (claves ausentes si no disponibles)."""
+    return compute_nonintrusive(prepare_nonintrusive(x, fs, start_s, target_dbfs), fs)
 
 
 # Claves en orden de reporte (para armar tablas/CSV de forma estable)

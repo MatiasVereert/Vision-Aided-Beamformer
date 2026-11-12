@@ -35,7 +35,27 @@ target_compile_options(ofb_warnings INTERFACE -Wall -Wextra)
 # --- tools/: produce algo que MIRAS ----------------------------------------
 add_executable(ofb_offline tools/ofb_offline.cpp)
 target_include_directories(ofb_offline PRIVATE .)
-target_link_libraries(ofb_offline PRIVATE ofb_warnings)
+target_link_libraries(ofb_offline PRIVATE kissfft tflite_c ofb_warnings)
+# P (kBlockUpd) del ejecutable: -DOFB_BLOCK_UPD=2 para la Kria. Solo llega a
+# ofb_offline: los tests de paridad se compilan siempre con el default (1).
+set(OFB_BLOCK_UPD 1 CACHE STRING "P de ofb_offline: cada bin se recalcula cada P frames")
+# El desglose por etapa SOLO aca: los tests y el codigo de produccion no ven
+# la macro.
+target_compile_definitions(ofb_offline PRIVATE OFB_PROFILE OFB_BLOCK_UPD=${OFB_BLOCK_UPD})
+# $ORIGIN: en la Kria la .so va en la misma carpeta que el ejecutable.
+set_target_properties(ofb_offline PROPERTIES BUILD_RPATH "${TFLITE_BUILD};\$ORIGIN")
+
+# --- capi/: OfbMvdr para ctypes (la replica de la GUI, mic-array-platform) --
+# Su P es el de la KRIA, no el de ofb_offline: la replica tiene que hacer la
+# misma cuenta que pdm_server_ofb (bitacora 32.7).
+set(OFB_CAPI_BLOCK_UPD 2 CACHE STRING "P de libofb_capi (el de la Kria)")
+add_library(ofb_capi SHARED capi/ofb_capi.cpp)
+target_include_directories(ofb_capi PRIVATE .)
+target_link_libraries(ofb_capi PRIVATE kissfft tflite_c ofb_warnings)
+target_compile_definitions(ofb_capi PRIVATE OFB_BLOCK_UPD=${OFB_CAPI_BLOCK_UPD})
+set_target_properties(ofb_capi PROPERTIES BUILD_RPATH "${TFLITE_BUILD}"
+                                          POSITION_INDEPENDENT_CODE ON)
+set_target_properties(kissfft PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # --- tests/: producen un VEREDICTO (exit 0 / 1) ----------------------------
 # test_core no necesita NI TFLite NI KissFFT: solve.hpp es aritmetica pura.

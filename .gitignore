@@ -5,6 +5,7 @@ __pycache__/
 
 # Build artifacts (generados por pip/setuptools)
 build/
+build-aarch64/
 dist/
 *.egg-info/
 

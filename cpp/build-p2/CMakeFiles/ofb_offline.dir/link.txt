@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/ofb_offline.dir/tools/ofb_offline.cpp.o -o ofb_offline  -Wl,-rpath,"/home/matias/src/tflite_build:\$ORIGIN" libkissfft.a /home/matias/src/tflite_build/libtensorflowlite_c.so 

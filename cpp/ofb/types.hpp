@@ -12,6 +12,13 @@ using Vec = std::array<cplx_t, M> ; // (M,1)
 using Vec_real = std::array<real_t, M> ; // (M,1)
 using Mat = std::array<Vec, M> ; // (M,M)
 
+// Matriz HERMITIANA guardada como su triangulo INFERIOR empaquetado por filas:
+// (i, j) con j <= i va en tri(i, j). El de arriba es conj del de abajo, asi
+// que guardarlo es duplicar memoria y cuenta. 78 complejos con M=12, no 144.
+inline constexpr int kTri = M * (M + 1) / 2;
+using TriMat = std::array<cplx_t, kTri>;
+constexpr int tri(int i, int j){ return i * (i + 1) / 2 + j; }
+
 // Multi Bin 
 using Frame = std::array<Vec, K> ; //(K, M)
 using Reals = std::array<real_t, K> ; //(K,)
@@ -47,15 +54,5 @@ constexpr Reals fill_reals(real_t v){
   return a;
 }
 
-
-inline constexpr Mat Mat_scalar_div( Mat R, real_t scalar){
-  real_t scalar_inv = 1 / scalar; 
-  for (int i = 0; i<M; i++){
-    for (int j = 0; j<M; j++){
-      R[i][j] = scalar_inv *  R[i][j]; 
-    }
-  }
-  return R;
-}
 
 }// ofb namespace

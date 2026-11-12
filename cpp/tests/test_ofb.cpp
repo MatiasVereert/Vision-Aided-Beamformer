@@ -10,6 +10,11 @@
 #include <string>
 #include <vector>
 
+// La referencia sale de ofb.py, que con P > 1 hace otra cosa que el C++ (todos
+// los bins cada P frames contra el solve ciclico): solo con P = 1 es la misma
+// cuenta. Si llega un -DOFB_BLOCK_UPD por los flags globales, mejor saberlo aca.
+static_assert(ofb::kBlockUpd == 1, "test_ofb solo vale con OFB_BLOCK_UPD=1");
+
 static bool leer(const std::string& p, void* dst, size_t bytes){
   std::ifstream f(p, std::ios::binary);
   if (!f) { std::printf("no pude abrir %s\n", p.c_str()); return false; }

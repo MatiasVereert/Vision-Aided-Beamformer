@@ -16,7 +16,16 @@ using cplx_t = std::complex<real_t>;
 inline constexpr real_t kAlpha      = 0.99f;
 inline constexpr real_t kMinLoading = 1e-5f;  // OJO: 1e-9 desaparece en float
 inline constexpr real_t kSharpen    = 8.0f;
-inline constexpr int    kBlockUpd   = 1;      // P
+
+// P: cada bin se recalcula cada P frames (solve ciclico, K/P solves por frame).
+// Se fija al COMPILAR con -DOFB_BLOCK_UPD=<P>, sin tocar este archivo: la Kria
+// usa 2 (medido: hop de 6.9 -> 4.2 ms, mismo DNSMOS). El default es 1 porque es
+// el unico valor en el que el C++ coincide con ofb.py -- con P > 1 Python
+// recalcula TODOS los bins cada P frames -- y test_ofb lo exige.
+#ifndef OFB_BLOCK_UPD
+#define OFB_BLOCK_UPD 1
+#endif
+inline constexpr int    kBlockUpd   = OFB_BLOCK_UPD;
 
 // --- ISIRTracker + agenda del post-filtro (Fase 2) -------------------------
 // ISIR_BAND_HZ de ofb.py = 300-3400 Hz. Los limites de bin se resuelven en
@@ -41,6 +50,7 @@ inline constexpr real_t kIsirCenter  = 2.2f;
 inline constexpr real_t kIsirWidth   = 3.5f;
 
 static_assert(kRefMic >= 0 && kRefMic < M, "ref_mic fuera de rango");
+static_assert(kBlockUpd >= 1 && kBlockUpd <= K, "OFB_BLOCK_UPD tiene que estar en [1, K]");
 static_assert(K == kFft / 2 + 1, "K tiene que salir de kFft");
 static_assert(kIsirBinLo <= kIsirBinHi && kIsirBinHi < K,
               "la banda del ISIR tiene que caer dentro de los bins validos");

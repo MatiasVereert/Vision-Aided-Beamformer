@@ -13,10 +13,19 @@ namespace ofb{
                   const Reals& m_s,
                   const Reals& m_n);
       Vec solve_bin( int f ) const;
-      
+
+      // Solo lectura, para la GUI: Phi = Num / Den (sin carga diagonal).
+      const std::array<TriMat, K>& num_ss() const { return Num_SS; }
+      const std::array<TriMat, K>& num_nn() const { return Num_NN; }
+      const Reals& den_ss() const { return Den_SS; }
+      const Reals& den_nn() const { return Den_NN; }
+
     private:
-        std::array<Mat, K> Num_SS{}; //signal cov ( K, M , M) Complex 
-        std::array<Mat, K> Num_NN{}; //noise cov 
+        // (K, M, M) complejas, pero solo el triangulo inferior (ver TriMat):
+        // 2 x 257 x 78 x 8 B = 321 kB en vez de 592 kB, que con el weights
+        // cache de XNNPACK (~540 kB) se disputan el MB de L2 del A53.
+        std::array<TriMat, K> Num_SS{}; //signal cov
+        std::array<TriMat, K> Num_NN{}; //noise cov
         Reals Den_SS{0};
         Reals Den_NN{0};
         // Los pesos NO viven aca: un solo Vec es el estado equivocado (guarda un
@@ -32,14 +41,17 @@ namespace ofb{
         //updates all bins per call
         for (int f = 0 ; f<K; f++){
           cplx_t Phi_XX_element{};
-        
+
+          // Solo c <= r: el recorrido por filas cae justo en el orden de tri(),
+          // asi que el indice empaquetado es un contador.
+          int p = 0;
           for (int r=0; r<M; r++ ){
-            for (int c=0; c<M; c++ ){
+            for (int c=0; c<=r; c++, p++ ){
               // Inst. Cov Matrix
               Phi_XX_element = X_frame[f][r] * std::conj(X_frame[f][c]);
-              
-              Num_SS[f][r][c] = kAlpha * Num_SS[f][r][c] + Phi_XX_element * m_s[f];
-              Num_NN[f][r][c] = kAlpha * Num_NN[f][r][c] + Phi_XX_element * m_n[f];
+
+              Num_SS[f][p] = kAlpha * Num_SS[f][p] + Phi_XX_element * m_s[f];
+              Num_NN[f][p] = kAlpha * Num_NN[f][p] + Phi_XX_element * m_n[f];
             }
           }
           Den_SS[f] = kAlpha *  Den_SS[f] + m_s[f];
@@ -47,44 +59,58 @@ namespace ofb{
         }
       }
 
-  inline Mat hermitian_sym( Mat P ){
+  inline Mat unpack_load( const TriMat& Num, real_t Den,
+                          real_t rel, real_t abs_floor ){
     /**
-        0.5 * (P + P^H), igual que ofb.py. En aritmetica exacta P ya es
-        hermitiana por construccion (suma de x x^H), pero el redondeo de float
-        la desvia y el Cholesky asume hermitiana exacta.
-        OJO: en numpy `0.5*(P + P.conj().T)` crea un array NUEVO; aca es
-        in-place, asi que hay que recorrer SOLO el triangulo superior y escribir
-        los dos lados. El doble bucle completo leeria valores ya modificados.
-    */
-    for (int i = 0; i < M; ++i){
-      for (int j = i + 1; j < M; ++j){
-        const cplx_t s = 0.5f * (P[i][j] + std::conj(P[j][i]));
-        P[i][j] = s;
-        P[j][i] = std::conj(s);
-      }
-      P[i][i] = cplx_t(P[i][i].real(), 0.0f);   // la diagonal es real
-    }
-    return P;
-  }
+        Phi = Num / Den, desempaquetada al triangulo INFERIOR de una Mat (el de
+        arriba queda en cero: Cholesky_bin solo lee j <= i), con la carga
+        diagonal ya sumada.
 
-  inline Mat diagonal_load( Mat Cov, real_t rel, real_t abs_floor ){
-    /**
+        Hermitiana EXACTA por construccion: se guarda un solo triangulo, asi que
+        no hay dos mitades que el redondeo pueda desviar y el 0.5*(P + P^H) de
+        ofb.py no tiene nada que corregir. Solo queda forzar la diagonal real.
+
         Carga diagonal RELATIVA a la traza, igual que SoudenCore.solve de ofb.py:
         invariante a la escala de la entrada. Es lo que garantiza que las DOS
         Cholesky existan siempre -- la de Phi_NN por definida positiva, y la de
         Phi_SS porque al arranque tiene rango 1 y no lo es hasta acumular M
         frames. Con esto la rama `else` de Cholesky_bin es inalcanzable.
     */
+    const real_t inv = 1 / Den;
+    Mat P{};
     real_t tr = 0;
-    for (int i = 0; i < M; i++) tr += Cov[i][i].real();
+    for (int i = 0; i < M; i++){
+      for (int j = 0; j < i; j++)
+        P[i][j] = inv * Num[tri(i, j)];
+      const real_t d = (inv * Num[tri(i, i)]).real();
+      P[i][i] = cplx_t(d, 0.0f);
+      tr += d;
+    }
     const real_t add = rel * (tr / M) + abs_floor;
-    for (int i = 0; i < M; i++) Cov[i][i] += cplx_t(add, 0);
-    return Cov;
+    for (int i = 0; i < M; i++) P[i][i] += cplx_t(add, 0);
+    return P;
+  }
+
+  inline Vec column_ref( const TriMat& Num, real_t Den ){
+    /**
+        Phi e_ref = la columna kRefMic de Num / Den, SIN carga: es el lado
+        derecho del numerador. Por encima de la diagonal no esta guardada y sale
+        de la fila kRefMic conjugada: Phi[i][ref] = conj(Phi[ref][i]).
+    */
+    const real_t inv = 1 / Den;
+    Vec c{};
+    for (int i = 0; i < M; i++){
+      if      (i > kRefMic) c[i] = inv * Num[tri(i, kRefMic)];
+      else if (i < kRefMic) c[i] = std::conj(inv * Num[tri(kRefMic, i)]);
+      else                  c[i] = cplx_t((inv * Num[tri(i, i)]).real(), 0.0f);
+    }
+    return c;
   }
 
   inline Mat Cholesky_bin( const Mat& Cov){
-    /** 
+    /**
         Solves Cholesky decomposition and returns de lower triangular component.
+        Solo lee el triangulo inferior de Cov (j <= i).
     */
     Mat L{};
     real_t minus_d{};
@@ -155,18 +181,16 @@ namespace ofb{
     return acc;
   }
 
-  inline Vec Forward_solve_Vec_bin(const Mat& L_B, const Mat& Phi_SS ){
+  inline Vec Forward_solve_Vec_bin(const Mat& L_B, const Vec& c ){
     Vec y_bin{};
-    
+
     for (int i= 0; i<M; i++){
       const real_t L_ii_inv = 1.0f / L_B[i][i].real();
-      cplx_t acc =0; 
+      cplx_t acc =0;
       for (int k = 0; k< i; k++){
         acc += L_B[i][k] * y_bin[k];
       }
-      // [i][kRefMic], NO [i, kRefMic]: eso es el operador coma y evalua a
-      // kRefMic, o sea indexa la FILA kRefMic.
-      y_bin[i] = L_ii_inv * (Phi_SS[i][kRefMic] - acc );
+      y_bin[i] = L_ii_inv * (c[i] - acc );
     }
     return y_bin;
   }
@@ -190,19 +214,18 @@ namespace ofb{
 
     // El +1e-15 del denominador es el de ofb.py: al arranque Den puede ser
     // ~m_scm^8, que es diminuto.
-    Mat Phi_SS = Mat_scalar_div( Num_SS[f] , Den_SS[f] + 1e-15f );
-    Mat Phi_NN = Mat_scalar_div( Num_NN[f] , Den_NN[f] + 1e-15f );
-
-    Phi_SS = hermitian_sym( Phi_SS );
-    Phi_NN = hermitian_sym( Phi_NN );
+    const real_t den_ss = Den_SS[f] + 1e-15f;
+    const real_t den_nn = Den_NN[f] + 1e-15f;
 
     // Carga diagonal, como en ofb.py. En float32 kMinLoading = 1e-5: el 1e-9 de
     // Python queda POR DEBAJO del epsilon de float y la carga desaparece en el
     // redondeo.
-    // `A` es una COPIA cargada de Phi_SS: existe solo para que su Cholesky
-    // exista siempre. Phi_SS SIN cargar se sigue necesitando como lado derecho.
-    const Mat A      = diagonal_load( Phi_SS, kMinLoading, 1e-30f );
-    const Mat Phi_NN_load = diagonal_load( Phi_NN, kMinLoading, 1e-12f );
+    // `A` es Phi_SS CARGADA: existe solo para que su Cholesky exista siempre.
+    // Phi_SS SIN cargar se sigue necesitando, pero solo su columna kRefMic
+    // como lado derecho (column_ref).
+    const Mat A           = unpack_load( Num_SS[f], den_ss, kMinLoading, 1e-30f );
+    const Mat Phi_NN_load = unpack_load( Num_NN[f], den_nn, kMinLoading, 1e-12f );
+    const Vec c           = column_ref ( Num_SS[f], den_ss );
 
     // Cholesky (Phi_NN_inv Phi_SS = L_B_inv L_B_-H L_A L_A_H
     Mat L_A = Cholesky_bin(A);
@@ -219,7 +242,7 @@ namespace ofb{
 
     // Nominator
     // Solve LB y = c  con c = Phi_ss.e_ref
-    Vec y = Forward_solve_Vec_bin(L_B, Phi_SS );
+    Vec y = Forward_solve_Vec_bin(L_B, c );
     // Solve LB_H w_nom = y
     Vec w_nom = Backward_solve_Vec_bin(L_B, y );
 

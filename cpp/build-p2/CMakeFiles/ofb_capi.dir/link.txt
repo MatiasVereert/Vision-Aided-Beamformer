@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libofb_capi.so -o libofb_capi.so CMakeFiles/ofb_capi.dir/capi/ofb_capi.cpp.o  -Wl,-rpath,/home/matias/src/tflite_build libkissfft.a /home/matias/src/tflite_build/libtensorflowlite_c.so 

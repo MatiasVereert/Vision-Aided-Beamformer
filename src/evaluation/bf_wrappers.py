@@ -3461,3 +3461,35 @@ class OFB_MVDR:
         # de borde que aparecen cuando el filtro cambia frame a frame.
         y_time = ola_taper(Y_stft, nperseg, hop, 'hann', mic_signals.shape[1])
         return y_time, weights
+
+
+class DTLN_MONO:
+    """
+    DTLN mono sobre el mic de referencia como un procesador mas, con el par de
+    modelos que se le pase. Es la MISMA funcion que usa el motor para las
+    columnas dtln_alone_* (`apply_dtln_post_tflite_realtime`), pero esas salen
+    siempre de los interpretes del motor: esto sirve para tener un segundo mono
+    con otros modelos en la misma corrida (p.ej. el int8 junto al float).
+
+    Los estados LSTM arrancan en cero en cada llamada, asi que reusar los
+    interpretes entre celdas no arrastra nada.
+    """
+
+    def __init__(self, model1_path, model2_path):
+        self.model1_path = model1_path
+        self.model2_path = model2_path
+        self._itp = None
+
+    def process(self, mic_signals: np.ndarray, scene_config: dict) -> tuple:
+        from dnn_denoise.dtln_lite import apply_dtln_post_tflite_realtime
+        if self._itp is None:
+            from ai_edge_litert.interpreter import Interpreter
+            self._itp = []
+            for p in (self.model1_path, self.model2_path):
+                itp = Interpreter(model_path=p)
+                itp.allocate_tensors()
+                self._itp.append(itp)
+        ref = int(scene_config.get('ref_mic_idx', mic_signals.shape[0] // 2))
+        y = apply_dtln_post_tflite_realtime(self._itp[0], self._itp[1],
+                                            mic_signals[ref])
+        return y, None
