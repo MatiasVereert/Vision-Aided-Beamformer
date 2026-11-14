@@ -49,10 +49,14 @@ set_target_properties(ofb_offline PROPERTIES BUILD_RPATH "${TFLITE_BUILD};\$ORIG
 # Su P es el de la KRIA, no el de ofb_offline: la replica tiene que hacer la
 # misma cuenta que pdm_server_ofb (bitacora 32.7).
 set(OFB_CAPI_BLOCK_UPD 2 CACHE STRING "P de libofb_capi (el de la Kria)")
+# M de la replica: el MISMO que el de pdm_server_ofb (build_server_ofb.sh M=...).
+# Un build por M: -B build-m10 -DOFB_CAPI_M=10.
+set(OFB_CAPI_M 12 CACHE STRING "M de libofb_capi (microfonos que entran al OFB)")
 add_library(ofb_capi SHARED capi/ofb_capi.cpp)
 target_include_directories(ofb_capi PRIVATE .)
 target_link_libraries(ofb_capi PRIVATE kissfft tflite_c ofb_warnings)
-target_compile_definitions(ofb_capi PRIVATE OFB_BLOCK_UPD=${OFB_CAPI_BLOCK_UPD})
+target_compile_definitions(ofb_capi PRIVATE OFB_BLOCK_UPD=${OFB_CAPI_BLOCK_UPD}
+                                            OFB_M=${OFB_CAPI_M})
 set_target_properties(ofb_capi PROPERTIES BUILD_RPATH "${TFLITE_BUILD}"
                                           POSITION_INDEPENDENT_CODE ON)
 set_target_properties(kissfft PROPERTIES POSITION_INDEPENDENT_CODE ON)

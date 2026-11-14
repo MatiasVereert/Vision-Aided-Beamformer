@@ -3,7 +3,13 @@
 
 namespace ofb {
 
-inline constexpr int M = 12;              // M  <-- cambiar y recompilar
+// M se fija al COMPILAR con -DOFB_M=<M>, como el P de abajo. 10 = el aro de 12
+// con dos capsulas anuladas (mic-array-platform, bitacora 34): quien llama elige
+// QUE canales entran. kRefMic = M/2 es un indice en ESA seleccion.
+#ifndef OFB_M
+#define OFB_M 12
+#endif
+inline constexpr int M = OFB_M;
 inline constexpr int kFft  = 512;
 inline constexpr int K = kFft / 2 + 1;    // 257
 inline constexpr int kHop  = 128;

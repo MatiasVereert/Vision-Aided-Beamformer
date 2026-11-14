@@ -314,7 +314,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     }
     all_metrics_results = []
 
-    master_h5 = os.path.join(output_dir, "mird_benchmark_catalog.h5")
+    # Prefijo de los archivos de salida. Configurable para que un dataset
+    # distinto (p.ej. las RIRs medidas con el arreglo de la Kria, ver
+    # propagation/kria_rir_loader.py) no sobreescriba los resultados del MIRD.
+    out_prefix = scene_base_config.get('out_prefix', 'mird')
+    master_h5 = os.path.join(output_dir, f"{out_prefix}_benchmark_catalog.h5")
 
     # --- CASCADING STATE VARIABLES ---
     current_rt60, current_target_dist, current_target_angle, current_interf_configs = None, None, None, None
@@ -362,7 +366,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
               f"(desde {eval_start_s:.1f} s, -26 dBFS RMS).")
 
     # Dummy dimensions for the Bar-Ilan room to keep HDF5 inspector happy
-    mird_room_dims = np.array([6.0, 6.0, 2.41])
+    # Dimensiones de la sala: solo entran en el H5 del catalogo y en el
+    # dashboard, no en las metricas. Las del MIRD son fijas; un provider con
+    # varias salas las expone con room_dims().
+    mird_room_dims = np.array(scene_base_config.get('room_dims',
+                                                    [6.0, 6.0, 2.41]), dtype=float)
     array_center = np.array(scene_base_config['array_center'])
 
     # --- PANEL DE CONSOLA (3 lineas fijas: total / prueba / etapa) ---
@@ -427,7 +435,17 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 # for MIRD). IMPORTANTE: la geometria debe coincidir con el spacing de las
                 # RIRs cargadas (mird_spacing), si no los steering vectors de los
                 # beamformers no corresponden al array real. Antes estaba fijo en 4-4-4.
-                base_array = generate_mird_linear_array_from_spacing(scene_base_config['mird_spacing'])
+                # LA GEOMETRIA LA DA EL PROVIDER SI LA SABE. Con el MIRD sale
+                # del espaciado nominal del arreglo lineal; con RIRs medidas
+                # tiene que salir de la MEDICION (cada .npz trae las posiciones
+                # de las capsulas con las que se grabo), porque un arreglo real
+                # no se describe con un string de espaciados. Sin el metodo, el
+                # comportamiento es el de antes.
+                if hasattr(dataset_provider, 'array_geometry'):
+                    base_array = dataset_provider.array_geometry(
+                        exp['rt60'], scene_base_config['mird_spacing'])
+                else:
+                    base_array = generate_mird_linear_array_from_spacing(scene_base_config['mird_spacing'])
                 mic_coords = base_array + array_center
                 scene_base_config['mic_coords'] = mic_coords
 
@@ -1111,10 +1129,11 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         if df_results[col].apply(lambda x: isinstance(x, (list, tuple))).any():
             df_results[col] = df_results[col].astype(str)
 
-    parquet_path = os.path.join(output_dir, "mird_benchmark_metrics.parquet")
+    parquet_path = os.path.join(output_dir, f"{out_prefix}_benchmark_metrics.parquet")
     df_results.to_parquet(parquet_path, engine="pyarrow")
 
-    df_results.to_csv(os.path.join(output_dir, "mird_benchmark_metrics.csv"), index=False)
+    df_results.to_csv(os.path.join(output_dir,
+                      f"{out_prefix}_benchmark_metrics.csv"), index=False)
 
     return df_results
 

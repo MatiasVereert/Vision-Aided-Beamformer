@@ -287,18 +287,36 @@ class SimAcoustic():
             
     def import_rirs(self, dataset_provider, target_t60, array_center=[3.0, 3.0, 1.2], spacing_cfg="4-4-4-8-4-4-4"):
         """
-        Imports real measured Room Impulse Responses from the MIRD dataset.
-        Applies strict native polyphase resampling to perfectly map the physical 
+        Imports real measured Room Impulse Responses from a dataset provider.
+        Applies strict native polyphase resampling to perfectly map the physical
         acoustic propagation delays to the target simulation sampling frequency.
+
+        Works with MirdDatasetProvider (Bar-Ilan) and with
+        kria_rir_loader.KriaRirProvider (RIRs medidas con el arreglo de la Kria).
+        El provider tiene que ofrecer load_rir(a, b, distancia, angulo),
+        get_current_fs() y, si su grilla no es la del MIRD, resolve_grid().
+        `target_t60` y `spacing_cfg` se le pasan tal cual al provider: con el
+        MIRD son el T60 y el espaciado; con la Kria, la sala y la posicion del
+        arreglo.
         """
         import scipy.signal as signal
         
         center_vec = np.array(array_center, dtype=float).squeeze()
         
+        # COMO SE RESUELVE "QUE RIR CORRESPONDE A ESTA POSICION" lo decide el
+        # PROVIDER, no esta funcion. El redondeo de abajo (distancia a 1 o 2 m,
+        # azimut a pasos de 15 grados) es la grilla del MIRD y solo vale para
+        # el MIRD. Un provider con su propia grilla -- por ejemplo
+        # kria_rir_loader.KriaRirProvider, que indexa mediciones reales en
+        # posiciones arbitrarias y discretas -- expone resolve_grid() y manda
+        # el. Sin ese metodo, el comportamiento es EXACTAMENTE el de antes.
         def resolve_grid_mapping(abs_pos):
             # Compute relative translation vector from array center to target source
             rel_vec = np.array(abs_pos, dtype=float).squeeze() - center_vec
-            
+
+            if hasattr(dataset_provider, "resolve_grid"):
+                return dataset_provider.resolve_grid(rel_vec)
+
             # Derive relative distance in the horizontal plane
             r_calc = np.linalg.norm(rel_vec[:2])
             dist_key = 1.0 if r_calc < 1.5 else 2.0
@@ -313,13 +331,14 @@ class SimAcoustic():
         
         # Process Target Source (Index 0)
         t_dist, t_angle = resolve_grid_mapping(self.audio_sources[0]["position"])
-        print(f"[SimAcoustic: MIRD] Mapping Target Source -> Snapped to Grid: Dist={t_dist}m, Angle={t_angle}°")
+        _who = type(dataset_provider).__name__
+        print(f"[SimAcoustic: {_who}] Target Source -> {t_dist}, {t_angle}")
         extracted_matrices.append(dataset_provider.load_rir(target_t60, spacing_cfg, t_dist, t_angle))
 
         # Process sequential Interference Sources
         for idx, interf in enumerate(self.audio_interferences):
             i_dist, i_angle = resolve_grid_mapping(interf["position"])
-            print(f"[SimAcoustic: MIRD] Mapping Interf #{idx+1} -> Snapped to Grid: Dist={i_dist}m, Angle={i_angle}°")
+            print(f"[SimAcoustic: {_who}] Interf #{idx+1} -> {i_dist}, {i_angle}")
             extracted_matrices.append(dataset_provider.load_rir(target_t60, spacing_cfg, i_dist, i_angle))
 
         # Retrieve native dataset physical sampling rate securely cached by the loader
