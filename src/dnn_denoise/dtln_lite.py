@@ -2,7 +2,8 @@ import numpy as np
 import tensorflow as tf
 
 
-def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono):
+def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono,
+                                    normalize=True):
     """
     Applies the DTLN TF-Lite models using a strict real-time
     frame-by-frame loop.
@@ -12,6 +13,10 @@ def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono):
     - Peak normalization so inputs of arbitrary scale (e.g. beamformer
       outputs) reach the network in the [-1, 1] range it was trained on,
       without clipping. The original scale is restored at the end.
+      normalize=False skips it: the network sees the input AS GIVEN (e.g. the
+      raw mic with the fixed gain a real-time device would apply). The peak of
+      the whole file is not causal, so a device cannot do this; the default
+      keeps the benchmark's behavior.
     - Hard copies of interpreter state tensors to prevent memory
       corruption across massive grid-search loops.
     """
@@ -21,7 +26,7 @@ def apply_dtln_post_tflite_realtime(interpreter_1, interpreter_2, audio_mono):
 
     # 2. Peak normalization (lossless, no clipping)
     peak = np.max(np.abs(audio_mono))
-    scale_factor = peak if peak > 1e-6 else 1.0
+    scale_factor = peak if (normalize and peak > 1e-6) else 1.0
 
     audio_norm = audio_mono / scale_factor
 

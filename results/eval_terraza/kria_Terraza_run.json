@@ -1,0 +1,476 @@
+{
+  "script": "src/evaluation/full_benchmark_test_dtln_kria.py",
+  "argv": [
+    "--room",
+    "Terraza",
+    "--target",
+    "all",
+    "--exclude-src",
+    "6",
+    "--n-interf",
+    "1",
+    "--isir",
+    "-5",
+    "0",
+    "5",
+    "--signal-sweep",
+    "--interf-audio",
+    "techno_gated commune.wav",
+    "ruido_rosa_16k.wav",
+    "vacuum_02_RHODE_NT1.wav",
+    "--nopf",
+    "--procs",
+    "NM_MVDR_OFB_AUTO",
+    "NM_MVDR_OFB_AUTO_noPF",
+    "--no-dtln",
+    "--nonintrusive",
+    "--no-catalog",
+    "--workers",
+    "6",
+    "--out",
+    "results/eval_terraza"
+  ],
+  "args": {
+    "root": null,
+    "list": false,
+    "room": "Terraza",
+    "array": null,
+    "target": "all",
+    "exclude_src": [
+      "6"
+    ],
+    "procs": [
+      "NM_MVDR_OFB_AUTO",
+      "NM_MVDR_OFB_AUTO_noPF"
+    ],
+    "n_interf": [
+      1
+    ],
+    "max_combos": null,
+    "seed": 0,
+    "min_sep": 0.0,
+    "interf_audio": [
+      "techno_gated commune.wav",
+      "ruido_rosa_16k.wav",
+      "vacuum_02_RHODE_NT1.wav"
+    ],
+    "isir": [
+      -5.0,
+      0.0,
+      5.0
+    ],
+    "out": "results/eval_terraza",
+    "dry_run": false,
+    "no_dtln": true,
+    "duration": 15,
+    "nonintrusive": true,
+    "no_catalog": true,
+    "nopf": true,
+    "signal_sweep": true,
+    "workers": 6
+  },
+  "when": "2026-11-18T12:58:49",
+  "git_beamformer": "d7329cd-dirty",
+  "git_dataset": "d360371-dirty",
+  "dataset_root": "/home/matias/Documents/Tesis/mic-array-platform/data/rirs",
+  "room": "Terraza",
+  "arrays": [
+    "Mesa",
+    "Mesa",
+    "Mesa",
+    "Mesa",
+    "Mesa",
+    "Mesa",
+    "Mesa"
+  ],
+  "target": "all",
+  "interf_audio": [
+    "techno_gated commune.wav",
+    "ruido_rosa_16k.wav",
+    "vacuum_02_RHODE_NT1.wav"
+  ],
+  "dtln": false,
+  "processors": {
+    "NM_MVDR_OFB_AUTO": {
+      "nperseg": 512,
+      "noverlap": 384,
+      "hop_length": 128,
+      "alpha": 0.99,
+      "sharpen_exp": 8.0,
+      "min_loading": 1e-09,
+      "smooth": 0.2,
+      "isir_center": 2.2,
+      "isir_width": 3.5,
+      "isir_alpha": 0.998,
+      "isir_calib": [
+        0.496,
+        3.77
+      ],
+      "isir_db": null,
+      "ban": false
+    },
+    "NM_MVDR_OFB_AUTO_noPF": {
+      "nperseg": 512,
+      "noverlap": 384,
+      "hop_length": 128,
+      "alpha": 0.99,
+      "sharpen_exp": 8.0,
+      "min_loading": 1e-09,
+      "smooth": null,
+      "isir_center": 2.2,
+      "isir_width": 3.5,
+      "isir_alpha": 0.998,
+      "isir_calib": [
+        0.496,
+        3.77
+      ],
+      "isir_db": null,
+      "ban": false
+    }
+  },
+  "base_config": {
+    "Mesa/1": {
+      "fs": 16000,
+      "duration": 15,
+      "t_early": 0.05,
+      "array_center": [
+        3.0,
+        3.0,
+        1.2
+      ],
+      "mird_spacing": "Mesa",
+      "out_prefix": "kria_Terraza_Mesa_job017",
+      "room_dims": [
+        5.0,
+        4.0,
+        2.6
+      ],
+      "ref_mic_mode": 6,
+      "snr_db": 60.0,
+      "source_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
+      "interf_paths": [
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/vacuum_02_RHODE_NT1.wav"
+      ],
+      "wpe_taps": 7,
+      "wpe_delay": 3,
+      "wpe_alpha": 0.9999,
+      "wpe_stft_size": 512,
+      "wpe_stft_shift": 128,
+      "wpe_fixed_bits": null,
+      "wpe_fixed_round": "nearest",
+      "wpe_backend": "cov",
+      "wpe_block_L": 512,
+      "wpe_block_shift": 2,
+      "wpe_block_iters": 2,
+      "wpe_block_reg": 1e-06,
+      "wpe_block_solver": "cholesky",
+      "wpe_block_mode": "resolve",
+      "stft_window": 512,
+      "stft_overlap": 384,
+      "eval_references": [
+        "early"
+      ],
+      "dtln_model_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
+      "catalog_save_rirs": true,
+      "input_band_sir": true,
+      "ref_mic_idx": 6
+    },
+    "Mesa/2": {
+      "fs": 16000,
+      "duration": 15,
+      "t_early": 0.05,
+      "array_center": [
+        3.0,
+        3.0,
+        1.2
+      ],
+      "mird_spacing": "Mesa",
+      "out_prefix": "kria_Terraza_Mesa_job035",
+      "room_dims": [
+        5.0,
+        4.0,
+        2.6
+      ],
+      "ref_mic_mode": 6,
+      "snr_db": 60.0,
+      "source_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
+      "interf_paths": [
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/vacuum_02_RHODE_NT1.wav"
+      ],
+      "wpe_taps": 7,
+      "wpe_delay": 3,
+      "wpe_alpha": 0.9999,
+      "wpe_stft_size": 512,
+      "wpe_stft_shift": 128,
+      "wpe_fixed_bits": null,
+      "wpe_fixed_round": "nearest",
+      "wpe_backend": "cov",
+      "wpe_block_L": 512,
+      "wpe_block_shift": 2,
+      "wpe_block_iters": 2,
+      "wpe_block_reg": 1e-06,
+      "wpe_block_solver": "cholesky",
+      "wpe_block_mode": "resolve",
+      "stft_window": 512,
+      "stft_overlap": 384,
+      "eval_references": [
+        "early"
+      ],
+      "dtln_model_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
+      "catalog_save_rirs": true,
+      "input_band_sir": true,
+      "ref_mic_idx": 6
+    },
+    "Mesa/3": {
+      "fs": 16000,
+      "duration": 15,
+      "t_early": 0.05,
+      "array_center": [
+        3.0,
+        3.0,
+        1.2
+      ],
+      "mird_spacing": "Mesa",
+      "out_prefix": "kria_Terraza_Mesa_job053",
+      "room_dims": [
+        5.0,
+        4.0,
+        2.6
+      ],
+      "ref_mic_mode": 6,
+      "snr_db": 60.0,
+      "source_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
+      "interf_paths": [
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/vacuum_02_RHODE_NT1.wav"
+      ],
+      "wpe_taps": 7,
+      "wpe_delay": 3,
+      "wpe_alpha": 0.9999,
+      "wpe_stft_size": 512,
+      "wpe_stft_shift": 128,
+      "wpe_fixed_bits": null,
+      "wpe_fixed_round": "nearest",
+      "wpe_backend": "cov",
+      "wpe_block_L": 512,
+      "wpe_block_shift": 2,
+      "wpe_block_iters": 2,
+      "wpe_block_reg": 1e-06,
+      "wpe_block_solver": "cholesky",
+      "wpe_block_mode": "resolve",
+      "stft_window": 512,
+      "stft_overlap": 384,
+      "eval_references": [
+        "early"
+      ],
+      "dtln_model_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
+      "catalog_save_rirs": true,
+      "input_band_sir": true,
+      "ref_mic_idx": 6
+    },
+    "Mesa/4": {
+      "fs": 16000,
+      "duration": 15,
+      "t_early": 0.05,
+      "array_center": [
+        3.0,
+        3.0,
+        1.2
+      ],
+      "mird_spacing": "Mesa",
+      "out_prefix": "kria_Terraza_Mesa_job071",
+      "room_dims": [
+        5.0,
+        4.0,
+        2.6
+      ],
+      "ref_mic_mode": 6,
+      "snr_db": 60.0,
+      "source_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
+      "interf_paths": [
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/vacuum_02_RHODE_NT1.wav"
+      ],
+      "wpe_taps": 7,
+      "wpe_delay": 3,
+      "wpe_alpha": 0.9999,
+      "wpe_stft_size": 512,
+      "wpe_stft_shift": 128,
+      "wpe_fixed_bits": null,
+      "wpe_fixed_round": "nearest",
+      "wpe_backend": "cov",
+      "wpe_block_L": 512,
+      "wpe_block_shift": 2,
+      "wpe_block_iters": 2,
+      "wpe_block_reg": 1e-06,
+      "wpe_block_solver": "cholesky",
+      "wpe_block_mode": "resolve",
+      "stft_window": 512,
+      "stft_overlap": 384,
+      "eval_references": [
+        "early"
+      ],
+      "dtln_model_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
+      "catalog_save_rirs": true,
+      "input_band_sir": true,
+      "ref_mic_idx": 6
+    },
+    "Mesa/5": {
+      "fs": 16000,
+      "duration": 15,
+      "t_early": 0.05,
+      "array_center": [
+        3.0,
+        3.0,
+        1.2
+      ],
+      "mird_spacing": "Mesa",
+      "out_prefix": "kria_Terraza_Mesa_job089",
+      "room_dims": [
+        5.0,
+        4.0,
+        2.6
+      ],
+      "ref_mic_mode": 6,
+      "snr_db": 60.0,
+      "source_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
+      "interf_paths": [
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/vacuum_02_RHODE_NT1.wav"
+      ],
+      "wpe_taps": 7,
+      "wpe_delay": 3,
+      "wpe_alpha": 0.9999,
+      "wpe_stft_size": 512,
+      "wpe_stft_shift": 128,
+      "wpe_fixed_bits": null,
+      "wpe_fixed_round": "nearest",
+      "wpe_backend": "cov",
+      "wpe_block_L": 512,
+      "wpe_block_shift": 2,
+      "wpe_block_iters": 2,
+      "wpe_block_reg": 1e-06,
+      "wpe_block_solver": "cholesky",
+      "wpe_block_mode": "resolve",
+      "stft_window": 512,
+      "stft_overlap": 384,
+      "eval_references": [
+        "early"
+      ],
+      "dtln_model_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
+      "catalog_save_rirs": true,
+      "input_band_sir": true,
+      "ref_mic_idx": 6
+    },
+    "Mesa/7": {
+      "fs": 16000,
+      "duration": 15,
+      "t_early": 0.05,
+      "array_center": [
+        3.0,
+        3.0,
+        1.2
+      ],
+      "mird_spacing": "Mesa",
+      "out_prefix": "kria_Terraza_Mesa_job107",
+      "room_dims": [
+        5.0,
+        4.0,
+        2.6
+      ],
+      "ref_mic_mode": 6,
+      "snr_db": 60.0,
+      "source_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
+      "interf_paths": [
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/vacuum_02_RHODE_NT1.wav"
+      ],
+      "wpe_taps": 7,
+      "wpe_delay": 3,
+      "wpe_alpha": 0.9999,
+      "wpe_stft_size": 512,
+      "wpe_stft_shift": 128,
+      "wpe_fixed_bits": null,
+      "wpe_fixed_round": "nearest",
+      "wpe_backend": "cov",
+      "wpe_block_L": 512,
+      "wpe_block_shift": 2,
+      "wpe_block_iters": 2,
+      "wpe_block_reg": 1e-06,
+      "wpe_block_solver": "cholesky",
+      "wpe_block_mode": "resolve",
+      "stft_window": 512,
+      "stft_overlap": 384,
+      "eval_references": [
+        "early"
+      ],
+      "dtln_model_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
+      "catalog_save_rirs": true,
+      "input_band_sir": true,
+      "ref_mic_idx": 6
+    },
+    "Mesa/8": {
+      "fs": 16000,
+      "duration": 15,
+      "t_early": 0.05,
+      "array_center": [
+        3.0,
+        3.0,
+        1.2
+      ],
+      "mird_spacing": "Mesa",
+      "out_prefix": "kria_Terraza_Mesa_job125",
+      "room_dims": [
+        5.0,
+        4.0,
+        2.6
+      ],
+      "ref_mic_mode": 6,
+      "snr_db": 60.0,
+      "source_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
+      "interf_paths": [
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/ruido_rosa_16k.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/vacuum_02_RHODE_NT1.wav"
+      ],
+      "wpe_taps": 7,
+      "wpe_delay": 3,
+      "wpe_alpha": 0.9999,
+      "wpe_stft_size": 512,
+      "wpe_stft_shift": 128,
+      "wpe_fixed_bits": null,
+      "wpe_fixed_round": "nearest",
+      "wpe_backend": "cov",
+      "wpe_block_L": 512,
+      "wpe_block_shift": 2,
+      "wpe_block_iters": 2,
+      "wpe_block_reg": 1e-06,
+      "wpe_block_solver": "cholesky",
+      "wpe_block_mode": "resolve",
+      "stft_window": 512,
+      "stft_overlap": 384,
+      "eval_references": [
+        "early"
+      ],
+      "dtln_model_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
+      "catalog_save_rirs": true,
+      "input_band_sir": true,
+      "ref_mic_idx": 6
+    }
+  },
+  "n_rows": 756,
+  "n_scenes": 126,
+  "outputs": {
+    "catalog": null,
+    "metrics": "kria_Terraza_benchmark_metrics.parquet",
+    "sources": "kria_Terraza_sources.parquet"
+  }
+}

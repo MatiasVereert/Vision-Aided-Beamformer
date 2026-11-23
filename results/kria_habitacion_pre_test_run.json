@@ -1,0 +1,164 @@
+{
+  "script": "src/evaluation/full_benchmark_test_dtln_kria.py",
+  "argv": [
+    "--room",
+    "habitacion_pre_test",
+    "--n-interf",
+    "1",
+    "2",
+    "--isir",
+    "-5",
+    "0",
+    "5",
+    "10",
+    "15",
+    "--workers",
+    "5",
+    "--out",
+    "results"
+  ],
+  "args": {
+    "root": null,
+    "list": false,
+    "room": "habitacion_pre_test",
+    "array": null,
+    "target": "1",
+    "n_interf": [
+      1,
+      2
+    ],
+    "max_combos": null,
+    "seed": 0,
+    "min_sep": 0.0,
+    "interf_audio": null,
+    "isir": [
+      -5.0,
+      0.0,
+      5.0,
+      10.0,
+      15.0
+    ],
+    "out": "results",
+    "dry_run": false,
+    "no_dtln": false,
+    "duration": 15,
+    "nonintrusive": false,
+    "no_catalog": false,
+    "workers": 5
+  },
+  "when": "2026-11-17T11:17:57",
+  "git_beamformer": "d7329cd-dirty",
+  "git_dataset": "d360371-dirty",
+  "dataset_root": "/home/matias/Documents/Tesis/mic-array-platform/data/rirs",
+  "room": "habitacion_pre_test",
+  "arrays": [
+    "escritorio"
+  ],
+  "target": "1",
+  "interf_audio": [
+    "techno_gated commune.wav",
+    "all minor ab oz.wav",
+    "flute_music.wav",
+    "hairdryer_02_RHODE_NT5.wav",
+    "vacuum_02_RHODE_NT1.wav",
+    "blender_03_RHODE_NT1.wav"
+  ],
+  "dtln": true,
+  "processors": {
+    "NM_MVDR_OFB_AUTO": {
+      "nperseg": 512,
+      "noverlap": 384,
+      "hop_length": 128,
+      "alpha": 0.99,
+      "sharpen_exp": 8.0,
+      "min_loading": 1e-09,
+      "smooth": 0.2,
+      "isir_center": 2.2,
+      "isir_width": 3.5,
+      "isir_alpha": 0.998,
+      "isir_calib": [
+        0.496,
+        3.77
+      ],
+      "isir_db": null,
+      "ban": false
+    },
+    "NM_MVDR_OFB_AUTO_BAN": {
+      "nperseg": 512,
+      "noverlap": 384,
+      "hop_length": 128,
+      "alpha": 0.99,
+      "sharpen_exp": 8.0,
+      "min_loading": 1e-09,
+      "smooth": 0.2,
+      "isir_center": 2.2,
+      "isir_width": 3.5,
+      "isir_alpha": 0.998,
+      "isir_calib": [
+        0.496,
+        3.77
+      ],
+      "isir_db": null,
+      "ban": true
+    }
+  },
+  "base_config": {
+    "escritorio": {
+      "fs": 16000,
+      "duration": 15,
+      "t_early": 0.05,
+      "array_center": [
+        3.0,
+        3.0,
+        1.2
+      ],
+      "mird_spacing": "escritorio",
+      "out_prefix": "kria_habitacion_pre_test_escritorio_job014",
+      "room_dims": [
+        5.0,
+        4.0,
+        2.6
+      ],
+      "ref_mic_mode": 6,
+      "snr_db": 60.0,
+      "source_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/p002_emo_adoration_sentences.wav",
+      "interf_paths": [
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/techno_gated commune.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/all minor ab oz.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/flute_music.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/hairdryer_02_RHODE_NT5.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/vacuum_02_RHODE_NT1.wav",
+        "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/tools/data/signals/blender_03_RHODE_NT1.wav"
+      ],
+      "wpe_taps": 7,
+      "wpe_delay": 3,
+      "wpe_alpha": 0.9999,
+      "wpe_stft_size": 512,
+      "wpe_stft_shift": 128,
+      "wpe_fixed_bits": null,
+      "wpe_fixed_round": "nearest",
+      "wpe_backend": "cov",
+      "wpe_block_L": 512,
+      "wpe_block_shift": 2,
+      "wpe_block_iters": 2,
+      "wpe_block_reg": 1e-06,
+      "wpe_block_solver": "cholesky",
+      "wpe_block_mode": "resolve",
+      "stft_window": 512,
+      "stft_overlap": 384,
+      "eval_references": [
+        "early"
+      ],
+      "dtln_model_path": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/src/dnn_denoise/models/model_quant_1.tflite",
+      "catalog_save_rirs": true,
+      "ref_mic_idx": 6
+    }
+  },
+  "n_rows": 150,
+  "n_scenes": 15,
+  "outputs": {
+    "catalog": "kria_habitacion_pre_test_benchmark_catalog.h5",
+    "metrics": "kria_habitacion_pre_test_benchmark_metrics.parquet",
+    "sources": "kria_habitacion_pre_test_sources.parquet"
+  }
+}

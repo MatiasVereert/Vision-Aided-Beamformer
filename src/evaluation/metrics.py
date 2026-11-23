@@ -9,24 +9,37 @@ def _fast_sdr_sir_sar(reference: np.ndarray, estimation: np.ndarray) -> tuple:
     """
     SDR/SIR/SAR del canal [0] via fast_bss_eval. Es el MISMO criterio BSS-Eval
     que mir_eval.separation.bss_eval_sources (filtro de 512 taps por LS), pero
-    ~3x mas rapido; coincide con mir_eval a <=1e-4 dB.
+    ~3x mas rapido.
 
     IMPORTANTE:
-    - use_cg_iter es OBLIGATORIO: el solver directo por defecto (use_cg_iter=None)
-      esta roto para la combinacion numpy/fast_bss_eval de este entorno
-      (ValueError en np.linalg.solve). El solver por gradiente conjugado lo evita.
-    - Con compute_permutation=False devuelve 3 valores (sdr, sir, sar), sin
-      'selection'. Se asume que la estimacion ya esta en el orden de las fuentes.
+    - NO usar use_cg_iter (gradiente conjugado): con 10 iteraciones no converge y
+      el SIR de los casos buenos sale +inf (ver comentario abajo). Se usa el
+      solver directo via square_cosine_metrics(pairwise=True), porque
+      bss_eval_sources(compute_permutation=False) con solver directo tira
+      ValueError en np.linalg.solve con NumPy 2 (bug de fast_bss_eval 0.1.4).
+    - Se asume que la estimacion ya esta en el orden de las fuentes (se toma [0, 0]).
     - La fila [0] es independiente de las demas filas de la estimacion (verificado),
       asi que un canal secundario dummy no afecta el resultado del target.
     - Para fuente unica, SIR sale inf (no hay interferencia); el llamador decide.
     """
     ref = np.ascontiguousarray(reference, dtype=np.float64)
     est = np.ascontiguousarray(estimation, dtype=np.float64)
-    sdr, sir, sar = fast_bss_eval.bss_eval_sources(
-        ref, est, compute_permutation=False, use_cg_iter=10
-    )
-    return float(sdr[0]), float(sir[0]), float(sar[0])
+    # Solver DIRECTO (exacto) en modo pairwise. Antes: use_cg_iter=10, que NO
+    # converge: el SIR sale de coh_sdr/coh_sar (dos proyecciones casi iguales
+    # cuando la interferencia residual es chica) y con 10 iteraciones de CG ese
+    # cociente daba >=1 -> SIR=+inf -> NaN, justo en los MEJORES casos
+    # (objetivo puntual, SIR real ~25-28 dB); tambien sesgaba SDR/SAR ~0.3 dB.
+    # El solver directo de fast_bss_eval 0.1.4 esta roto con NumPy 2 SOLO en
+    # modo no-pairwise (RHS vectorial en lote); en pairwise el RHS es matricial
+    # y funciona. El elemento [0, 0] (ref 0 vs est 0) es el de mir_eval;
+    # verificado vs minimos cuadrados explicitos (<=0.05 dB) e independiente de
+    # la fila 1 de la estimacion. Mismo costo (~0.1 s por 10 s de audio).
+    from fast_bss_eval.numpy.metrics import (square_cosine_metrics,
+                                             _base_metrics_bss_eval)
+    coh_sdr, coh_sar = square_cosine_metrics(
+        ref, est, filter_length=512, use_cg_iter=None, pairwise=True)
+    nsdr, nsir, nsar = _base_metrics_bss_eval(coh_sdr, coh_sar)
+    return float(-nsdr[0, 0]), float(-nsir[0, 0]), float(-nsar[0, 0])
 
 def precise_slice_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, max_shift_s: float = 0.5) -> tuple:
     """
@@ -65,6 +78,13 @@ def precise_slice_alignment(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int, m
 
     min_len = min(len(aligned_ref), len(aligned_deg))
     return aligned_ref[:min_len], aligned_deg[:min_len], shift
+
+
+def _pesq_single(ref, deg, fs):
+    """PESQ de UN par referencia/degradada (mismo modo que el facade de
+    pb_bss: 'wb' a 16 kHz, 'nb' a 8 kHz)."""
+    from pb_bss.evaluation.module_pesq import pesq as _pb_pesq
+    return float(np.squeeze(_pb_pesq(np.asarray(ref), np.asarray(deg), fs)))
 
 
 def _safe_metric(getter):
@@ -168,7 +188,15 @@ def evaluate_full_pipeline(ref_sig: np.ndarray, deg_sig: np.ndarray, fs: int,
 
             # Extract index 0 metrics which correspond strictly to the target speech channel.
             # Each metric is isolated so a PESQ 'NoUtterances' failure does not discard the rest.
-            results['PESQ'] = _safe_metric(lambda: metrics_facade.pesq[0])
+            # PESQ SOLO del canal 0. `metrics_facade.pesq` calcula PESQ de TODOS
+            # los canales, y el canal 1 es [ruido_total vs relleno ~silencio]:
+            # con interferencias tipo ruido el VAD de PESQ no encuentra habla en
+            # ese par, tira NoUtterancesError, y _safe_metric perdia TAMBIEN el
+            # PESQ del objetivo (canal 0), que era valido. Los NaN dependian del
+            # tipo de interferente -> perdida de datos sesgada. Con la llamada de
+            # un solo canal los valores que ya salian no cambian (el canal 0 no
+            # depende del 1); solo se recuperan los que se perdian.
+            results['PESQ'] = _safe_metric(lambda: _pesq_single(ref_crop, deg_crop, fs))
             results['STOI'] = _safe_metric(lambda: metrics_facade.stoi[0])
             results['SI-SDR'] = _safe_metric(lambda: metrics_facade.si_sdr[0])
 

@@ -1,0 +1,59 @@
+{
+  "script": "src/evaluation/full_benchmark_test_dtln_scenes.py",
+  "argv": [
+    "--root",
+    "/home/matias/Documents/Tesis/mic-array-platform/data/escenas",
+    "--procs",
+    "NM_MVDR_OFB_AUTO",
+    "NM_MVDR_OFB_AUTO_BAN",
+    "--save-audio"
+  ],
+  "args": {
+    "root": "/home/matias/Documents/Tesis/mic-array-platform/data/escenas",
+    "rir_root": null,
+    "list": false,
+    "room": null,
+    "array": null,
+    "procs": [
+      "NM_MVDR_OFB_AUTO",
+      "NM_MVDR_OFB_AUTO_BAN"
+    ],
+    "no_dtln": false,
+    "no_dtln_pk": false,
+    "no_ofb": false,
+    "include_bad": false,
+    "c_skip": null,
+    "out": "/home/matias/Documents/Tesis/Vision-Aided-Beamformer/results",
+    "save_audio": true
+  },
+  "when": "2026-11-21T11:46:25",
+  "git_beamformer": "d7329cd",
+  "git_dataset": "d360371",
+  "dataset_root": "/home/matias/Documents/Tesis/mic-array-platform/data/escenas",
+  "room": "Terraza",
+  "takes": [
+    "Terraza/Mesa/1",
+    "Terraza/Mesa/2",
+    "Terraza/Mesa/3",
+    "Terraza/Mesa/4",
+    "Terraza/Mesa/5"
+  ],
+  "processors": [
+    "OFB_kria",
+    "NM_MVDR_OFB_AUTO",
+    "NM_MVDR_OFB_AUTO_BAN",
+    "DTLN_mono_f",
+    "DTLN_mono_pk"
+  ],
+  "baseline": "DTLN float (model_1 + model_2) sobre el mic de referencia con la ganancia fija de la Kria, sin normalizar; DTLN_mono_pk = control normalizado por pico",
+  "offline_gain": "procesadores --procs con la ganancia de la Kria (entrada x g, salida / g)",
+  "nonintrusive": {
+    "dnsmos": true,
+    "squim": false
+  },
+  "n_rows": 25,
+  "outputs": {
+    "metrics": "scenes_Terraza_benchmark_metrics.parquet",
+    "takes": "scenes_Terraza_takes.parquet"
+  }
+}

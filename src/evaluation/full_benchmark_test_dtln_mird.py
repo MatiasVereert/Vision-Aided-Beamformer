@@ -77,7 +77,11 @@ def compute_scene_seed(exp, scene_base_config):
         exp['isir_db'],
         exp.get('source_path', scene_base_config.get('source_path', '')),
         scene_base_config.get('interf_paths', ''),
-    ])
+    ] + ([] if exp.get('target_src') is None else
+         # Dataset medido (fuentes por nombre): dos posiciones de aro pueden
+         # dar el mismo (dist, ang). Solo se agrega en ese caso, para que las
+         # semillas del MIRD queden bit a bit iguales a las de siempre.
+         [exp['target_src'], scene_base_config.get('mird_spacing', '')]))
     digest = hashlib.sha256(physics_key.encode('utf-8')).digest()
     # 64 bits bastan y son comodos para SeedSequence de numpy.
     return int.from_bytes(digest[:8], 'big')
@@ -85,10 +89,20 @@ def compute_scene_seed(exp, scene_base_config):
 def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, processor_obj,
                                 mic_signals, y_processed, target_reference, weights,
                                 exp_config, row_data, scene_base_config, current_room_dims,
-                                audio_dtln_alone=None, y_post_dtln=None):
+                                audio_dtln_alone=None, y_post_dtln=None,
+                                scene_info=None, rirs=None):
     """
     Saves or updates the master H5 file. Includes audio streams for DTLN
     so the Dashboard can play the neural-enhanced versions.
+
+    Opcionales (None = H5 identico al historico):
+      scene_info : dict plano de escalares que describen la escena (p.ej. los
+                   descriptores acusticos MEDIDOS y la ubicacion de cada fuente
+                   en un dataset real). Va a los atributos del grupo 'scene' y
+                   NO al grupo 'metrics' (claves como 'tgt_CDR_1000' contienen
+                   'CD' y se colaban como si fueran metricas).
+      rirs       : [rir_objetivo, rir_interf_1, ...], cada una (N, M): las RIRs
+                   que de verdad entraron a la convolucion. Van a 'rirs/'.
     """
     fs = scene_base_config['fs']
 
@@ -128,10 +142,28 @@ def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, 
             grp_audio.create_dataset(f"processed_{proc_name}_dtln", data=y_post_dtln, compression="gzip")
 
         # 3. METRICS
+        _skip = set(scene_info or ())
         grp_res = grp.create_group("metrics")
         for k, v in row_data.items():
+            if k in _skip:
+                continue
             if any(m in k for m in ["PESQ", "STOI", "SDR", "SIR", "SAR", "SINR", "CD", "DNSMOS"]):
-                grp_res.attrs[k] = v if not np.isnan(v) else "NaN"
+                grp_res.attrs[k] = _h5_attr(v)
+
+        # 3b. ESCENA (dataset medido): ubicacion, descriptores, calidad.
+        if scene_info:
+            grp_scene = grp.create_group("scene")
+            for k, v in scene_info.items():
+                grp_scene.attrs[k] = _h5_attr(v)
+
+        # 3c. RIRs usadas, (N, M) por fuente, en el orden de la escena.
+        if rirs is not None:
+            grp_rir = grp.create_group("rirs")
+            grp_rir.attrs["fs"] = fs
+            for j, h in enumerate(rirs):
+                name = "target" if j == 0 else f"interf_{j}"
+                grp_rir.create_dataset(name, data=np.asarray(h, dtype=np.float32),
+                                       compression="gzip")
 
         # Infer the correct N_FFT directly from the weights shape (axis 0 is frequency)
         n_bins = weights.shape[0]
@@ -158,6 +190,69 @@ def save_extreme_case_to_master(master_path, proc_name, metric_name, case_type, 
         grp_spat.create_dataset("freqs", data=freqs_sub)
         grp_spat.create_dataset("max_db_per_frame", data=max_db)
         grp_spat.attrs.update({"min_dB": -30.0, "target_fps": 24})
+
+
+# Importancia por banda de octava del SII (ANSI S3.5-1997, tabla 4, "octave band
+# procedure"), 250-4000 Hz renormalizada: a fs = 16 kHz la banda de 8 kHz no
+# entra entera. Es una APROXIMACION del indice (sin umbral de audicion, sin
+# enmascaramiento entre bandas), suficiente para ordenar escenas.
+_SII_OCT = {250: 0.0617, 500: 0.1671, 1000: 0.2373, 2000: 0.2648, 4000: 0.2142}
+
+
+def input_band_sir(target, interf, fs, start_s=0.0, nperseg=1024):
+    """SIR de ENTRADA por banda en un microfono: cuanto se superponen
+    interferencia y voz en frecuencia, que el iSIR de banda ancha no dice.
+
+    target, interf : (N,) senales en el mic de referencia (objetivo completo =
+        directo + reverb; interferencia completa), las mismas que despues
+        entran a las metricas. Se usa la ventana de metricas [start_s, fin].
+    Devuelve (dB salvo in_SII):
+      in_SIR_wide       banda ancha en esa ventana (= iSIR, salvo mic/ventana)
+      in_SIR_<b>        por banda de octava, b = 125 ... 4000 Hz
+      in_SIR_speech     300-4000 Hz (cociente de potencias en la banda de voz)
+      in_SIR_tw         SIR por bin PONDERADO POR LA ENERGIA DEL OBJETIVO:
+                        sum_f P_t(f) SIR_dB(f) / sum_f P_t(f), SIR por bin
+                        recortado a +-30 dB. "Que SIR ve la voz alli donde la voz
+                        tiene energia": la medida directa de superposicion.
+      in_SII            indice tipo SII 0-1: sum_b I_b (SIR_b + 15) / 30 con
+                        SIR_b recortado a [-15, 15] dB e I_b de _SII_OCT.
+    """
+    import scipy.signal as _sg
+    i0 = int(round(start_s * fs))
+    t = np.asarray(target, dtype=float)[i0:]
+    n = np.asarray(interf, dtype=float)[i0:]
+    f, Pt = _sg.welch(t, fs=fs, nperseg=nperseg)
+    _, Pn = _sg.welch(n, fs=fs, nperseg=nperseg)
+    eps = 1e-30
+    db = lambda a, b: float(10 * np.log10((a + eps) / (b + eps)))
+    out = {"in_SIR_wide": db(np.sum(t ** 2), np.sum(n ** 2))}
+    band = {}
+    for b in (125, 250, 500, 1000, 2000, 4000):
+        m = (f >= b / np.sqrt(2)) & (f < b * np.sqrt(2))
+        band[b] = db(Pt[m].sum(), Pn[m].sum())
+        out[f"in_SIR_{b}"] = band[b]
+    m = (f >= 300) & (f <= 4000)
+    out["in_SIR_speech"] = db(Pt[m].sum(), Pn[m].sum())
+    sir_bin = np.clip(10 * np.log10((Pt + eps) / (Pn + eps)), -30, 30)
+    out["in_SIR_tw"] = float(np.sum(Pt * sir_bin) / (np.sum(Pt) + eps))
+    w = np.array(list(_SII_OCT.values()))
+    sb = np.array([np.clip(band[b], -15, 15) for b in _SII_OCT])
+    out["in_SII"] = float(np.sum(w * (sb + 15) / 30) / np.sum(w))
+    return out
+
+
+def _h5_attr(v):
+    """Un valor apto para atributo HDF5: None -> 'None', NaN -> 'NaN' (como ya
+    lee el dashboard), listas/tuplas -> str, numpy escalar -> python."""
+    if v is None:
+        return "None"
+    if isinstance(v, (list, tuple, dict)):
+        return str(v)
+    if isinstance(v, np.generic):
+        v = v.item()
+    if isinstance(v, float) and np.isnan(v):
+        return "NaN"
+    return v
 
 
 def evaluate_all_references(refs_dict, deg_sig, fs, interf_early, interf_late, target_late, eval_start_s, prefix_name):
@@ -187,7 +282,8 @@ def evaluate_all_references(refs_dict, deg_sig, fs, interf_early, interf_late, t
 def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_config, output_dir="results/", interpreter_1=None, interpreter_2=None, save_catalog=True, apply_dtln_post=True,
                          show_progress=True, quiet_console=True,
                          save_weights_dir=None, save_weights_cells=None,
-                         save_weights_fps=16, nonintrusive=False):
+                         save_weights_fps=16, nonintrusive=False,
+                         scene_info_fn=None, leaderboard=None, catalog_path=None):
     """
     Barrido MIRD. `show_progress`/`quiet_console` SOLO afectan la consola:
       show_progress=False -> sin panel de barras (log plano, util en CI/logs).
@@ -225,6 +321,20 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         recorta a eval_start_s y se normaliza a -26 dBFS RMS (DNSMOS depende del
         nivel). Si falta una dep/modelo, esas columnas quedan en NaN. False
         (default) = DataFrame identico al historico.
+
+    DATASETS MEDIDOS (opcionales; None = comportamiento historico)
+    --------------------------------------------------------------
+    scene_info_fn : callable(exp) -> dict plano. Lo que devuelve se agrega a
+        CADA fila del DataFrame (descriptores acusticos medidos, ubicacion de
+        las fuentes, calidad de la medicion, ...) y al grupo 'scene' de cada
+        caso del catalogo H5. Las claves no deben pisar las del motor.
+    leaderboard : dict a COMPARTIR entre llamadas (se muta). Sirve para que
+        varias llamadas (p.ej. una por posicion de aro) mantengan UN solo
+        best/worst por (procesador, metrica) en un mismo catalogo.
+    catalog_path : ruta del catalogo H5 (default:
+        <output_dir>/<out_prefix>_benchmark_catalog.h5).
+    scene_base_config['catalog_save_rirs'] : True guarda en cada caso del
+        catalogo las RIRs que entraron a la escena (grupo 'rirs/').
     """
     os.makedirs(output_dir, exist_ok=True)
     if save_weights_dir is not None:
@@ -283,7 +393,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
     # 2. STRATEGIC SORTING (Crucial for cascaded caching adapted to MIRD)
     experiments.sort(key=lambda x: (
-        x['rt60'], x['target_dist'], x['target_angle'], str(x['interf_configs']), x['source_path'], # Node 1: Physical Environment
+        x['rt60'], str(x.get('target_src', '')), x['target_dist'], x['target_angle'], str(x['interf_configs']), x['source_path'], # Node 1: Physical Environment
         x['isir_db'],                                                             # Node 2: Mixture
         x['mismatch_gain'], x['mismatch_phase'],                                  # Node 3: Hardware
         x['use_wpe'], x['wpe_method'], x['wpe_taps'], x['wpe_delay'],             # Node 4: Pre-processing (WPE; wpe_delay no longer feeds t_early)
@@ -305,20 +415,20 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     # Base tracked metrics.
     tracked_metrics = ["Delta_tot_PESQ", "Delta_tot_STOI", "Delta_tot_SDR", "Delta_tot_SIR", "Delta_tot_SAR", "Delta_tot_SINR", "Delta_tot_CD"]
 
-    leaderboard = {
-        proc: {
-            m: {"best_val": -np.inf if m != "Delta_tot_CD" else np.inf,
-                "worst_val": np.inf if m != "Delta_tot_CD" else -np.inf}
-            for m in tracked_metrics
-        } for proc in processors.keys()
-    }
+    if leaderboard is None:
+        leaderboard = {}
+    for proc in processors.keys():
+        for m in tracked_metrics:
+            leaderboard.setdefault(proc, {}).setdefault(m, {
+                "best_val": -np.inf if m != "Delta_tot_CD" else np.inf,
+                "worst_val": np.inf if m != "Delta_tot_CD" else -np.inf})
     all_metrics_results = []
 
     # Prefijo de los archivos de salida. Configurable para que un dataset
     # distinto (p.ej. las RIRs medidas con el arreglo de la Kria, ver
     # propagation/kria_rir_loader.py) no sobreescriba los resultados del MIRD.
     out_prefix = scene_base_config.get('out_prefix', 'mird')
-    master_h5 = os.path.join(output_dir, f"{out_prefix}_benchmark_catalog.h5")
+    master_h5 = catalog_path or os.path.join(output_dir, f"{out_prefix}_benchmark_catalog.h5")
 
     # --- CASCADING STATE VARIABLES ---
     current_rt60, current_target_dist, current_target_angle, current_interf_configs = None, None, None, None
@@ -326,6 +436,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
     current_wpe_taps, current_wpe_delay, current_wpe_method = None, None, None
     current_wpe_block_L, current_wpe_block_shift = None, None
     current_source_path = None
+    current_target_src = None
 
     acoustic_scene, scene_data, mic_signals_degraded, mic_signals_ready = None, None, None, None
     # Componentes target-solo / (interf+ruido)-solo POST-HW (dominio de Node 3), a
@@ -359,6 +470,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         return score_nonintrusive(x, scene_base_config['fs'], start_s=eval_start_s)
 
     baseline_ni, wpe_ni, dtln_alone_ni = {}, {}, {}
+    input_band = {}
     if nonintrusive:
         _ni_ok = nonintrusive_status()
         print(f"[*] Metricas no-intrusivas: DNSMOS {'ok' if _ni_ok['dnsmos'] else 'NO DISPONIBLE (NaN)'}"
@@ -392,6 +504,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
         recalc_physics = (exp['rt60'] != current_rt60 or
                           exp['target_dist'] != current_target_dist or
                           exp['target_angle'] != current_target_angle or
+                          exp.get('target_src') != current_target_src or
                           str(exp['interf_configs']) != str(current_interf_configs) or
                           exp['source_path'] != current_source_path)
         recalc_mixture = recalc_physics or (exp['isir_db'] != current_isir_db)
@@ -462,8 +575,21 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 # seed per speaker.
                 scene_base_config['source_path'] = exp['source_path']
 
+                # FUENTES POR NOMBRE (opcional). Un dataset medido en
+                # posiciones discretas y sin grilla (KriaRirProvider) identifica
+                # cada fuente por su NOMBRE, no por (angulo, distancia): dos
+                # fuentes pueden compartir azimut y no ser la misma medicion.
+                # El eje de grilla 'target_src' nombra el objetivo y un 4to
+                # elemento en cada interf_cfg nombra al interferente. Sin
+                # ellos (MIRD), todo sigue yendo por (distancia, angulo).
+                target_src = exp.get('target_src')
+                source_names = [target_src] if target_src is not None else None
+
                 # Map Target Position
-                _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], exp['target_dist'], exp['target_angle'])
+                if target_src is not None:
+                    _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], source=target_src)
+                else:
+                    _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], exp['target_dist'], exp['target_angle'])
                 rel_pos_target = dataset_provider.export_position('cartesian')
                 abs_pos_target = array_center + rel_pos_target.squeeze()
                 scene_base_config['source_pos'] = abs_pos_target.reshape(1,3)
@@ -484,7 +610,14 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                         audio_idx = idx % len(scene_base_config['interf_paths'])
 
                     # Fetch RIR data for the specified spatial coordinates
-                    _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], i_dist, i_ang)
+                    if source_names is not None:
+                        if len(interf_cfg) < 4:
+                            raise ValueError("con 'target_src' cada interf_cfg tiene que ser "
+                                             "(angulo, distancia, audio_idx, nombre)")
+                        source_names.append(interf_cfg[3])
+                        _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], source=interf_cfg[3])
+                    else:
+                        _ = dataset_provider.load_rir(exp['rt60'], scene_base_config['mird_spacing'], i_dist, i_ang)
                     rel_pos_interf = dataset_provider.export_position('cartesian')
                     abs_pos_interf = array_center + rel_pos_interf.squeeze()
                     interferences_pos.append(abs_pos_interf)
@@ -502,7 +635,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                     dataset_provider=dataset_provider,
                     target_t60=exp['rt60'],
                     array_center=array_center,
-                    spacing_cfg=scene_base_config['mird_spacing']
+                    spacing_cfg=scene_base_config['mird_spacing'],
+                    **({} if source_names is None else {'source_names': source_names})
                 )
 
                 acoustic_scene.convolve_signals(t_early=t_early_dynamic)
@@ -513,6 +647,7 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             current_target_angle = exp['target_angle']
             current_interf_configs = exp['interf_configs']
             current_source_path = exp['source_path']
+            current_target_src = exp.get('target_src')
 
         # ---------------------------------------------------------
         # MICROFONO DE REFERENCIA (canal de escucha de TODO el pipeline)
@@ -579,6 +714,16 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 refs_dict['early'] = scene_data["target_early"][ref_ch]
             if 'reverberant' in scene_base_config['eval_references']:
                 refs_dict['reverberant'] = scene_data["target_early"][ref_ch] + scene_data["target_late"][ref_ch]
+
+            # SIR de entrada POR BANDA (opcional): la superposicion espectral
+            # voz/interferencia en el mic de referencia, que el iSIR de banda
+            # ancha no ve. scene_base_config['input_band_sir'] = True.
+            input_band = {}
+            if scene_base_config.get('input_band_sir'):
+                input_band = input_band_sir(
+                    scene_data["target_early"][ref_ch] + scene_data["target_late"][ref_ch],
+                    scene_data["interference_early"][ref_ch] + scene_data["interference_late"][ref_ch],
+                    scene_base_config['fs'], start_s=eval_start_s)
 
         unprocessed_mic_signals = scene_data["mic_signals"]
 
@@ -928,7 +1073,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 _ti = np.round(np.linspace(0, _T - 1, _nt)).astype(int)
                 _freqs = np.fft.rfftfreq(scene_base_config['stft_window'],
                                          1.0 / scene_base_config['fs'])
-                _tag = (f"exp{i:03d}_{proc_name}_rt{exp['rt60']:g}"
+                _rt = exp['rt60']   # con RIRs medidas es el NOMBRE de la sala, no un numero
+                _tag = (f"exp{i:03d}_{proc_name}_rt{_rt if isinstance(_rt, str) else format(_rt, 'g')}"
                         f"_isir{exp['isir_db']:g}")
                 np.savez_compressed(
                     os.path.join(save_weights_dir, f"{_tag}.npz"),
@@ -988,7 +1134,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
             row_data = {
                 "processor": proc_name,
                 "rt60": exp['rt60'],
-                "M": 8, # Fixed MIRD Array size
+                "target_src": exp.get('target_src'),
+                "M": _M_arr,   # canales del arreglo cargado (8 en MIRD)
                 "ref_mic_idx": ref_ch,   # canal de referencia (metricas + proyeccion)
                 "N_interferences": len(exp['interf_configs']),
                 # Geometria de las interferencias (angulo, distancia). Sin esta
@@ -1017,6 +1164,13 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                 "target_angle": exp['target_angle'],
                 "source": os.path.basename(exp['source_path'])
             }
+            row_data.update(input_band)        # vacio salvo input_band_sir=True
+            scene_info = scene_info_fn(exp) if scene_info_fn is not None else None
+            if scene_info:
+                _clash = set(scene_info) & set(row_data)
+                if _clash:
+                    raise ValueError(f"scene_info_fn pisa columnas del motor: {sorted(_clash)}")
+                row_data.update(scene_info)
 
             # Append absolute metrics for all references
             row_data.update({f"base_{k}": v for k, v in baseline_metrics.items()})
@@ -1095,6 +1249,12 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
 
                 if is_best or is_worst:
                     target_ref_audio = refs_dict.get('early')
+                    _rirs_used = None
+                    if scene_base_config.get('catalog_save_rirs'):
+                        # acoustic_scene.rirs es [mic][fuente] -> (N, M) por fuente
+                        _rirs_used = [np.stack([acoustic_scene.rirs[m_][s_]
+                                                for m_ in range(acoustic_scene.M)], axis=1)
+                                      for s_ in range(len(acoustic_scene.rirs[0]))]
 
                     if is_best:
                         leaderboard[proc_name][m_name]["best_val"] = current_val
@@ -1105,7 +1265,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                                                         processor, mic_signals_ready, y_processed,
                                                         target_ref_audio, weights, exp, row_data,
                                                         scene_base_config, mird_room_dims,
-                                                        audio_dtln_alone, y_post_dtln)
+                                                        audio_dtln_alone, y_post_dtln,
+                                                        scene_info=scene_info, rirs=_rirs_used)
 
                     if is_worst:
                         leaderboard[proc_name][m_name]["worst_val"] = current_val
@@ -1116,7 +1277,8 @@ def run_mird_grid_search(grid_params, dataset_provider, processors, scene_base_c
                                                         processor, mic_signals_ready, y_processed,
                                                         target_ref_audio, weights, exp, row_data,
                                                         scene_base_config, mird_room_dims,
-                                                        audio_dtln_alone, y_post_dtln)
+                                                        audio_dtln_alone, y_post_dtln,
+                                                        scene_info=scene_info, rirs=_rirs_used)
 
         ui.end_experiment()
 

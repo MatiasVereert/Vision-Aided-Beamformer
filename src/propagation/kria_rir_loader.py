@@ -76,6 +76,16 @@ import numpy as np
 DEFAULT_ROOT = os.path.expanduser(
     "~/Documents/Tesis/mic-array-platform/data/rirs")
 
+# DISTANCIA NOMINAL para una fuente cuya distancia no se midio. Con 12 cm de
+# apertura la distancia NO se puede sacar de la FORMA de la RIR (la curvatura
+# del frente a 1.5-3 m es de ~1 mm), y no hace falta: el motor solo la usa para
+# UBICAR la fuente en la escena (catalogo H5, dashboard). Lo que importa es la
+# direccion. Las mediciones por cable con la latencia calibrada traen la
+# distancia por TIEMPO DE VUELO (rir_lab/tof.py, meta['doa']['dist_m']); esta
+# constante queda para las que no. position() devuelve el origen y
+# dist_known lo dice.
+NOMINAL_DIST_M = 1.5
+
 
 def _f(v):
     return None if v is None else float(v)
@@ -84,13 +94,15 @@ def _f(v):
 class KriaMeasurement:
     """Una medicion: la RIR, su geometria y de donde vino el sonido."""
 
-    __slots__ = ("path", "meta", "_ir", "_pos")
+    __slots__ = ("path", "meta", "_ir", "_pos", "_est", "_spec")
 
     def __init__(self, path, meta):
         self.path = path
         self.meta = meta
         self._ir = None
         self._pos = None
+        self._est = False            # False = todavia no se intento estimar
+        self._spec = None
 
     # ---- identidad de la escena -----------------------------------------
     @property
@@ -148,25 +160,162 @@ class KriaMeasurement:
         _, pos = self._load()
         return pos[self.active, :]
 
-    def position(self):
-        """(dist_m, az_deg, el_deg, de_donde_salio) en el marco interno.
+    def direction(self):
+        """(az_deg, el_deg, origen) en el marco interno, o (None, None, None).
 
-        `de_donde_salio` es 'rel'/'xyz' si se midio con cinta o de un plano, y
-        'estimated' si la saco locate() de la propia RIR. Que quede explicito
-        no es un detalle: una posicion estimada alimentando un beamformer
-        geometrico es defendible, pero el lector tiene que saberlo.
+        Tres origenes posibles, en orden de preferencia:
+          'manual'    se cargo a mano al medir (--az / --src-xyz)
+          'doa'       la estimo rir_lab AL MEDIR y viaja en el .npz (meta['doa'])
+          'estimated' medicion vieja sin meta['doa']: se estima aca, una sola
+                      vez por objeto, y para eso hace falta rir_lab
+        La direccion es un METADATO de la medicion. La fuente se identifica por
+        sala / posicion de aro / nombre, nunca por su angulo.
         """
         sc = self.scene
-        if sc.get("dist_m") is not None and sc.get("az_deg") is not None:
-            return (_f(sc["dist_m"]), _f(sc["az_deg"]), _f(sc.get("el_deg") or 0.0),
-                    sc.get("pos_source") or "rel")
-        est = self.estimate_position()
-        if est is None:
-            return (None, None, None, None)
-        return est
+        if sc.get("az_deg") is not None:
+            return _f(sc["az_deg"]), _f(sc.get("el_deg") or 0.0), "manual"
+        doa = self.meta.get("doa") or {}
+        if doa.get("az_deg") is not None:
+            return _f(doa["az_deg"]), _f(doa.get("el_deg") or 0.0), "doa"
+        if self._est is False:
+            self._est = self._estimate_direction()
+        if self._est is None:
+            return None, None, None
+        return self._est[0], self._est[1], "estimated"
 
-    def estimate_position(self, rir_lab_path=None):
-        """Estima la direccion de la propia RIR. Necesita rir_lab."""
+    def _dist(self):
+        """(distancia, de donde): cinta si la hay, si no tiempo de vuelo.
+
+        Una distancia por ToF que rir_lab marco como fuera de rango, o que no es
+        positiva, NO se usa: con d < 0, export_position() pondria la fuente del
+        lado OPUESTO del aro (d * cos(az) da vuelta el vector) sin avisar. Queda
+        como nominal y el valor crudo sigue en tof_dist_raw.
+        """
+        if self.scene.get("dist_m") is not None:
+            return _f(self.scene["dist_m"]), "cinta"
+        d = self.tof_dist_raw
+        if d is not None and d > 0 and not self.tof_rejected:
+            return d, "tof"
+        return None, None
+
+    @property
+    def tof_dist_raw(self):
+        """La distancia por tiempo de vuelo tal como la dejo rir_lab (o None)."""
+        return _f((self.meta.get("doa") or {}).get("dist_m"))
+
+    @property
+    def tof_rejected(self):
+        """True si la distancia por ToF existe pero no es usable."""
+        d = self.tof_dist_raw
+        if d is None:
+            return False
+        tw = (self.meta.get("tof") or {}).get("warnings") or []
+        return d <= 0 or any("fuera de rango" in str(w) for w in tw)
+
+    @property
+    def dist_known(self):
+        return self._dist()[0] is not None
+
+    @property
+    def dist_origin(self):
+        """'cinta', 'tof' o None (nominal)."""
+        return self._dist()[1]
+
+    def summary(self):
+        """TODO lo que describe esta medicion, aplanado en escalares (str /
+        float / int / bool / None), para pegarlo en una fila del banco o en un
+        atributo HDF5: identidad, archivo, posicion y de donde salio, calidad de
+        la medicion, ruido de fondo, excitacion y los descriptores acusticos.
+        Las claves NO llevan prefijo: quien llama pone 'tgt_' / 'int1_' / ...
+        """
+        d, az, el, dir_src = self.position()
+        q = self.quality
+        doa = self.meta.get("doa") or {}
+        ac = self.meta.get("acoustics") or {}
+        sw = self.meta.get("sweep") or {}
+        npre = self.meta.get("noise_pre") or {}
+        cap = self.meta.get("capture") or {}
+        if d is not None:
+            a, e = np.radians(az), np.radians(el or 0.0)
+            xyz = (d * np.cos(e) * np.cos(a), d * np.cos(e) * np.sin(a),
+                   d * np.sin(e))
+        else:
+            xyz = (None, None, None)
+        out = {
+            "src": self.source,
+            "file": os.path.basename(self.path),
+            "when": self.meta.get("when"),
+            "note": self.meta.get("note"),
+            # posicion (marco interno del aro, relativa a su centro)
+            "dist_m": _f(d), "az_deg": _f(az), "el_deg": _f(el),
+            "x_rel_m": _f(xyz[0]), "y_rel_m": _f(xyz[1]), "z_rel_m": _f(xyz[2]),
+            "dir_origin": dir_src,
+            "dist_origin": self.dist_origin or "nominal",
+            "tof_dist_raw_m": self.tof_dist_raw,
+            "tof_rejected": bool(self.tof_rejected),
+            "dist_sigma_m": _f(doa.get("dist_sigma_m")),
+            "doa_contrast": _f(doa.get("contrast")),
+            "doa_check_diff_deg": _f(doa.get("check_diff_deg")),
+            # calidad de la medicion
+            "reps_used": q["reps_used"],
+            "rep_corr_min": _f(q["rep_corr_min"]),
+            "eps_ppm": _f(q["eps_ppm"]),
+            "eps_resid_us": _f(q["eps_resid_us"]),
+            "gaps": q["gaps"],
+            "n_warnings": len(q["warnings"]),
+            "warnings": " | ".join(map(str, q["warnings"])),
+            "peak_ir_db": _f(self.meta.get("peak_ir_db")),
+            "noise_rms_dbfs": _f(npre.get("rms_median_dbfs")),
+            # excitacion / reproduccion
+            "sweep_f1_hz": _f(sw.get("f1")), "sweep_f2_hz": _f(sw.get("f2")),
+            "sweep_dur_s": _f(sw.get("dur")), "amplitude": _f(self.meta.get("amplitude")),
+            "out_device": cap.get("out_device_name"),
+            "out_channel": cap.get("out_channel"),
+            "ir_len_s": (None if (self.meta.get("ir_meta") or {}).get("ir_ms") is None
+                         else float(self.meta["ir_meta"]["ir_ms"]) / 1e3),
+            "critical_distance_m": _f(ac.get("critical_distance_m")),
+        }
+        out.update(self.descriptors())
+        out.update(self.spectral_descriptors())
+        return out
+
+    def array_summary(self):
+        """La posicion de ARO con la que se midio (geometria + hardware)."""
+        g = self.meta.get("geometry") or {}
+        ai = self.scene.get("array_info") or {}
+        act = self.active
+        return {
+            "M": len(act),
+            "active": ",".join(map(str, act)),
+            "mics_off": ",".join(map(str, g.get("mics_off") or [])),
+            "order": ",".join(map(str, g.get("order") or [])),
+            "ref_ch": g.get("ref_mic"),
+            "radius_m": _f(g.get("radius_m")),
+            "rot_deg": _f(self.meta.get("rot_deg")),
+            "az_zero_deg": _f(ai.get("az_zero_deg")),
+            "az_sense": ai.get("az_sense"),
+            "hw_rev": ai.get("hw_rev"),
+            "x_room_m": _f(ai.get("x")), "y_room_m": _f(ai.get("y")),
+            "z_room_m": _f(ai.get("z")),
+        }
+
+    def position(self):
+        """(dist_m, az_deg, el_deg, origen) en el marco interno.
+
+        La distancia es la medida con cinta si la hay, si no la de tiempo de
+        vuelo, y si no NOMINAL_DIST_M (ver arriba; `dist_known` y
+        `dist_origin` lo distinguen). El origen es el de direction().
+        """
+        az, el, src = self.direction()
+        if az is None:
+            return (None, None, None, None)
+        d = self._dist()[0]
+        d = NOMINAL_DIST_M if d is None else d
+        return (d, az, el, src)
+
+    def _estimate_direction(self, rir_lab_path=None):
+        """(az, el) de la propia RIR, para mediciones sin meta['doa'].
+        Necesita rir_lab; si no esta, se dice y se devuelve None."""
         import sys
         p = rir_lab_path or os.path.expanduser(
             "~/Documents/Tesis/mic-array-platform/tools")
@@ -174,21 +323,86 @@ class KriaMeasurement:
             sys.path.insert(0, p)
         try:
             from rir_lab import locate as loc
+            ir, _ = self._load()
+            e = loc.locate(ir, self.fs, active=self.active,
+                           rot_deg=_f(self.meta.get("rot_deg")) or 0.0)
         except Exception as e:                               # noqa: BLE001
-            print(f"[KriaRir] no puedo estimar la posicion de "
-                  f"{os.path.basename(self.path)}: falta rir_lab ({e}). "
-                  f"Medila con cinta o corre `measure.py locate`.")
+            print(f"[KriaRir] no puedo estimar la direccion de "
+                  f"{os.path.basename(self.path)} ({type(e).__name__}: {e}). "
+                  f"Las mediciones nuevas la traen adentro (meta['doa']).")
             return None
-        ir, _ = self._load()
-        acs = self.meta.get("acoustics") or {}
-        e = loc.locate(ir, self.fs, active=self.active,
-                       rot_deg=_f(self.meta.get("rot_deg")) or 0.0,
-                       drr_db=acs.get("DRR_wide", np.nan),
-                       rc_m=acs.get("critical_distance_m", np.nan))
-        # La distancia NO sale de la geometria: se usa la cota inferior, que es
-        # lo unico defendible (ver locate.range_lower_bound).
-        return (float(e["r_min_m"]), float(e["az_deg"]), float(e["el_deg"]),
-                "estimated")
+        return (float(e["az_deg"]), float(e["el_deg"]))
+
+    def descriptors(self):
+        """Los descriptores acusticos que rir_lab calculo al medir, aplanados:
+        {'T_wide': s, 'T_mid': s, 'DRR_wide': dB, 'MSC_rms': -, 'T_500': s,
+         'EDT_1000': s, 'DRR_2000': dB, 'CDR_4000': dB, ...}.
+
+        Son de la CADENA parlante-sala-arreglo para ESTA posicion de fuente. Es
+        con esto que se ordenan los resultados despues: no se elige un RT60
+        antes de correr, se corre todo y se analiza contra lo medido.
+        """
+        ac = self.meta.get("acoustics") or {}
+        out = {k: _f(ac.get(k)) for k in ("T_wide", "T_mid", "DRR_wide")}
+        out["T_method"] = ac.get("method_wide")
+        out["MSC_rms"] = _f(self.meta.get("msc_rms"))
+        bands = ac.get("bands_hz") or []
+        for key, name in (("T_band", "T"), ("EDT_band", "EDT"),
+                          ("DRR_band", "DRR")):
+            for b, v in zip(bands, ac.get(key) or []):
+                out[f"{name}_{int(round(b))}"] = _f(v)
+        cd = self.meta.get("cdr") or {}
+        for b, v in zip(cd.get("bands_hz") or [], cd.get("cdr_band_db") or []):
+            out[f"CDR_{int(round(b))}"] = _f(v)
+        return out
+
+    SPEC_BANDS = (125, 250, 500, 1000, 2000, 4000)
+
+    def spectral_descriptors(self):
+        """Balance espectral de la funcion de transferencia (parlante -> sala ->
+        aro), para cruzarlo con el espectro de las senales:
+
+          E_<banda>     energia de la RIR en la banda de octava, dB re 1 kHz
+                        (promedio de potencia sobre los canales activos)
+          tilt_db_oct   pendiente de E vs log2(f), 125-4000 Hz, dB/octava
+          BER_db        "bass energy ratio": 10 log10((E125+E250)/(E500+E1000))
+          BR, Br        bass ratio y brilliance de Beranek, sobre TIEMPOS de
+                        reverberacion: (T125+T250)/(T500+T1000) y
+                        (T2000+T4000)/(T500+T1000). Miden si la cola es mas
+                        larga en graves/agudos; BER y tilt miden donde esta la
+                        ENERGIA. No son lo mismo y conviene tener los dos.
+
+        Ojo: la cadena no esta calibrada, asi que E incluye la respuesta del
+        parlante. Es la respuesta que de verdad le llega al arreglo, que es lo
+        que importa para el banco, pero no es "la sala sola".
+        """
+        if self._spec is not None:
+            return dict(self._spec)
+        ir = self.rir()                                      # (N, M) activos
+        nfft = 1 << int(np.ceil(np.log2(max(ir.shape[0], 2))))
+        H2 = np.mean(np.abs(np.fft.rfft(ir, nfft, axis=0)) ** 2, axis=1)
+        f = np.fft.rfftfreq(nfft, 1.0 / self.fs)
+        E = {}
+        for b in self.SPEC_BANDS:
+            m = (f >= b / np.sqrt(2)) & (f < b * np.sqrt(2))
+            E[b] = float(np.sum(H2[m])) if np.any(m) else np.nan
+        ref = E.get(1000) or np.nan
+        out = {f"E_{b}": float(10 * np.log10(E[b] / ref)) for b in self.SPEC_BANDS}
+        x = np.log2(np.array(self.SPEC_BANDS, dtype=float))
+        y = np.array([out[f"E_{b}"] for b in self.SPEC_BANDS])
+        ok = np.isfinite(y)
+        out["tilt_db_oct"] = (float(np.polyfit(x[ok], y[ok], 1)[0])
+                              if ok.sum() >= 2 else None)
+        out["BER_db"] = float(10 * np.log10((E[125] + E[250]) / (E[500] + E[1000])))
+        d = self.descriptors()
+        T = [d.get(f"T_{b}") for b in (125, 250, 500, 1000, 2000, 4000)]
+        mid = (T[2] + T[3]) if None not in (T[2], T[3]) else None
+        out["BR"] = (float((T[0] + T[1]) / mid)
+                     if mid and None not in (T[0], T[1]) else None)
+        out["Br"] = (float((T[4] + T[5]) / mid)
+                     if mid and None not in (T[4], T[5]) else None)
+        self._spec = out
+        return dict(out)
 
     @property
     def quality(self):
@@ -284,7 +498,7 @@ class KriaRirProvider:
         esta base es DISCRETA y chica, no una grilla densa como MIRD.
         """
         if source is not None:
-            m = self.get(room, array, source)
+            m = self.get(room, array, str(source))
         else:
             m = self._nearest(room, array, distance, angle)
         self.current = m
@@ -349,19 +563,29 @@ class KriaRirProvider:
         return r, az
 
     # ----------------------------------------------------------- geometria
+    def _for(self, room=None, array=None):
+        """La medicion de referencia para (sala, aro): la ultima cargada si es
+        de ESA sala/aro, si no cualquiera de ellas. Antes se devolvia
+        self.current sin mirar los argumentos: si la ultima carga era de otro
+        aro, la geometria salia de ese otro aro."""
+        c = self.current
+        if c is not None and (room is None or c.room == room) and (
+                array is None or c.array == array):
+            return c
+        return self._any(room, array)
+
     def array_geometry(self, room=None, array=None):
         """(M, 3) centrada en el aro, marco interno. Es lo que hay que pasarle
         a SimAcoustic como array_geometry (mas el array_center)."""
-        m = self.current or self._any(room, array)
-        return m.geometry()
+        return self._for(room, array).geometry()
 
     def active_channels(self, room=None, array=None):
-        return (self.current or self._any(room, array)).active
+        return self._for(room, array).active
 
     def ref_mic_index(self, room=None, array=None):
         """Indice de ch6 DENTRO de la seleccion: es lo que va en
         scene_base_config['ref_mic_mode']. Ver la nota 2 del encabezado."""
-        m = self.current or self._any(room, array)
+        m = self._for(room, array)
         act = m.active
         ref = m.ref_mic
         if ref is None or ref not in act:
@@ -410,6 +634,27 @@ class KriaRirProvider:
         if not r or r["dim_x"] is None:
             return None
         return (float(r["dim_x"]), float(r["dim_y"]), float(r["dim_z"]))
+
+    def room_summary(self, room):
+        """Lo que la base SQLite sabe de la sala (o Nones si no esta)."""
+        out = {"name": None, "dim_x_m": None, "dim_y_m": None, "dim_z_m": None,
+               "volume_m3": None, "notes": None}
+        db = os.path.join(self.root, "rirs.sqlite")
+        if not os.path.exists(db):
+            return out
+        try:
+            cx = sqlite3.connect(db)
+            cx.row_factory = sqlite3.Row
+            r = cx.execute("SELECT name, dim_x, dim_y, dim_z, volume_m3, notes "
+                           "FROM room WHERE slug=?", (room,)).fetchone()
+            cx.close()
+        except Exception:                                    # noqa: BLE001
+            return out
+        if r:
+            out.update({"name": r["name"], "dim_x_m": _f(r["dim_x"]),
+                        "dim_y_m": _f(r["dim_y"]), "dim_z_m": _f(r["dim_z"]),
+                        "volume_m3": _f(r["volume_m3"]), "notes": r["notes"]})
+        return out
 
     def scene_table(self, room, array):
         """[(fuente, dist, az, el, origen)] de las fuentes medidas, ordenadas

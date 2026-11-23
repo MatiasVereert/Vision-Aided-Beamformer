@@ -285,7 +285,8 @@ class SimAcoustic():
 
         print("[SimAcoustic] RIRs successfully computed and stored in 'self.rirs'.")
             
-    def import_rirs(self, dataset_provider, target_t60, array_center=[3.0, 3.0, 1.2], spacing_cfg="4-4-4-8-4-4-4"):
+    def import_rirs(self, dataset_provider, target_t60, array_center=[3.0, 3.0, 1.2], spacing_cfg="4-4-4-8-4-4-4",
+                    source_names=None):
         """
         Imports real measured Room Impulse Responses from a dataset provider.
         Applies strict native polyphase resampling to perfectly map the physical
@@ -298,6 +299,12 @@ class SimAcoustic():
         `target_t60` y `spacing_cfg` se le pasan tal cual al provider: con el
         MIRD son el T60 y el espaciado; con la Kria, la sala y la posicion del
         arreglo.
+
+        `source_names` (opcional): [objetivo, interferente 1, ...] en el orden
+        en que se cargaron. Si se da, cada RIR se pide POR NOMBRE
+        (load_rir(..., source=nombre)) y no se deduce de la posicion: es lo que
+        corresponde a un dataset medido, donde dos fuentes pueden compartir
+        azimut. Sin el, el comportamiento es EXACTAMENTE el de antes.
         """
         import scipy.signal as signal
         
@@ -328,18 +335,29 @@ class SimAcoustic():
             return dist_key, angle_key
 
         extracted_matrices = []
-        
-        # Process Target Source (Index 0)
-        t_dist, t_angle = resolve_grid_mapping(self.audio_sources[0]["position"])
         _who = type(dataset_provider).__name__
-        print(f"[SimAcoustic: {_who}] Target Source -> {t_dist}, {t_angle}")
-        extracted_matrices.append(dataset_provider.load_rir(target_t60, spacing_cfg, t_dist, t_angle))
 
-        # Process sequential Interference Sources
-        for idx, interf in enumerate(self.audio_interferences):
-            i_dist, i_angle = resolve_grid_mapping(interf["position"])
-            print(f"[SimAcoustic: {_who}] Interf #{idx+1} -> {i_dist}, {i_angle}")
-            extracted_matrices.append(dataset_provider.load_rir(target_t60, spacing_cfg, i_dist, i_angle))
+        if source_names is not None:
+            if len(source_names) != 1 + len(self.audio_interferences):
+                raise ValueError(
+                    f"source_names trae {len(source_names)} nombres y la escena tiene "
+                    f"1 objetivo + {len(self.audio_interferences)} interferentes")
+            for idx, name in enumerate(source_names):
+                print(f"[SimAcoustic: {_who}] "
+                      f"{'Target Source' if idx == 0 else f'Interf #{idx}'} -> '{name}'")
+                extracted_matrices.append(
+                    dataset_provider.load_rir(target_t60, spacing_cfg, source=name))
+        else:
+            # Process Target Source (Index 0)
+            t_dist, t_angle = resolve_grid_mapping(self.audio_sources[0]["position"])
+            print(f"[SimAcoustic: {_who}] Target Source -> {t_dist}, {t_angle}")
+            extracted_matrices.append(dataset_provider.load_rir(target_t60, spacing_cfg, t_dist, t_angle))
+
+            # Process sequential Interference Sources
+            for idx, interf in enumerate(self.audio_interferences):
+                i_dist, i_angle = resolve_grid_mapping(interf["position"])
+                print(f"[SimAcoustic: {_who}] Interf #{idx+1} -> {i_dist}, {i_angle}")
+                extracted_matrices.append(dataset_provider.load_rir(target_t60, spacing_cfg, i_dist, i_angle))
 
         # Retrieve native dataset physical sampling rate securely cached by the loader
         native_fs = dataset_provider.get_current_fs()

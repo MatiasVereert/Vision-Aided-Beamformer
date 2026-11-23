@@ -1,6 +1,8 @@
 import os
+import re
 import h5py
 import numpy as np
+import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
@@ -43,6 +45,21 @@ def get_h5_structure(h5_filepath: str, mtime: float) -> dict:
                 structure[proc][metric] = list(f[proc][metric].keys())
     return structure
 
+def _decode_attr(v):
+    """Inverse of the benchmark's _h5_attr: 'None' -> None, 'NaN' -> nan,
+    numpy scalars -> python."""
+    if isinstance(v, bytes):
+        v = v.decode()
+    if isinstance(v, str):
+        if v == "None":
+            return None
+        if v == "NaN":
+            return np.nan
+        return v
+    if isinstance(v, np.generic):
+        return v.item()
+    return v
+
 @st.cache_data
 def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case_type: str, mtime: float) -> dict:
     """
@@ -74,6 +91,15 @@ def load_benchmark_case(h5_filepath: str, proc_name: str, metric_name: str, case
                     data["metrics"][k] = np.nan
                 else:
                     data["metrics"][k] = v
+
+        # OPTIONAL groups written only by measured-dataset runs (Kria). MIRD
+        # catalogs do not have them, and then data["scene"] / data["rirs"]
+        # stay empty and nothing below changes.
+        if "scene" in grp:
+            data["scene"] = {k: _decode_attr(v) for k, v in grp["scene"].attrs.items()}
+        if "rirs" in grp:
+            data["rirs"] = {k: grp["rirs"][k][()] for k in grp["rirs"].keys()}
+            data["rirs"].update({k: v for k, v in grp["rirs"].attrs.items()})
 
         # Load spatial group for the specific processor
         spat_key = f"spatial_{proc_name}"
@@ -214,6 +240,10 @@ def display_experiment_conditions(data: dict, h5_structure: dict, selected_proc:
             if key in skip:
                 continue
             label, unit = _META_LABELS.get(key, (key.replace("_", " ").title(), ""))
+            # Measured datasets reuse the 'rt60' axis for the ROOM NAME (a str);
+            # MIRD stores a number there and keeps the RT60 label.
+            if key == "rt60" and isinstance(val, (str, bytes)):
+                label, unit = "Sala", ""
             text = _fmt_meta_value(key, val)
             params.append((label, f"{text} {unit}".strip()))
 
@@ -223,6 +253,146 @@ def display_experiment_conditions(data: dict, h5_structure: dict, selected_proc:
             cols = st.columns(per_row)
             for col, (label, value) in zip(cols, params[i:i + per_row]):
                 col.markdown(f"**{label}**  \n{value}")
+
+_BAND_RE = re.compile(r"^(T|EDT|DRR|CDR)_(\d+)$")
+
+def _scene_prefixes(scene: dict) -> list:
+    """[('Objetivo', 'tgt_'), ('Interf 1', 'int1_'), ...] present in the scene."""
+    out = [("Objetivo", "tgt_")]
+    j = 1
+    while any(k.startswith(f"int{j}_") for k in scene):
+        out.append((f"Interf {j}", f"int{j}_"))
+        j += 1
+    return out
+
+def _fmt_cell(v, nd=2):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    if isinstance(v, float):
+        return f"{v:.{nd}f}"
+    return str(v)
+
+def display_measured_scene(data: dict):
+    """
+    Extra panel for catalogs built from MEASURED RIRs (full_benchmark_test_dtln_kria.py):
+    reads the optional 'scene' / 'rirs' groups. MIRD catalogs lack them and
+    this function returns without drawing anything.
+    """
+    scene = data.get("scene") or {}
+    if not scene:
+        return
+    rirs = data.get("rirs") or {}
+
+    with st.expander("📐 Escena medida (RIRs reales)", expanded=False):
+        st.caption(f"`{scene.get('scene_id', '')}` · aro `{scene.get('array', '')}` · "
+                   f"centro {scene.get('arr_center_origin', '?')}")
+        tab_src, tab_bands, tab_rir, tab_arr, tab_q = st.tabs(
+            ["Fuentes", "Acústica por banda", "RIRs", "Aro y sala", "Calidad"])
+
+        prefixes = _scene_prefixes(scene)
+
+        # --- Fuentes: one row per source -----------------------------------
+        with tab_src:
+            cols = [("src", "Fuente"), ("dist_m", "Dist (m)"), ("dist_origin", "Origen dist"),
+                    ("az_deg", "Az (°)"), ("el_deg", "El (°)"), ("dir_origin", "Origen dir"),
+                    ("sep_deg", "Sep. objetivo (°)"), ("T_wide", "T (s)"), ("T_mid", "T mid (s)"),
+                    ("DRR_wide", "DRR (dB)"), ("MSC_rms", "MSC rms"), ("audio", "Audio")]
+            rows = []
+            for role, p in prefixes:
+                r = {"Rol": role}
+                for k, lab in cols:
+                    v = scene.get(f"{p}{k}")
+                    if k == "src" and p == "tgt_":
+                        v = data.get("metadata", {}).get("target_src", v)
+                    r[lab] = _fmt_cell(v)
+                rows.append(r)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            tof_bad = [role for role, p in prefixes if scene.get(f"{p}tof_rejected")]
+            if tof_bad:
+                st.warning("ToF descartado (fuera de rango) en: " + ", ".join(tof_bad) +
+                           f" → distancia nominal. Crudo: " +
+                           ", ".join(_fmt_cell(scene.get(f"{p}tof_dist_raw_m"))
+                                     for role, p in prefixes if scene.get(f"{p}tof_rejected")) + " m")
+
+        # --- Acústica por banda --------------------------------------------
+        with tab_bands:
+            desc = st.radio("Descriptor", ["T", "EDT", "DRR", "CDR"], horizontal=True,
+                            key="scene_band_desc")
+            fig = go.Figure()
+            table = {}
+            for role, p in prefixes:
+                pts = []
+                for k, v in scene.items():
+                    if not k.startswith(p):
+                        continue
+                    m = _BAND_RE.match(k[len(p):])
+                    if m and m.group(1) == desc and v is not None:
+                        pts.append((int(m.group(2)), float(v)))
+                pts.sort()
+                if not pts:
+                    continue
+                fig.add_trace(go.Scatter(x=[b for b, _ in pts], y=[v for _, v in pts],
+                                         mode="lines+markers", name=role))
+                table[role] = {f"{b} Hz": v for b, v in pts}
+            if table:
+                unit = "s" if desc in ("T", "EDT") else "dB"
+                fig.update_layout(xaxis=dict(title="Banda (Hz)", type="log"),
+                                  yaxis=dict(title=f"{desc} ({unit})"),
+                                  height=320, margin=dict(l=0, r=0, t=10, b=0))
+                st.plotly_chart(fig, width="stretch")
+                st.dataframe(pd.DataFrame(table).T.round(3), width="stretch")
+            else:
+                st.info(f"No hay {desc} por banda en este caso.")
+
+        # --- RIRs ------------------------------------------------------------
+        with tab_rir:
+            names = [k for k in rirs if isinstance(rirs[k], np.ndarray)]
+            if not names:
+                st.info("Este catálogo no guardó las RIRs.")
+            else:
+                fs_rir = int(rirs.get("fs", data.get("metadata", {}).get("fs", 16000)))
+                active = [int(c) for c in str(scene.get("arr_active") or "").split(",") if c != ""]
+                ref_ch = scene.get("arr_ref_ch")
+                ref_idx = active.index(int(ref_ch)) if (ref_ch is not None and int(ref_ch) in active) else 0
+                n_ch = rirs[names[0]].shape[1]
+                ch = st.selectbox("Canal (índice dentro de los activos)", list(range(n_ch)),
+                                  index=min(ref_idx, n_ch - 1), key="scene_rir_ch",
+                                  format_func=lambda i: f"{i} (ch{active[i]})" if i < len(active) else str(i))
+                fig = go.Figure()
+                for nm in names:
+                    h = np.asarray(rirs[nm])[:, ch]
+                    db = 20 * np.log10(np.abs(h) / (np.max(np.abs(h)) + 1e-30) + 1e-12)
+                    fig.add_trace(go.Scatter(x=np.arange(len(h)) / fs_rir * 1e3, y=db,
+                                             mode="lines", name=nm, line=dict(width=1)))
+                fig.update_layout(xaxis=dict(title="t (ms)"), yaxis=dict(title="|h| (dB re pico)",
+                                  range=[-80, 3]), height=320, margin=dict(l=0, r=0, t=10, b=0))
+                st.plotly_chart(fig, width="stretch")
+
+        # --- Aro y sala ------------------------------------------------------
+        with tab_arr:
+            items = [(k, v) for k, v in scene.items() if k.startswith(("arr_", "room_"))]
+            per_row = 4
+            for i in range(0, len(items), per_row):
+                cs = st.columns(per_row)
+                for c, (k, v) in zip(cs, items[i:i + per_row]):
+                    c.markdown(f"**{k}**  \n{_fmt_cell(v, 3)}")
+
+        # --- Calidad de las mediciones ---------------------------------------
+        with tab_q:
+            qcols = [("file", "Archivo"), ("when", "Cuándo"), ("reps_used", "Reps"),
+                     ("rep_corr_min", "Corr. mín"), ("eps_ppm", "ε (ppm)"),
+                     ("noise_rms_dbfs", "Ruido (dBFS)"), ("peak_ir_db", "Pico IR (dB)"),
+                     ("n_warnings", "# avisos")]
+            rows = []
+            for role, p in prefixes:
+                r = {"Rol": role}
+                r.update({lab: _fmt_cell(scene.get(f"{p}{k}"), 3) for k, lab in qcols})
+                rows.append(r)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            for role, p in prefixes:
+                w = scene.get(f"{p}warnings")
+                if w:
+                    st.warning(f"**{role}:** " + str(w).replace(" | ", "\n\n"))
 
 def get_room_wireframe_traces(room_dims: list, **kwargs) -> list:
     """
@@ -467,6 +637,7 @@ def main():
     st.caption(f"Optimized for extreme variance in: **{selected_metric}**")
 
     display_experiment_conditions(data, h5_structure, selected_proc, selected_metric, selected_case)
+    display_measured_scene(data)   # no-op for MIRD catalogs (no 'scene' group)
 
     if data["metrics"]:
         display_metrics_row(data["metrics"])
